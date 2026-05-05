@@ -24,15 +24,16 @@ PAUSE        = 120     # 2 minutes entre trades
 SCORE_MIN    = 10      # Score minimum 10/30
 
 # Seuils ADX
-ADX_RANGE    = 20      # ADX < 20 = range = pas de trade
+ADX_RANGE    = 15      # ADX < 15 = range = pas de trade (abaissé de 20 à 15)
 ADX_TREND    = 25      # ADX > 25 = tendance forte
 
 # Filtre volume
-VOLUME_MINI  = 0.50    # Volume doit être > 50% de la moyenne
+VOLUME_MINI  = 0.35    # Volume doit être > 35% de la moyenne (abaissé de 50% à 35%)
 
 MARCHES = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT",
-    "BNBUSDT", "LINKUSDT", "XRPUSDT", "AVAXUSDT"
+    "BNBUSDT", "LINKUSDT", "XRPUSDT", "AVAXUSDT",
+    "DOGEUSDT", "ADAUSDT"
 ]
 
 KRAKEN_SYMBOLS = {
@@ -42,7 +43,9 @@ KRAKEN_SYMBOLS = {
     "XRPUSDT":  "XRPUSD",
     "AVAXUSDT": "AVAXUSD",
     "BNBUSDT":  "BNBUSD",
-    "LINKUSDT": "LINKUSD"
+    "LINKUSDT": "LINKUSD",
+    "DOGEUSDT": "XDGUSD",
+    "ADAUSDT":  "ADAUSD"
 }
 
 print("=" * 55)
@@ -223,7 +226,7 @@ def analyser_marche(symbole):
     # ── FILTRE 2 : VOLUME ──
     volume_ok, volume_ratio = verifier_volume(volumes)
     if not volume_ok:
-        print(f"  {symbole} : Volume {volume_ratio}% < 50% moyenne → pas de trade")
+        print(f"  {symbole} : Volume {volume_ratio}% < 35% moyenne → pas de trade")
         return 0, "NEUTRE", {"adx": adx, "volume_ratio": volume_ratio}
 
     # ── FILTRE 3 : MA (direction) ──
@@ -247,11 +250,9 @@ def analyser_marche(symbole):
     else:                  score_vol = 1
 
     # ── DIRECTION FINALE ──
-    # MA donne la direction, RSI confirme dans le sens de MA
     if direction_ma != "NEUTRE":
         direction_finale = direction_ma
 
-        # RSI doit confirmer la direction MA
         if direction_ma == "ACHAT" and rsi > 65:
             print(f"  {symbole} : RSI {rsi} trop haut pour ACHAT → signal ignore")
             return 0, "NEUTRE", {"rsi": rsi, "score_total": 0, "volatilite": volatilite, "direction": "NEUTRE"}
@@ -259,11 +260,10 @@ def analyser_marche(symbole):
             print(f"  {symbole} : RSI {rsi} trop bas pour VENTE → signal ignore")
             return 0, "NEUTRE", {"rsi": rsi, "score_total": 0, "volatilite": volatilite, "direction": "NEUTRE"}
 
-        # RSI dans le bon sens -> calcul du score
         if direction_rsi == direction_ma:
-            score_total = score_ma + score_rsi + score_vol  # Signal fort
+            score_total = score_ma + score_rsi + score_vol
         else:
-            score_total = score_ma + score_vol  # Signal modere
+            score_total = score_ma + score_vol
 
     elif direction_rsi != "NEUTRE":
         direction_finale = direction_rsi
@@ -272,7 +272,6 @@ def analyser_marche(symbole):
         direction_finale = "NEUTRE"
         score_total = 0
 
-    # Bonus ADX fort
     if adx > ADX_TREND:
         score_total = min(score_total + 3, 30)
 
