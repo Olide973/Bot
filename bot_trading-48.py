@@ -21,7 +21,7 @@ LEVIER       = 3
 GAIN_CIBLE   = 0.75    # +0.75EUR
 STOP_LOSS    = -1.50   # -1.50EUR
 PAUSE        = 120     # 2 minutes entre trades
-SCORE_MIN    = 10      # Score minimum 10/30
+SCORE_MIN    = 7       # Score minimum 7/30 (abaissé de 10 à 7)
 
 # Seuils ADX
 ADX_RANGE    = 15      # ADX < 15 = range = pas de trade (abaissé de 20 à 15)
