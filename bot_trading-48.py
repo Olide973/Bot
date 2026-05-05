@@ -1,8 +1,8 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║       BOT SCALPING OPTIMISE — SIMULATION COMPLETE           ║
-║       Mise 50EUR | +0.40EUR = ferme | -1.50EUR = ferme      ║
-║       Pause 2min | Score min 10/30 | Kraken API             ║
+║       Mise 50EUR | +1.50EUR = ferme | -1.50EUR = ferme      ║
+║       Pause 2min | Score min 15/30 | Kraken API             ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -12,12 +12,16 @@ import time
 import os
 from datetime import datetime
 
+# ══════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ══════════════════════════════════════════════════════════════
+
 MISE              = 50.0
 LEVIER            = 3
 GAIN_CIBLE        = 0.40    # +0.40EUR
 STOP_LOSS         = -1.50   # -1.50EUR
-PAUSE             = 120
-SCORE_MIN         = 10
+PAUSE             = 120     # 2 minutes entre trades
+SCORE_MIN         = 10      # Ne trade que si score > 10/30
 MARCHES           = ["DOGEUSDT", "SOLUSDT", "XRPUSDT", "AVAXUSDT", "BNBUSDT", "LINKUSDT", "ADAUSDT"]
 FICHIER_ETAT      = "etat_bot.json"
 
@@ -38,6 +42,10 @@ print(f"  Objectif   : +{GAIN_CIBLE}EUR | Stop : {STOP_LOSS}EUR")
 print(f"  Pause      : {PAUSE//60} min | Score min : {SCORE_MIN}/30")
 print(f"  Source     : Kraken API (sans restriction)")
 print("=" * 55)
+
+# ══════════════════════════════════════════════════════════════
+# RÉCUPÉRATION DES PRIX VIA KRAKEN
+# ══════════════════════════════════════════════════════════════
 
 def get_prix_actuel(symbole):
     kraken_symbol = KRAKEN_SYMBOLS.get(symbole, symbole)
@@ -69,10 +77,12 @@ def get_klines(symbole, limite=50):
         result = data.get("result", {})
         keys = [k for k in result.keys() if k != "last"]
         if not keys:
+            print(f"  Pas de donnees pour {symbole}")
             return None, None, None
         key = keys[0]
         candles = result[key]
         if not candles:
+            print(f"  Bougies vides pour {symbole}")
             return None, None, None
         closes = [float(k[4]) for k in candles]
         highs  = [float(k[2]) for k in candles]
@@ -81,6 +91,10 @@ def get_klines(symbole, limite=50):
     except Exception as e:
         print(f"  Erreur klines {symbole} : {e}")
         return None, None, None
+
+# ══════════════════════════════════════════════════════════════
+# INDICATEURS TECHNIQUES
+# ══════════════════════════════════════════════════════════════
 
 def calculer_rsi(closes, periode=14):
     if len(closes) < periode + 1:
@@ -106,6 +120,10 @@ def calculer_volatilite(closes, highs, lows, periode=14):
         return 0
     amplitudes = [(highs[i] - lows[i]) / closes[i] * 100 for i in range(-periode, 0)]
     return round(sum(amplitudes) / len(amplitudes), 2)
+
+# ══════════════════════════════════════════════════════════════
+# SCORING ET CHOIX DU MARCHÉ
+# ══════════════════════════════════════════════════════════════
 
 def scorer_marche(symbole):
     closes, highs, lows = get_klines(symbole)
@@ -172,6 +190,10 @@ def choisir_meilleur_marche():
     print(f"  => CHOIX : {meilleur} ({direction}) — Score {score}/30 ✅")
     return meilleur, direction, resultats[meilleur]["details"]
 
+# ══════════════════════════════════════════════════════════════
+# SIMULATION DU TRADE
+# ══════════════════════════════════════════════════════════════
+
 def simuler_trade(symbole, direction, numero_trade):
     prix_entree = get_prix_actuel(symbole)
     if prix_entree is None:
@@ -200,6 +222,7 @@ def simuler_trade(symbole, direction, numero_trade):
 
     while True:
         time.sleep(30)
+
         prix_actuel = get_prix_actuel(symbole)
         if prix_actuel is None:
             continue
@@ -226,15 +249,23 @@ def simuler_trade(symbole, direction, numero_trade):
             print(f"\n  TIMEOUT 24H — Fermeture : {'+' if pnl >= 0 else ''}{pnl}EUR")
             return ("GAGNE" if pnl > 0 else "PERDU"), pnl
 
+# ══════════════════════════════════════════════════════════════
+# GESTION DE L'ÉTAT
+# ══════════════════════════════════════════════════════════════
+
 def charger_etat():
     if os.path.exists(FICHIER_ETAT):
         with open(FICHIER_ETAT, "r") as f:
             return json.load(f)
     return {
-        "total_gagne": 0.0, "total_perdu": 0.0,
-        "cumul_net": 0.0, "nb_trades": 0,
-        "nb_wins": 0, "nb_losses": 0,
-        "nb_skips": 0, "historique": []
+        "total_gagne": 0.0,
+        "total_perdu": 0.0,
+        "cumul_net": 0.0,
+        "nb_trades": 0,
+        "nb_wins": 0,
+        "nb_losses": 0,
+        "nb_skips": 0,
+        "historique": []
     }
 
 def sauvegarder_etat(etat):
@@ -261,6 +292,10 @@ def afficher_tableau_de_bord(etat):
                   f"{h['resultat']} | {'+' if h['gain'] >= 0 else ''}{h['gain']}EUR | "
                   f"Cumul: {'+' if h['cumul'] >= 0 else ''}{h['cumul']}EUR")
     print(f"  {'='*55}")
+
+# ══════════════════════════════════════════════════════════════
+# BOUCLE PRINCIPALE
+# ══════════════════════════════════════════════════════════════
 
 def demarrer_bot():
     print(f"\n  DEMARRAGE — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -318,3 +353,5 @@ def demarrer_bot():
 
 if __name__ == "__main__":
     demarrer_bot()
+
+
