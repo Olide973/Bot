@@ -1,9 +1,9 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║       BOT SCALPING V3 — VERSION OPTIMISEE COMPLETE          ║
-║       ADX → Volume → MA → RSI                               ║
+║       ADX → Volume → MA → RSI (assoupli)                    ║
 ║       Mise 50EUR | +0.75EUR | -1.50EUR | 15 minutes         ║
-║       BTC ETH SOL BNB LINK XRP AVAX                         ║
+║       12 marchés pour plus de signaux                        ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -27,9 +27,14 @@ ADX_RANGE    = 20      # ADX < 20 = range = pas de trade
 ADX_TREND    = 25      # ADX > 25 = tendance forte = bonus
 VOLUME_MINI  = 0.50    # Volume > 50% de la moyenne 24h
 
+# Filtre RSI/MA assoupli de moitié
+RSI_MAX_ACHAT = 75     # ACHAT bloqué si RSI > 75 (au lieu de 65)
+RSI_MIN_VENTE = 25     # VENTE bloquée si RSI < 25 (au lieu de 35)
+
 MARCHES = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT",
-    "BNBUSDT", "LINKUSDT", "XRPUSDT", "AVAXUSDT"
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
+    "LINKUSDT", "XRPUSDT", "AVAXUSDT", "DOGEUSDT",
+    "ADAUSDT", "DOTUSDT", "ATOMUSDT", "NEARUSDT"
 ]
 
 KRAKEN_SYMBOLS = {
@@ -39,7 +44,12 @@ KRAKEN_SYMBOLS = {
     "XRPUSDT":  "XRPUSD",
     "AVAXUSDT": "AVAXUSD",
     "BNBUSDT":  "BNBUSD",
-    "LINKUSDT": "LINKUSD"
+    "LINKUSDT": "LINKUSD",
+    "DOGEUSDT": "XDGUSD",
+    "ADAUSDT":  "ADAUSD",
+    "DOTUSDT":  "DOTUSD",
+    "ATOMUSDT": "ATOMUSD",
+    "NEARUSDT": "NEARUSD"
 }
 
 print("=" * 55)
@@ -49,6 +59,7 @@ print(f"  Objectif  : +{GAIN_CIBLE}EUR | Stop : {STOP_LOSS}EUR")
 print(f"  Bougies   : 15 minutes")
 print(f"  Ordre     : ADX → Volume → MA → RSI")
 print(f"  Marches   : {len(MARCHES)} cryptos")
+print(f"  RSI filtre: ACHAT < {RSI_MAX_ACHAT} | VENTE > {RSI_MIN_VENTE}")
 print("=" * 55)
 
 # ══════════════════════════════════════════════════════════════
@@ -173,7 +184,7 @@ def scorer_ma(closes):
     else:             return 1,  direction
 
 # ══════════════════════════════════════════════════════════════
-# FILTRE 4 — RSI (timing confirmé par MA)
+# FILTRE 4 — RSI (timing confirmé par MA - assoupli)
 # ══════════════════════════════════════════════════════════════
 
 def calculer_rsi(closes, periode=14):
@@ -224,7 +235,7 @@ def analyser_marche(symbole):
     # ── FILTRE 3 : MA (direction) ──
     score_ma, direction_ma = scorer_ma(closes)
 
-    # ── FILTRE 4 : RSI (timing confirmé par MA) ──
+    # ── FILTRE 4 : RSI (timing confirmé par MA - assoupli) ──
     rsi = calculer_rsi(closes)
     score_rsi, direction_rsi = scorer_rsi(rsi)
 
@@ -242,23 +253,21 @@ def analyser_marche(symbole):
     else:                  score_vol = 1
 
     # ── DIRECTION FINALE ──
-    # MA donne la direction, RSI confirme dans le sens de MA
     if direction_ma != "NEUTRE":
         direction_finale = direction_ma
 
-        # RSI ne doit pas contredire MA
-        if direction_ma == "ACHAT" and rsi > 65:
-            print(f"  {symbole} : RSI {rsi} trop haut pour ACHAT → ignore")
+        # Filtre RSI/MA assoupli
+        if direction_ma == "ACHAT" and rsi > RSI_MAX_ACHAT:
+            print(f"  {symbole} : RSI {rsi} > {RSI_MAX_ACHAT} pour ACHAT → ignore")
             return 0, "NEUTRE", {"rsi": rsi, "adx": adx, "score_total": 0, "volatilite": volatilite, "direction": "NEUTRE"}
-        elif direction_ma == "VENTE" and rsi < 35:
-            print(f"  {symbole} : RSI {rsi} trop bas pour VENTE → ignore")
+        elif direction_ma == "VENTE" and rsi < RSI_MIN_VENTE:
+            print(f"  {symbole} : RSI {rsi} < {RSI_MIN_VENTE} pour VENTE → ignore")
             return 0, "NEUTRE", {"rsi": rsi, "adx": adx, "score_total": 0, "volatilite": volatilite, "direction": "NEUTRE"}
 
-        # Calcul score selon cohérence RSI/MA
         if direction_rsi == direction_ma:
-            score_total = score_ma + score_rsi + score_vol  # Signal fort
+            score_total = score_ma + score_rsi + score_vol
         else:
-            score_total = score_ma + score_vol  # Signal modéré
+            score_total = score_ma + score_vol
 
     elif direction_rsi != "NEUTRE":
         direction_finale = direction_rsi
@@ -267,7 +276,6 @@ def analyser_marche(symbole):
         direction_finale = "NEUTRE"
         score_total = 0
 
-    # Bonus ADX fort
     if adx > ADX_TREND:
         score_total = min(score_total + 3, 30)
 
@@ -275,7 +283,7 @@ def analyser_marche(symbole):
 
     print(f"  {symbole} : ADX {adx} | Vol {volume_ratio}% | "
           f"RSI {rsi} ({direction_rsi}) | MA ({direction_ma}) | "
-          f"Vol {volatilite}% | Score {score_total}/30 | {direction_finale}")
+          f"Volatilite {volatilite}% | Score {score_total}/30 | {direction_finale}")
 
     return score_total, direction_finale, {
         "adx": adx,
@@ -302,7 +310,6 @@ def choisir_meilleur_marche():
         print("  => Aucun signal valide. On attend...")
         return None, "NEUTRE", {}
 
-    # Priorité : meilleur score puis meilleure volatilité
     meilleur = max(valides, key=lambda x: (
         valides[x]["score"],
         valides[x]["details"].get("volatilite", 0)
