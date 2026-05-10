@@ -256,7 +256,7 @@ def choisir_meilleur_marche():
 # SIMULATION DU TRADE
 # ══════════════════════════════════════════════════════════════
 
-def simuler_trade(symbole, direction, numero_trade, details):
+def simuler_trade(symbole, direction, numero_trade, capital, details):
     prix_entree = get_prix_actuel(symbole)
     if prix_entree is None:
         return "ERREUR", 0
@@ -467,7 +467,7 @@ def demarrer_bot():
                 continue
 
             etat["nb_trades"] += 1
-            resultat, gain = simuler_trade(symbole, direction, etat["nb_trades"], details)
+            resultat, gain = simuler_trade(symbole, direction, etat["nb_trades"], etat["capital"], details)
 
             if resultat == "ERREUR":
                 etat["nb_trades"] -= 1
