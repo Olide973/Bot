@@ -32,6 +32,26 @@ CAPITAL_INITIAL         = 215.0
 LEVIER                  = 10
 MISE_FIXE_PCT           = 0.20
 ATR_MULTIPLIER          = 2.5
+
+# Trailing Stop Progressif — Bot 2
+TRAILING_NIVEAUX = [
+    (100, 0.05),   # PnL > +100€ → ATR × 0.05 → protège ~+97€
+    ( 75, 0.07),   # PnL > +75€  → ATR × 0.07 → protège ~+72€
+    ( 50, 0.10),   # PnL > +50€  → ATR × 0.10 → protège ~+47€
+    ( 35, 0.15),   # PnL > +35€  → ATR × 0.15 → protège ~+32€
+    ( 25, 0.20),   # PnL > +25€  → ATR × 0.20 → protège ~+22€
+    ( 18, 0.30),   # PnL > +18€  → ATR × 0.30 → protège ~+15€
+    ( 12, 0.50),   # PnL > +12€  → ATR × 0.50 → protège ~+10€
+    ( 11, 0.80),   # PnL > +11€  → ATR × 0.80 → protège ~+9€
+    (  8, 1.50),   # PnL > +8€   → ATR × 1.50 → protège ~+6€
+    (  0, 2.50),   # Par défaut  → ATR × 2.50
+]
+
+def get_multiplicateur_atr(pnl):
+    for seuil, mult in TRAILING_NIVEAUX:
+        if pnl >= seuil:
+            return mult
+    return 2.50
 RATIO_RR                = 2.0
 RATIO_PARTIEL           = 1.0
 PAUSE                   = 120
@@ -242,7 +262,7 @@ def simuler_trade(symbole, direction, numero_trade, details):
         return "ERREUR", 0
 
     atr  = details.get("atr", 0)
-    mise = CAPITAL_INITIAL * MISE_FIXE_PCT
+    mise = capital * MISE_FIXE_PCT  # Compoundage — mise basée sur capital actuel
 
     if direction == "ACHAT":
         stop_loss        = round(prix_entree - (atr * ATR_MULTIPLIER), 8)
@@ -281,23 +301,33 @@ def simuler_trade(symbole, direction, numero_trade, details):
         if prix_actuel is None:
             continue
 
+        # Calcul PnL
         if direction == "ACHAT":
             pnl = round((prix_actuel - prix_entree) / prix_entree * mise * LEVIER, 2)
+        else:
+            pnl = round((prix_entree - prix_actuel) / prix_entree * mise * LEVIER, 2)
+
+        # Trailing Stop Progressif
+        multiplicateur    = get_multiplicateur_atr(pnl)
+        distance_trailing = atr * multiplicateur
+
+        if direction == "ACHAT":
             if prix_actuel > meilleur_prix:
                 meilleur_prix = prix_actuel
-                nouveau_stop  = round(meilleur_prix - distance_stop, 8)
-                if nouveau_stop > stop_actuel:
-                    stop_actuel = nouveau_stop
+            nouveau_stop = round(meilleur_prix - distance_trailing, 8)
+            if nouveau_stop > stop_actuel:
+                stop_actuel = nouveau_stop
+                log.info(f"  [TRAILING] PnL {'+' if pnl>=0 else ''}{pnl}EUR → ATR×{multiplicateur} | Stop : {nouveau_stop}")
             atteint_partiel = not partiel_execute and prix_actuel >= objectif_partiel
             atteint_final   = prix_actuel >= objectif_final
             atteint_stop    = prix_actuel <= stop_actuel
         else:
-            pnl = round((prix_entree - prix_actuel) / prix_entree * mise * LEVIER, 2)
             if prix_actuel < meilleur_prix:
                 meilleur_prix = prix_actuel
-                nouveau_stop  = round(meilleur_prix + distance_stop, 8)
-                if nouveau_stop < stop_actuel:
-                    stop_actuel = nouveau_stop
+            nouveau_stop = round(meilleur_prix + distance_trailing, 8)
+            if nouveau_stop < stop_actuel:
+                stop_actuel = nouveau_stop
+                log.info(f"  [TRAILING] PnL {'+' if pnl>=0 else ''}{pnl}EUR → ATR×{multiplicateur} | Stop : {nouveau_stop}")
             atteint_partiel = not partiel_execute and prix_actuel <= objectif_partiel
             atteint_final   = prix_actuel <= objectif_final
             atteint_stop    = prix_actuel >= stop_actuel
