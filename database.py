@@ -1,12 +1,13 @@
+```
 import os
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
+from psycopg.rows import dict_row
 
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
 
 def get_conn():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
 def init_database():
@@ -125,28 +126,6 @@ def sauvegarder_etat(etat):
                 etat.get('avg_loss_pct', 0),
                 int(etat.get('pause_until', 0)),
             ))
-            conn.commit()
-    finally:
-        conn.close()
-
-
-def enregistrer_trade(data):
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO trade_history (
-                    marche, direction, resultat,
-                    prix_entree, prix_sortie, stop_loss, objectif,
-                    mise, gain, capital_apres, duree_minutes,
-                    score, adx, atr, rsi
-                ) VALUES (
-                    %(marche)s, %(direction)s, %(resultat)s,
-                    %(prix_entree)s, %(prix_sortie)s, %(stop_loss)s, %(objectif)s,
-                    %(mise)s, %(gain)s, %(capital_apres)s, %(duree_minutes)s,
-                    %(score)s, %(adx)s, %(atr)s, %(rsi)s
-                )
-            """, data)
             conn.commit()
     finally:
         conn.close()
