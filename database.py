@@ -4,6 +4,9 @@ from psycopg.rows import dict_row
 
 DATABASE_URL = os.environ.get('DATABASE_URL')
 
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL manquant dans les variables d'environnement")
+
 
 def get_conn():
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
@@ -31,6 +34,7 @@ def init_database():
                     CONSTRAINT single_row CHECK (id = 1)
                 )
             """)
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS trade_history (
                     id SERIAL PRIMARY KEY,
@@ -52,48 +56,77 @@ def init_database():
                     rsi NUMERIC(6,2)
                 )
             """)
-            cur.execute("INSERT INTO bot_state (id) VALUES (1) ON CONFLICT DO NOTHING")
+
+            cur.execute("""
+                INSERT INTO bot_state (id)
+                VALUES (1)
+                ON CONFLICT DO NOTHING
+            """)
+
             conn.commit()
+
     finally:
         conn.close()
 
 
 def charger_etat():
     conn = get_conn()
+
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM bot_state WHERE id = 1")
             row = cur.fetchone()
+
             if not row:
                 init_database()
                 return charger_etat()
+
             etat = dict(row)
-            for k in ['capital', 'total_gagne', 'total_perdu', 'cumul_net',
-                      'avg_win_pct', 'avg_loss_pct']:
+
+            for k in [
+                'capital',
+                'total_gagne',
+                'total_perdu',
+                'cumul_net',
+                'avg_win_pct',
+                'avg_loss_pct'
+            ]:
                 if etat.get(k) is not None:
                     etat[k] = float(etat[k])
-            cur.execute("SELECT * FROM trade_history ORDER BY timestamp DESC LIMIT 5")
+
+            cur.execute("""
+                SELECT *
+                FROM trade_history
+                ORDER BY timestamp DESC
+                LIMIT 5
+            """)
+
             rows = cur.fetchall()
+
             etat['historique'] = [
                 {
-                    'heure':     h['timestamp'].strftime('%Y-%m-%d %H:%M'),
-                    'marche':    h['marche'],
+                    'heure': h['timestamp'].strftime('%Y-%m-%d %H:%M'),
+                    'marche': h['marche'],
                     'direction': h['direction'],
-                    'resultat':  h['resultat'],
-                    'gain':      float(h['gain']) if h['gain'] is not None else 0,
-                    'mise':      float(h['mise']) if h['mise'] is not None else 0,
-                    'capital':   float(h['capital_apres']) if h['capital_apres'] is not None else 0
+                    'resultat': h['resultat'],
+                    'gain': float(h['gain']) if h['gain'] is not None else 0,
+                    'mise': float(h['mise']) if h['mise'] is not None else 0,
+                    'capital': float(h['capital_apres']) if h['capital_apres'] is not None else 0
                 }
                 for h in reversed(rows)
             ]
+
             etat.pop('id', None)
+
             return etat
+
     finally:
         conn.close()
 
 
 def sauvegarder_etat(etat):
     conn = get_conn()
+
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -125,6 +158,60 @@ def sauvegarder_etat(etat):
                 etat.get('avg_loss_pct', 0),
                 int(etat.get('pause_until', 0)),
             ))
+
             conn.commit()
+
+    finally:
+        conn.close()
+
+
+def enregistrer_trade(trade):
+    conn = get_conn()
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO trade_history (
+                    marche,
+                    direction,
+                    resultat,
+                    prix_entree,
+                    prix_sortie,
+                    stop_loss,
+                    objectif,
+                    mise,
+                    gain,
+                    capital_apres,
+                    duree_minutes,
+                    score,
+                    adx,
+                    atr,
+                    rsi
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s
+                )
+            """, (
+                trade.get('marche'),
+                trade.get('direction'),
+                trade.get('resultat'),
+                trade.get('prix_entree'),
+                trade.get('prix_sortie'),
+                trade.get('stop_loss'),
+                trade.get('objectif'),
+                trade.get('mise'),
+                trade.get('gain'),
+                trade.get('capital_apres'),
+                trade.get('duree_minutes'),
+                trade.get('score'),
+                trade.get('adx'),
+                trade.get('atr'),
+                trade.get('rsi')
+            ))
+
+            conn.commit()
+
     finally:
         conn.close()
