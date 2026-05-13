@@ -4,8 +4,7 @@
 ║   RSI < 30 → ACHAT | RSI > 70 → VENTE                      ║
 ║   15 marchés | H1 | Stop ATR×2.5 | Ratio 1:2               ║
 ║   Sortie partielle 50% | Capital 215€ | Levier x10          ║
-║   Trailing Stop Progressif avec PnL/Multi/Protège           ║
-║   Paliers : +3€, +7.50€, +12€, +18€, +25€, +35€...          ║
+║   Trailing Stop CONTINU (corrigé) — protection dès +0.75€   ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -35,18 +34,18 @@ LEVIER                  = 10
 MISE_FIXE_PCT           = 0.20
 ATR_MULTIPLIER          = 2.5
 
-# ========== NOUVEAUX Paliers de Trailing Stop (selon votre tableau) ==========
+# Paliers de Trailing Stop (protection progressive, premier palier à +0.75€)
 TRAILING_NIVEAUX = [
-    (100, 0.05),   # PnL ≥ +100€ → ATR × 0.05 → protège ~+97€
-    ( 75, 0.07),   # PnL ≥ +75€  → ATR × 0.07 → protège ~+72€
-    ( 50, 0.10),   # PnL ≥ +50€  → ATR × 0.10 → protège ~+47€
-    ( 35, 0.15),   # PnL ≥ +35€  → ATR × 0.15 → protège ~+32€
-    ( 25, 0.20),   # PnL ≥ +25€  → ATR × 0.20 → protège ~+22€
-    ( 18, 0.30),   # PnL ≥ +18€  → ATR × 0.30 → protège ~+15€
-    ( 12, 0.50),   # PnL ≥ +12€  → ATR × 0.50 → protège ~+10€
-    (7.5, 0.80),   # PnL ≥ +7.50€ → ATR × 0.80 → protège ~+5€
-    (  3, 1.50),   # PnL ≥ +3€   → ATR × 1.50 → protège ~+1€
-    (  0, 2.50),   # défaut        → ATR × 2.50
+    (100, 0.05),
+    ( 75, 0.07),
+    ( 50, 0.10),
+    ( 35, 0.15),
+    ( 25, 0.20),
+    ( 18, 0.30),
+    ( 12, 0.50),
+    (7.5, 0.80),
+    (0.75, 2.00),   # protection très douce dès +0.75€
+    (  0, 2.50),
 ]
 
 def get_multiplicateur_atr(pnl):
@@ -72,10 +71,8 @@ import json
 ETAT_FILE = "etat_bot2.json"
 
 MARCHES = [
-    # 10 marchés validés
     "BTCUSDT", "ETHUSDT", "XRPUSDT", "ATOMUSDT", "LINKUSDT",
     "ADAUSDT", "SOLUSDT", "AVAXUSDT", "NEARUSDT", "DOTUSDT",
-    # 5 nouveaux marchés
     "DOGEUSDT", "BNBUSDT", "TRXUSDT", "LTCUSDT", "MATICUSDT"
 ]
 
@@ -98,12 +95,11 @@ KRAKEN_SYMBOLS = {
 }
 
 log.info("=" * 55)
-log.info("  BOT MEAN REVERSION V7.2 — BOT 2")
+log.info("  BOT MEAN REVERSION V7.2 — BOT 2 (TRAILING CONTINU)")
 log.info(f"  Capital : {CAPITAL_INITIAL}EUR | Levier x{LEVIER} | Mise {MISE_FIXE_PCT*100}%")
 log.info(f"  RSI < {RSI_ACHAT} → ACHAT | RSI > {RSI_VENTE} → VENTE")
 log.info(f"  Stop ATR×{ATR_MULTIPLIER} | Ratio 1:{RATIO_RR}")
-log.info(f"  Trailing Stop : PnL + Multiplicateur + Protège")
-log.info(f"  Paliers : +3€, +7.50€, +12€, +18€, +25€, +35€, +50€...")
+log.info(f"  Trailing stop : mise à jour continue, protection dès +0.75€")
 log.info(f"  Marchés : {len(MARCHES)} cryptos")
 log.info("=" * 55)
 
@@ -258,7 +254,7 @@ def choisir_meilleur_marche():
     return meilleur, direction, signaux[meilleur]["details"]
 
 # ══════════════════════════════════════════════════════════════
-# SIMULATION DU TRADE — AVEC PnL / MULTI / PROTÈGE
+# SIMULATION DU TRADE — TRAILING STOP CONTINU (CORRIGÉ)
 # ══════════════════════════════════════════════════════════════
 
 def simuler_trade(symbole, direction, numero_trade, capital, details):
@@ -267,7 +263,7 @@ def simuler_trade(symbole, direction, numero_trade, capital, details):
         return "ERREUR", 0
 
     atr  = details.get("atr", 0)
-    mise = capital * MISE_FIXE_PCT  # Compoundage — mise basée sur capital actuel
+    mise = capital * MISE_FIXE_PCT
 
     if direction == "ACHAT":
         stop_loss        = round(prix_entree - (atr * ATR_MULTIPLIER), 8)
@@ -312,34 +308,42 @@ def simuler_trade(symbole, direction, numero_trade, capital, details):
         else:
             pnl = round((prix_entree - prix_actuel) / prix_entree * mise * LEVIER, 2)
 
-        # Trailing Stop Progressif
-        multiplicateur    = get_multiplicateur_atr(pnl)
+        # Trailing Stop Progressif : multiplicateur dépend du PnL
+        multiplicateur = get_multiplicateur_atr(pnl)
         distance_trailing = atr * multiplicateur
 
+        # Mise à jour CONTINUE du stop suiveur (même si multiplicateur inchangé)
+        stop_modifie = False
         if direction == "ACHAT":
             if prix_actuel > meilleur_prix:
                 meilleur_prix = prix_actuel
             nouveau_stop = round(meilleur_prix - distance_trailing, 8)
             if nouveau_stop > stop_actuel:
-                if multiplicateur != niveau_actuel:
-                    # Calcul CORRECT du gain protégé (gain si stop touché maintenant)
-                    gain_protege = round((nouveau_stop - prix_entree) / prix_entree * mise * LEVIER, 2)
-                    log.info(f"  [TRAILING] PnL {'+' if pnl>=0 else ''}{pnl}€ → ATR×{multiplicateur} | Stop : {nouveau_stop} | Protège : ~{gain_protege}€")
-                    niveau_actuel = multiplicateur
                 stop_actuel = nouveau_stop
-            atteint_partiel = not partiel_execute and prix_actuel >= objectif_partiel
-            atteint_final   = prix_actuel >= objectif_final
-            atteint_stop    = prix_actuel <= stop_actuel
+                stop_modifie = True
         else:  # VENTE
             if prix_actuel < meilleur_prix:
                 meilleur_prix = prix_actuel
             nouveau_stop = round(meilleur_prix + distance_trailing, 8)
             if nouveau_stop < stop_actuel:
-                if multiplicateur != niveau_actuel:
-                    gain_protege = round((prix_entree - nouveau_stop) / prix_entree * mise * LEVIER, 2)
-                    log.info(f"  [TRAILING] PnL {'+' if pnl>=0 else ''}{pnl}€ → ATR×{multiplicateur} | Stop : {nouveau_stop} | Protège : ~{gain_protege}€")
-                    niveau_actuel = multiplicateur
                 stop_actuel = nouveau_stop
+                stop_modifie = True
+
+        # Log uniquement si le multiplicateur a changé (pour éviter spam)
+        if multiplicateur != niveau_actuel and stop_modifie:
+            if direction == "ACHAT":
+                gain_protege = round((stop_actuel - prix_entree) / prix_entree * mise * LEVIER, 2)
+            else:
+                gain_protege = round((prix_entree - stop_actuel) / prix_entree * mise * LEVIER, 2)
+            log.info(f"  [TRAILING] PnL {'+' if pnl>=0 else ''}{pnl}€ → ATR×{multiplicateur} | Stop : {stop_actuel} | Protège : ~{gain_protege}€")
+            niveau_actuel = multiplicateur
+
+        # Vérification des conditions de sortie
+        if direction == "ACHAT":
+            atteint_partiel = not partiel_execute and prix_actuel >= objectif_partiel
+            atteint_final   = prix_actuel >= objectif_final
+            atteint_stop    = prix_actuel <= stop_actuel
+        else:
             atteint_partiel = not partiel_execute and prix_actuel <= objectif_partiel
             atteint_final   = prix_actuel <= objectif_final
             atteint_stop    = prix_actuel >= stop_actuel
@@ -354,7 +358,6 @@ def simuler_trade(symbole, direction, numero_trade, capital, details):
                      f"{' | PARTIEL ✅' if partiel_execute else ''}")
             dernier_log = time.time()
 
-        # Gestion des sorties
         if atteint_partiel:
             gain_partiel    = round(pnl * 0.5, 2)
             partiel_execute = True
