@@ -118,9 +118,9 @@ class BotConfig:
         "DOGE/USDT",  # Dogecoin      — forte volatilité, volumes élevés
         "ATOM/USDT",  # Cosmos        — IBC leader, tendances franches ✅ remplace MATIC
         "LTC/USDT",   # Litecoin      — haute liquidité Kraken, cycles nets
-        "FIL/USDT",   # Filecoin      — disponible Kraken, bonne volatilité ✅
+        "ETC/USDT",   # Ethereum Classic  — disponible Kraken
         "ALGO/USDT",  # Algorand      — disponible Kraken, swings exploitables
-        "GRT/USDT",   # The Graph     — disponible Kraken, cycles nets ✅
+        "XTZ/USDT",   # Tezos             — disponible Kraken
     ])
 
     # ── Timeframes
