@@ -47,12 +47,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-try:
-    import aiohttp
-except ImportError:
-    import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "aiohttp==3.9.5", "--quiet"])
-    import aiohttp
+import aiohttp
 try:
     import psycopg
     from psycopg.rows import dict_row
@@ -117,10 +112,10 @@ class BotConfig:
         "DOT/USDT",   # Polkadot      — interopérabilité, swings propres
         "DOGE/USDT",  # Dogecoin      — forte volatilité, volumes élevés
         "ATOM/USDT",  # Cosmos        — IBC leader, tendances franches ✅ remplace MATIC
-        "LTC/USDT",   # Litecoin      — haute liquidité Kraken, cycles nets
-        "MANA/USDT",  # Decentraland — disponible Kraken
-        "ALGO/USDT",  # Algorand      — disponible Kraken, swings exploitables
-        "XTZ/USDT",   # Tezos             — disponible Kraken
+        "LTC/USDT",   # Litecoin          — haute liquidité Kraken
+        "ETC/USDT",   # Ethereum Classic  — disponible Kraken ✅
+        "ALGO/USDT",  # Algorand          — disponible Kraken ✅
+        "XTZ/USDT",   # Tezos             — disponible Kraken ✅
     ])
 
     # ── Timeframes
@@ -135,10 +130,10 @@ class BotConfig:
     kelly_fraction: float = 0.25    # fraction Kelly (conservateur)
 
     # ── Profit / Perte
-    target_pct:     float = 0.60    # +0.60% sur position levierisée = ~+0.90€
+    target_pct:     float = 0.50    # +0.50% sur position levierisée = ~+0.75€
     stoploss_pct:   float = 1.00    # -1.00% sur position = ~-1.50€
-    trailing_start: float = 0.45    # déclenche le trailing à +0.45%
-    trailing_step:  float = 0.20    # step du trailing stop
+    trailing_start: float = 0.30    # déclenche le trailing à +0.30%
+    trailing_step:  float = 0.15    # step du trailing stop
 
     # ── Kill switch
     daily_kill_eur: float = -3.0    # arrêt si PnL journalier < -3€
@@ -236,6 +231,7 @@ class Trade:
     score:          int = 0
     regime:         MarketRegime = MarketRegime.RANGING
     partial_taken:  bool = False
+    atr_value:      float = 0.0   # ATR en % au moment de l'ouverture (pour trailing progressif)
 
     def position_size(self) -> float:
         """Taille de la position en € (stake × levier)."""
@@ -782,36 +778,56 @@ class RiskManager:
         return adjusted
 
     def update_trailing_stop(self, trade: Trade, current_price: float) -> Optional[float]:
-        """Met à jour le trailing stop. Retourne le nouveau stop ou None."""
+        """
+        Trailing stop PROGRESSIF basé sur l'ATR.
+
+        Le step s'adapte à la volatilité réelle du marché :
+        - Marché volatile (BTC, ETH) → step large → le trade respire
+        - Marché calme (MANA, XTZ)   → step serré → gains mieux protégés
+
+        Formule : step = max(0.10%, min(0.50%, ATR% × 0.5))
+        """
+        # Calculer le step dynamique basé sur l'ATR du trade
+        if trade.atr_value > 0:
+            atr_step = max(0.10, min(0.50, trade.atr_value * 0.5))
+        else:
+            atr_step = self.cfg.trailing_step  # fallback au step fixe
+
         if trade.trailing_stop is None:
             # Initialiser si on a atteint le seuil de déclenchement
             if trade.side == Signal.BUY:
                 pct_gain = (current_price - trade.entry_price) / trade.entry_price * 100 * trade.leverage
                 if pct_gain >= self.cfg.trailing_start:
-                    stop = current_price * (1 - self.cfg.trailing_step / 100 / trade.leverage)
+                    stop = current_price * (1 - atr_step / 100 / trade.leverage)
                     trade.trailing_stop = stop
                     trade.peak_price = current_price
-                    log.info(f"[TRAILING] {trade.market} Trailing stop activé @ {stop:.6f}")
+                    log.info(
+                        f"[TRAILING] {trade.market} activé @ {stop:.6f} "
+                        f"(step ATR={atr_step:.2f}%)"
+                    )
                     return stop
             else:
                 pct_gain = (trade.entry_price - current_price) / trade.entry_price * 100 * trade.leverage
                 if pct_gain >= self.cfg.trailing_start:
-                    stop = current_price * (1 + self.cfg.trailing_step / 100 / trade.leverage)
+                    stop = current_price * (1 + atr_step / 100 / trade.leverage)
                     trade.trailing_stop = stop
                     trade.peak_price = current_price
-                    log.info(f"[TRAILING] {trade.market} Trailing stop activé @ {stop:.6f}")
+                    log.info(
+                        f"[TRAILING] {trade.market} activé @ {stop:.6f} "
+                        f"(step ATR={atr_step:.2f}%)"
+                    )
                     return stop
         else:
-            # Mise à jour du pic et déplacement du stop
+            # Mise à jour du pic et déplacement progressif du stop
             if trade.side == Signal.BUY and current_price > (trade.peak_price or 0):
                 trade.peak_price = current_price
-                new_stop = current_price * (1 - self.cfg.trailing_step / 100 / trade.leverage)
+                new_stop = current_price * (1 - atr_step / 100 / trade.leverage)
                 if new_stop > trade.trailing_stop:
                     trade.trailing_stop = new_stop
                     return new_stop
             elif trade.side == Signal.SELL and current_price < (trade.peak_price or float("inf")):
                 trade.peak_price = current_price
-                new_stop = current_price * (1 + self.cfg.trailing_step / 100 / trade.leverage)
+                new_stop = current_price * (1 + atr_step / 100 / trade.leverage)
                 if new_stop < trade.trailing_stop:
                     trade.trailing_stop = new_stop
                     return new_stop
@@ -1062,10 +1078,10 @@ class KrakenClient:
         "DOT/USDT":  "DOTUSDT",
         "DOGE/USDT": "DOGEUSDT",
         "ATOM/USDT": "ATOMUSDT",   # ✅ disponible Kraken
-        "LTC/USDT":  "LTCUSDT",    # ✅ disponible Kraken
-        "MANA/USDT": "MANAUSDT",   # ✅ Kraken
-        "ALGO/USDT": "ALGOUSDT",   # ✅ disponible Kraken
-        "XTZ/USDT":  "XTZUSDT",   # ✅ Kraken
+        "LTC/USDT":  "LTCUSDT",    # ✅ Kraken
+        "ETC/USDT":  "ETCUSDT",    # ✅ Kraken
+        "ALGO/USDT": "ALGOUSDT",   # ✅ Kraken
+        "XTZ/USDT":  "XTZUSDT",    # ✅ Kraken
     }
 
     def __init__(self, timeout: int = 10):
@@ -1296,7 +1312,7 @@ class QuantumEdgeBot:
             "MAJORS":        ["XBT/USDT", "ETH/USDT", "LTC/USDT"],
             "L1":            ["SOL/USDT", "AVAX/USDT", "ADA/USDT", "DOT/USDT", "ALGO/USDT"],
             "PAYMENTS":      ["XRP/USDT", "DOGE/USDT", "BNB/USDT"],
-            "DEFI":          ["LINK/USDT", "GRT/USDT", "FIL/USDT"],
+            "DEFI":          ["LINK/USDT", "ETC/USDT", "XTZ/USDT"],
             "INFRA":         ["ATOM/USDT"],
         }
 
@@ -1413,6 +1429,7 @@ class QuantumEdgeBot:
         # ── Ajustement volatilité (ATR % sur 14 bougies 15m)
         # On récupère les candles depuis le cache corr_filter si disponible
         prices = list(self.corr_filter._price_history.get(market, []))
+        atr_pct = 0.0
         if len(prices) >= 15:
             recent_range = max(prices[-14:]) - min(prices[-14:])
             atr_pct = (recent_range / prices[-1]) * 100 if prices[-1] else 0
@@ -1438,6 +1455,7 @@ class QuantumEdgeBot:
             entry_time  = datetime.now(timezone.utc),
             score       = score,
             regime      = regime,
+            atr_value   = atr_pct,
         )
         self.open_trades[market] = trade
         log.info(
@@ -2400,7 +2418,7 @@ class ParameterOptimizer:
         max_runs: int = 50,
     ) -> Tuple[Dict, Dict]:
         """
-        Lance le grid 
+        Lance le grid search. Retourne (meilleurs_params, meilleures_métriques).
         Limite à max_runs pour éviter des temps de calcul trop longs.
         """
         combos = self._combinations()
