@@ -8,8 +8,8 @@
 ║          ██████╔╝╚██████╔╝   ██║        ╚████╔╝ ██████╔╝                    ║
 ║          ╚═════╝  ╚═════╝    ╚═╝         ╚═══╝  ╚═════╝                     ║
 ║                                                                              ║
-║                  QUANTUM EDGE TRADING SYSTEM — v3.0                         ║
-║  Backtest · Optimizer · Walk-Forward · Data Store · Dashboard Web           ║
+║                  QUANTUM EDGE TRADING SYSTEM — v3.1                         ║
+║  Backtest · Optimizer · Walk-Forward · PostgreSQL · Dashboard Web           ║
 ║                                                                              ║
 ║  Marchés  : 15 paires crypto — classement dynamique ADX/Volume              ║
 ║  Signaux  : ADX · EMA · RSI · Bollinger · Volume · Macro · Divergence       ║
@@ -48,6 +48,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+    PSYCOPG_AVAILABLE = True
+except ImportError:
+    PSYCOPG_AVAILABLE = False
+    log_tmp = logging.getLogger("QUANTUM_EDGE")
+    log_tmp.warning("[DB] psycopg non installé — fallback SQLite activé")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  LOGGING
@@ -104,10 +112,10 @@ class BotConfig:
         "DOT/USDT",   # Polkadot      — interopérabilité, swings propres
         "DOGE/USDT",  # Dogecoin      — forte volatilité, volumes élevés
         "ATOM/USDT",  # Cosmos        — IBC leader, tendances franches ✅ remplace MATIC
-        "LTC/USDT",   # Litecoin      — haute liquidité Kraken, cycles nets ✅ remplace NEAR
-        "TRX/USDT",   # TRON          — volume élevé, disponible Kraken ✅ remplace APT
-        "ALGO/USDT",  # Algorand      — disponible Kraken, swings exploitables ✅ remplace OP
-        "XLM/USDT",   # Stellar       — corrélé XRP, bonne volatilité ✅ remplace BNB si erreur
+        "LTC/USDT",   # Litecoin      — haute liquidité Kraken, cycles nets
+        "UNI/USDT",   # Uniswap       — DeFi leader, disponible Kraken ✅ remplace TRX
+        "ALGO/USDT",  # Algorand      — disponible Kraken, swings exploitables
+        "AAVE/USDT",  # Aave          — DeFi lending, disponible Kraken ✅ remplace XLM
     ])
 
     # ── Timeframes
@@ -185,6 +193,7 @@ class BotConfig:
     # ── Persistance d'état
     enable_persistence: bool = True
     state_file:         str  = "quantum_edge_state.json"
+    database_url:       str  = ""   # PostgreSQL Railway (DATABASE_URL)
 
     # ── Notifications Telegram (désactivé par défaut)
     use_telegram:       bool = False
@@ -1049,9 +1058,9 @@ class KrakenClient:
         "DOGE/USDT": "DOGEUSDT",
         "ATOM/USDT": "ATOMUSDT",   # ✅ disponible Kraken
         "LTC/USDT":  "LTCUSDT",    # ✅ disponible Kraken
-        "TRX/USDT":  "TRXUSDT",    # ✅ disponible Kraken
+        "UNI/USDT":  "UNIUSDT",    # ✅ disponible Kraken
         "ALGO/USDT": "ALGOUSDT",   # ✅ disponible Kraken
-        "XLM/USDT":  "XLMUSDT",    # ✅ disponible Kraken
+        "AAVE/USDT": "AAVEUSDT",   # ✅ disponible Kraken
     }
 
     def __init__(self, timeout: int = 10):
@@ -1281,9 +1290,9 @@ class QuantumEdgeBot:
         self.market_groups: Dict[str, List[str]] = {
             "MAJORS":        ["XBT/USDT", "ETH/USDT", "LTC/USDT"],
             "L1":            ["SOL/USDT", "AVAX/USDT", "ADA/USDT", "DOT/USDT", "ALGO/USDT"],
-            "PAYMENTS":      ["XRP/USDT", "XLM/USDT", "TRX/USDT"],
-            "DEFI_INFRA":    ["LINK/USDT", "ATOM/USDT"],
-            "SPECULATIVE":   ["DOGE/USDT", "BNB/USDT"],
+            "PAYMENTS":      ["XRP/USDT", "DOGE/USDT", "BNB/USDT"],
+            "DEFI":          ["LINK/USDT", "UNI/USDT", "AAVE/USDT"],
+            "INFRA":         ["ATOM/USDT"],
         }
 
     # ── Propriétés de commodité
@@ -1322,28 +1331,50 @@ class QuantumEdgeBot:
                 + " ..."
             )
 
-    # ── Persistance d'état
+    # ── Persistance d'état (PostgreSQL prioritaire, JSON fallback)
     def _save_state(self):
-        """Sauvegarde l'état essentiel du bot dans un fichier JSON."""
+        """Sauvegarde l'état du bot — PostgreSQL si dispo, JSON sinon."""
         if not self.cfg.enable_persistence:
             return
+        # ── PostgreSQL
+        if self.store.use_postgres:
+            self.store.save_bot_state(self.risk, self.perf)
+            return
+        # ── Fallback JSON
         try:
             state = {
-                "capital":       self.risk.capital,
-                "peak_capital":  self.risk.peak_capital,
-                "daily_pnl":     self.risk.daily_pnl,
-                "trades_today":  self.risk.trades_today,
-                "saved_at":      datetime.now(timezone.utc).isoformat(),
+                "capital":      self.risk.capital,
+                "peak_capital": self.risk.peak_capital,
+                "daily_pnl":    self.risk.daily_pnl,
+                "trades_today": self.risk.trades_today,
+                "saved_at":     datetime.now(timezone.utc).isoformat(),
             }
             with open(self.state_file, "w", encoding="utf-8") as f:
                 json.dump(state, f, indent=2)
-            log.debug(f"[STATE] État sauvegardé → {self.state_file}")
+            log.debug(f"[STATE] Sauvegardé → {self.state_file}")
         except Exception as e:
-            log.error(f"[STATE] Erreur sauvegarde : {e}")
+            log.error(f"[STATE] Erreur sauvegarde JSON : {e}")
 
     def _load_state(self):
-        """Restaure l'état du bot depuis le fichier JSON (redémarrage Railway)."""
-        if not self.cfg.enable_persistence or not self.state_file.exists():
+        """Restaure l'état du bot — PostgreSQL prioritaire, JSON fallback."""
+        if not self.cfg.enable_persistence:
+            return
+        # ── PostgreSQL
+        if self.store.use_postgres:
+            state = self.store.load_bot_state()
+            if state:
+                self.risk.capital      = float(state.get("capital",      self.risk.capital))
+                self.risk.peak_capital = float(state.get("peak_capital", self.risk.peak_capital))
+                self.risk.daily_pnl    = float(state.get("daily_pnl",    0.0))
+                self.risk.trades_today = int(state.get("trades_today",   0))
+                log.info(
+                    f"[STATE] État restauré (PostgreSQL) — "
+                    f"Capital: {self.risk.capital:.2f}€  "
+                    f"| Trades today: {self.risk.trades_today}"
+                )
+            return
+        # ── Fallback JSON
+        if not self.state_file.exists():
             return
         try:
             with open(self.state_file, "r", encoding="utf-8") as f:
@@ -1352,10 +1383,9 @@ class QuantumEdgeBot:
             self.risk.peak_capital = state.get("peak_capital", self.risk.peak_capital)
             self.risk.daily_pnl    = state.get("daily_pnl",    0.0)
             self.risk.trades_today = state.get("trades_today", 0)
-            saved_at = state.get("saved_at", "inconnu")
             log.info(
-                f"[STATE] État restauré — Capital: {self.risk.capital:.2f}€  "
-                f"| sauvegardé le {saved_at}"
+                f"[STATE] État restauré (JSON) — Capital: {self.risk.capital:.2f}€  "
+                f"| sauvegardé le {state.get('saved_at', '?')}"
             )
         except Exception as e:
             log.warning(f"[STATE] Impossible de restaurer : {e}")
@@ -1438,6 +1468,9 @@ class QuantumEdgeBot:
         self.paused_until[market] = time.time() + self.cfg.pause_after_trade
 
         self.perf.print_trade_closed(trade, reason)
+
+        # ── Enregistrer le trade en PostgreSQL
+        self.store.save_trade(trade)
 
         # Notification Telegram
         icon = "✅" if trade.pnl_eur > 0 else "❌"
@@ -1682,34 +1715,135 @@ class QuantumEdgeBot:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  MODULE 1 — DATA STORE (SQLite local, zéro dépendance externe)
+#  MODULE 1 — DATA STORE (PostgreSQL prioritaire, SQLite en fallback)
 # ─────────────────────────────────────────────────────────────────────────────
 class DataStore:
     """
-    Base de données SQLite locale pour stocker et requêter les bougies OHLCV.
+    Stockage persistant hybride :
+    - PostgreSQL (psycopg) si DATABASE_URL est défini → recommandé sur Railway
+    - SQLite local en fallback si psycopg absent ou DATABASE_URL vide
 
-    Structure :
-      table candles(market TEXT, interval_min INT, timestamp INT,
-                    open REAL, high REAL, low REAL, close REAL, volume REAL)
-
-    Usage :
-      store = DataStore()
-      store.save_candles("XBT/USDT", 15, candles_list)
-      candles = store.load_candles("XBT/USDT", 15, limit=500)
+    Tables gérées :
+      candles          — bougies OHLCV pour le backtester
+      bot_state        — état du bot (capital, PnL, stats)
+      trade_history    — historique complet des trades
+      backtest_results — résultats des runs de backtest / optimisation
     """
 
     def __init__(self, db_path: str = "quantum_edge_data.db"):
-        self.db_path = db_path
-        self._init_db()
+        self.db_path     = db_path
+        self.database_url = os.environ.get("DATABASE_URL", "")
+        self.use_postgres = PSYCOPG_AVAILABLE and bool(self.database_url)
 
-    def _conn(self) -> sqlite3.Connection:
+        if self.use_postgres:
+            self._init_postgres()
+            log.info("[DATASTORE] Mode PostgreSQL activé (Railway)")
+        else:
+            self._init_sqlite()
+            log.info(f"[DATASTORE] Mode SQLite activé : {self.db_path}")
+
+    # ── Connexions ────────────────────────────────────────────────────────────
+
+    def _pg_conn(self):
+        return psycopg.connect(self.database_url, row_factory=dict_row)
+
+    def _sqlite_conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
-    def _init_db(self):
-        with self._conn() as conn:
+    # ── Initialisation PostgreSQL ─────────────────────────────────────────────
+
+    def _init_postgres(self):
+        try:
+            with self._pg_conn() as conn:
+                with conn.cursor() as cur:
+                    # Table bot_state
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS bot_state (
+                            id               INTEGER PRIMARY KEY DEFAULT 1,
+                            capital          NUMERIC(15,2) NOT NULL DEFAULT 200.0,
+                            peak_capital     NUMERIC(15,2) NOT NULL DEFAULT 200.0,
+                            total_gagne      NUMERIC(15,2) NOT NULL DEFAULT 0,
+                            total_perdu      NUMERIC(15,2) NOT NULL DEFAULT 0,
+                            cumul_net        NUMERIC(15,2) NOT NULL DEFAULT 0,
+                            nb_trades        INTEGER NOT NULL DEFAULT 0,
+                            nb_wins          INTEGER NOT NULL DEFAULT 0,
+                            nb_losses        INTEGER NOT NULL DEFAULT 0,
+                            daily_pnl        NUMERIC(15,2) NOT NULL DEFAULT 0,
+                            trades_today     INTEGER NOT NULL DEFAULT 0,
+                            pertes_consecutives INTEGER NOT NULL DEFAULT 0,
+                            pause_until      BIGINT NOT NULL DEFAULT 0,
+                            CONSTRAINT single_row CHECK (id = 1)
+                        )
+                    """)
+                    # Table trade_history
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS trade_history (
+                            id            SERIAL PRIMARY KEY,
+                            timestamp     TIMESTAMP NOT NULL DEFAULT NOW(),
+                            marche        VARCHAR(20),
+                            direction     VARCHAR(10),
+                            resultat      VARCHAR(10),
+                            prix_entree   NUMERIC(20,8),
+                            prix_sortie   NUMERIC(20,8),
+                            stop_loss     NUMERIC(20,8),
+                            objectif      NUMERIC(20,8),
+                            mise          NUMERIC(15,2),
+                            gain          NUMERIC(15,2),
+                            capital_apres NUMERIC(15,2),
+                            duree_minutes INTEGER,
+                            score         INTEGER,
+                            adx           NUMERIC(6,2),
+                            rsi           NUMERIC(6,2),
+                            regime        VARCHAR(20),
+                            raison        VARCHAR(20)
+                        )
+                    """)
+                    # Table candles
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS candles (
+                            market       VARCHAR(20)  NOT NULL,
+                            interval_min INTEGER      NOT NULL,
+                            timestamp    BIGINT       NOT NULL,
+                            open         NUMERIC(20,8) NOT NULL,
+                            high         NUMERIC(20,8) NOT NULL,
+                            low          NUMERIC(20,8) NOT NULL,
+                            close        NUMERIC(20,8) NOT NULL,
+                            volume       NUMERIC(20,8) NOT NULL,
+                            PRIMARY KEY (market, interval_min, timestamp)
+                        )
+                    """)
+                    # Table backtest_results
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS backtest_results (
+                            id            SERIAL PRIMARY KEY,
+                            run_at        TIMESTAMP DEFAULT NOW(),
+                            params        TEXT,
+                            win_rate      NUMERIC(6,2),
+                            profit_factor NUMERIC(8,4),
+                            total_pnl     NUMERIC(15,2),
+                            max_drawdown  NUMERIC(6,2),
+                            total_trades  INTEGER,
+                            sharpe        NUMERIC(8,4)
+                        )
+                    """)
+                    # Insérer la ligne d'état si absente
+                    cur.execute("""
+                        INSERT INTO bot_state (id)
+                        VALUES (1) ON CONFLICT DO NOTHING
+                    """)
+                    conn.commit()
+        except Exception as e:
+            log.error(f"[DATASTORE] Erreur init PostgreSQL : {e} — bascule SQLite")
+            self.use_postgres = False
+            self._init_sqlite()
+
+    # ── Initialisation SQLite ─────────────────────────────────────────────────
+
+    def _init_sqlite(self):
+        with self._sqlite_conn() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS candles (
                     market       TEXT    NOT NULL,
@@ -1729,96 +1863,296 @@ class DataStore:
             """)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS backtest_results (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    run_at      TEXT,
-                    params      TEXT,
-                    win_rate    REAL,
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_at        TEXT,
+                    params        TEXT,
+                    win_rate      REAL,
                     profit_factor REAL,
-                    total_pnl   REAL,
-                    max_drawdown REAL,
-                    total_trades INTEGER,
-                    sharpe      REAL
+                    total_pnl     REAL,
+                    max_drawdown  REAL,
+                    total_trades  INTEGER,
+                    sharpe        REAL
                 )
             """)
-        log.info(f"[DATASTORE] Base SQLite initialisée : {self.db_path}")
 
-    def save_candles(self, market: str, interval_min: int, candles: List[Candle]):
-        """Insère ou met à jour les bougies (INSERT OR REPLACE)."""
+    # ── État du bot ───────────────────────────────────────────────────────────
+
+    def save_bot_state(self, risk: "RiskManager", perf: "PerformanceTracker"):
+        """Sauvegarde l'état complet du bot en PostgreSQL."""
+        if not self.use_postgres:
+            return
+        try:
+            with self._pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE bot_state SET
+                            capital             = %s,
+                            peak_capital        = %s,
+                            total_gagne         = %s,
+                            total_perdu         = %s,
+                            cumul_net           = %s,
+                            nb_trades           = %s,
+                            nb_wins             = %s,
+                            nb_losses           = %s,
+                            daily_pnl           = %s,
+                            trades_today        = %s,
+                            pertes_consecutives = %s
+                        WHERE id = 1
+                    """, (
+                        risk.capital,
+                        risk.peak_capital,
+                        perf.avg_win  * perf.winning_trades,
+                        abs(perf.avg_loss) * (perf.total_trades - perf.winning_trades),
+                        perf.total_pnl,
+                        perf.total_trades,
+                        perf.winning_trades,
+                        perf.total_trades - perf.winning_trades,
+                        risk.daily_pnl,
+                        risk.trades_today,
+                        perf.loss_streak,
+                    ))
+                    conn.commit()
+        except Exception as e:
+            log.error(f"[DATASTORE] Erreur save_bot_state : {e}")
+
+    def load_bot_state(self) -> Optional[Dict]:
+        """Charge l'état du bot depuis PostgreSQL."""
+        if not self.use_postgres:
+            return None
+        try:
+            with self._pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT * FROM bot_state WHERE id = 1")
+                    row = cur.fetchone()
+                    if not row:
+                        return None
+                    state = dict(row)
+                    for k in ["capital", "peak_capital", "total_gagne",
+                              "total_perdu", "cumul_net", "daily_pnl"]:
+                        if state.get(k) is not None:
+                            state[k] = float(state[k])
+                    return state
+        except Exception as e:
+            log.error(f"[DATASTORE] Erreur load_bot_state : {e}")
+            return None
+
+    def save_trade(self, trade: "Trade"):
+        """Enregistre un trade fermé dans trade_history (PostgreSQL)."""
+        if not self.use_postgres:
+            return
+        try:
+            duration = int((trade.exit_time - trade.entry_time).total_seconds() / 60) if trade.exit_time else 0
+            with self._pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO trade_history (
+                            marche, direction, resultat,
+                            prix_entree, prix_sortie,
+                            stop_loss, objectif,
+                            mise, gain, capital_apres,
+                            duree_minutes, score, regime
+                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """, (
+                        trade.market,
+                        trade.side.value,
+                        "WIN" if trade.pnl_eur > 0 else "LOSS",
+                        trade.entry_price,
+                        trade.exit_price,
+                        trade.stoploss_price(),
+                        trade.target_price(),
+                        trade.stake,
+                        trade.pnl_eur,
+                        None,   # capital_apres mis à jour via save_bot_state
+                        duration,
+                        trade.score,
+                        trade.regime.value,
+                    ))
+                    conn.commit()
+        except Exception as e:
+            log.error(f"[DATASTORE] Erreur save_trade : {e}")
+
+    def load_recent_trades(self, limit: int = 10) -> List[Dict]:
+        """Charge les N derniers trades depuis PostgreSQL."""
+        if not self.use_postgres:
+            return []
+        try:
+            with self._pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT marche, direction, resultat, prix_entree,
+                               prix_sortie, gain, capital_apres, timestamp, score
+                        FROM trade_history
+                        ORDER BY timestamp DESC LIMIT %s
+                    """, (limit,))
+                    rows = cur.fetchall()
+                    return [dict(r) for r in rows]
+        except Exception as e:
+            log.error(f"[DATASTORE] Erreur load_recent_trades : {e}")
+            return []
+
+    # ── Bougies OHLCV ─────────────────────────────────────────────────────────
+
+    def save_candles(self, market: str, interval_min: int, candles: List["Candle"]):
+        """Insère ou met à jour les bougies."""
         if not candles:
             return
-        rows = [
-            (market, interval_min, c.timestamp, c.open, c.high, c.low, c.close, c.volume)
-            for c in candles
-        ]
-        with self._conn() as conn:
-            conn.executemany(
-                "INSERT OR REPLACE INTO candles VALUES (?,?,?,?,?,?,?,?)", rows
-            )
-        log.debug(f"[DATASTORE] {len(rows)} bougies sauvegardées — {market} {interval_min}m")
+        if self.use_postgres:
+            try:
+                rows = [
+                    (market, interval_min, c.timestamp,
+                     c.open, c.high, c.low, c.close, c.volume)
+                    for c in candles
+                ]
+                with self._pg_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.executemany("""
+                            INSERT INTO candles
+                                (market, interval_min, timestamp, open, high, low, close, volume)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT (market, interval_min, timestamp) DO NOTHING
+                        """, rows)
+                        conn.commit()
+            except Exception as e:
+                log.debug(f"[DATASTORE] save_candles PG : {e}")
+        else:
+            rows = [
+                (market, interval_min, c.timestamp,
+                 c.open, c.high, c.low, c.close, c.volume)
+                for c in candles
+            ]
+            with self._sqlite_conn() as conn:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO candles VALUES (?,?,?,?,?,?,?,?)", rows
+                )
 
     def load_candles(
         self, market: str, interval_min: int, limit: int = 1000, after_ts: int = 0
-    ) -> List[Candle]:
-        """Charge les bougies triées par timestamp ASC."""
-        with self._conn() as conn:
-            rows = conn.execute(
-                """SELECT timestamp, open, high, low, close, volume
-                   FROM candles
-                   WHERE market=? AND interval_min=? AND timestamp>?
-                   ORDER BY timestamp ASC
-                   LIMIT ?""",
-                (market, interval_min, after_ts, limit),
-            ).fetchall()
-        return [Candle(r[0], r[1], r[2], r[3], r[4], r[5]) for r in rows]
+    ) -> List["Candle"]:
+        """Charge les bougies triées ASC."""
+        if self.use_postgres:
+            try:
+                with self._pg_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT timestamp, open, high, low, close, volume
+                            FROM candles
+                            WHERE market=%s AND interval_min=%s AND timestamp>%s
+                            ORDER BY timestamp ASC LIMIT %s
+                        """, (market, interval_min, after_ts, limit))
+                        rows = cur.fetchall()
+                return [Candle(
+                    int(r["timestamp"]), float(r["open"]), float(r["high"]),
+                    float(r["low"]), float(r["close"]), float(r["volume"])
+                ) for r in rows]
+            except Exception as e:
+                log.debug(f"[DATASTORE] load_candles PG : {e}")
+                return []
+        else:
+            with self._sqlite_conn() as conn:
+                rows = conn.execute(
+                    """SELECT timestamp, open, high, low, close, volume
+                       FROM candles
+                       WHERE market=? AND interval_min=? AND timestamp>?
+                       ORDER BY timestamp ASC LIMIT ?""",
+                    (market, interval_min, after_ts, limit),
+                ).fetchall()
+            return [Candle(r[0], r[1], r[2], r[3], r[4], r[5]) for r in rows]
 
     def candle_count(self, market: str, interval_min: int) -> int:
-        """Nombre de bougies stockées pour un marché/intervalle."""
-        with self._conn() as conn:
-            return conn.execute(
-                "SELECT COUNT(*) FROM candles WHERE market=? AND interval_min=?",
-                (market, interval_min),
-            ).fetchone()[0]
+        if self.use_postgres:
+            try:
+                with self._pg_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT COUNT(*) AS n FROM candles WHERE market=%s AND interval_min=%s",
+                            (market, interval_min)
+                        )
+                        row = cur.fetchone()
+                        return int(row["n"]) if row else 0
+            except Exception:
+                return 0
+        else:
+            with self._sqlite_conn() as conn:
+                return conn.execute(
+                    "SELECT COUNT(*) FROM candles WHERE market=? AND interval_min=?",
+                    (market, interval_min),
+                ).fetchone()[0]
+
+    # ── Backtest ──────────────────────────────────────────────────────────────
 
     def save_backtest_result(self, params: Dict, metrics: Dict):
-        """Persiste les résultats d'un run de backtest."""
-        with self._conn() as conn:
-            conn.execute(
-                """INSERT INTO backtest_results
-                   (run_at, params, win_rate, profit_factor, total_pnl,
-                    max_drawdown, total_trades, sharpe)
-                   VALUES (?,?,?,?,?,?,?,?)""",
-                (
-                    datetime.now(timezone.utc).isoformat(),
-                    json.dumps(params),
-                    metrics.get("win_rate", 0),
-                    metrics.get("profit_factor", 0),
-                    metrics.get("total_pnl", 0),
-                    metrics.get("max_drawdown", 0),
-                    metrics.get("total_trades", 0),
-                    metrics.get("sharpe", 0),
-                ),
-            )
+        if self.use_postgres:
+            try:
+                with self._pg_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            INSERT INTO backtest_results
+                                (params, win_rate, profit_factor, total_pnl,
+                                 max_drawdown, total_trades, sharpe)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s)
+                        """, (
+                            json.dumps(params),
+                            metrics.get("win_rate", 0),
+                            metrics.get("profit_factor", 0),
+                            metrics.get("total_pnl", 0),
+                            metrics.get("max_drawdown", 0),
+                            metrics.get("total_trades", 0),
+                            metrics.get("sharpe", 0),
+                        ))
+                        conn.commit()
+            except Exception as e:
+                log.debug(f"[DATASTORE] save_backtest_result PG : {e}")
+        else:
+            with self._sqlite_conn() as conn:
+                conn.execute(
+                    """INSERT INTO backtest_results
+                       (run_at, params, win_rate, profit_factor, total_pnl,
+                        max_drawdown, total_trades, sharpe)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    (
+                        datetime.now(timezone.utc).isoformat(),
+                        json.dumps(params),
+                        metrics.get("win_rate", 0),
+                        metrics.get("profit_factor", 0),
+                        metrics.get("total_pnl", 0),
+                        metrics.get("max_drawdown", 0),
+                        metrics.get("total_trades", 0),
+                        metrics.get("sharpe", 0),
+                    ),
+                )
 
     def best_backtest_results(self, top_n: int = 5) -> List[Dict]:
-        """Retourne les N meilleurs runs par profit_factor."""
-        with self._conn() as conn:
-            rows = conn.execute(
-                """SELECT run_at, params, win_rate, profit_factor, total_pnl,
-                          max_drawdown, total_trades, sharpe
-                   FROM backtest_results
-                   ORDER BY profit_factor DESC
-                   LIMIT ?""",
-                (top_n,),
-            ).fetchall()
-        return [
-            {
-                "run_at": r[0], "params": json.loads(r[1]),
-                "win_rate": r[2], "profit_factor": r[3],
-                "total_pnl": r[4], "max_drawdown": r[5],
-                "total_trades": r[6], "sharpe": r[7],
-            }
-            for r in rows
-        ]
+        if self.use_postgres:
+            try:
+                with self._pg_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT run_at, params, win_rate, profit_factor,
+                                   total_pnl, max_drawdown, total_trades, sharpe
+                            FROM backtest_results
+                            ORDER BY profit_factor DESC LIMIT %s
+                        """, (top_n,))
+                        return [dict(r) for r in cur.fetchall()]
+            except Exception:
+                return []
+        else:
+            with self._sqlite_conn() as conn:
+                rows = conn.execute(
+                    """SELECT run_at, params, win_rate, profit_factor, total_pnl,
+                              max_drawdown, total_trades, sharpe
+                       FROM backtest_results
+                       ORDER BY profit_factor DESC LIMIT ?""",
+                    (top_n,),
+                ).fetchall()
+            return [
+                {
+                    "run_at": r[0], "params": json.loads(r[1]),
+                    "win_rate": r[2], "profit_factor": r[3],
+                    "total_pnl": r[4], "max_drawdown": r[5],
+                    "total_trades": r[6], "sharpe": r[7],
+                }
+                for r in rows
+            ]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2540,6 +2874,8 @@ if __name__ == "__main__":
     cfg.use_telegram      = os.environ.get("USE_TELEGRAM", "false").lower() == "true"
     cfg.telegram_token    = os.environ.get("TELEGRAM_TOKEN", "")
     cfg.telegram_chat_id  = os.environ.get("TELEGRAM_CHAT_ID", "")
+    # ── PostgreSQL (Railway fournit DATABASE_URL automatiquement)
+    cfg.database_url      = os.environ.get("DATABASE_URL", "")
 
     # ────────────────────────────────────────────────────────────────────────
     #  MODE CLI — usage : python bot_trading.py [commande]
