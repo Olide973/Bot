@@ -8,13 +8,15 @@
 ║          ██████╔╝╚██████╔╝   ██║        ╚████╔╝ ██████╔╝                    ║
 ║          ╚═════╝  ╚═════╝    ╚═╝         ╚═══╝  ╚═════╝                     ║
 ║                                                                              ║
-║                  QUANTUM EDGE TRADING SYSTEM — v2.0                         ║
-║          Multi-Signal · Risk-Controlled · Adaptive Intelligence              ║
+║                  QUANTUM EDGE TRADING SYSTEM — v3.0                         ║
+║  Backtest · Optimizer · Walk-Forward · Data Store · Dashboard Web           ║
 ║                                                                              ║
-║  Marchés  : 15 paires crypto soigneusement sélectionnées                    ║
-║  Signaux  : ADX · EMA · RSI · Bollinger · Volume · Tendance Macro           ║
-║  Gestion  : Trailing Stop · Kill Switch · Drawdown Guard · Kelly Sizing     ║
-║  Source   : Kraken API (prix) — compatible Binance Futures (live)           ║
+║  Marchés  : 15 paires crypto — classement dynamique ADX/Volume              ║
+║  Signaux  : ADX · EMA · RSI · Bollinger · Volume · Macro · Divergence       ║
+║  Risque   : Trailing · Kill Switch · Partial TP · Smart Defense · Vol Adj   ║
+║  Filtres  : Pearson ρ · Corrélation Groupe · Bougie Exp. · Score Adaptatif  ║
+║  Validation: Backtester · Grid Search · Walk-Forward · SQLite DataStore     ║
+║  Monitoring: Dashboard HTML · Telegram · Persistance JSON                   ║
 ║                                                                              ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
@@ -27,9 +29,14 @@ aucun système ne garantit des profits constants. Tradez avec prudence.
 #  IMPORTS
 # ─────────────────────────────────────────────────────────────────────────────
 import asyncio
+import hashlib
+import itertools
+import json
 import logging
 import math
 import os
+import random
+import sqlite3
 import statistics
 import sys
 import time
@@ -37,7 +44,8 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 
@@ -95,11 +103,11 @@ class BotConfig:
         "ADA/USDT",   # Cardano       — cycles réguliers, technique lisible
         "DOT/USDT",   # Polkadot      — interopérabilité, swings propres
         "DOGE/USDT",  # Dogecoin      — forte volatilité, volumes élevés
-        "MATIC/USDT", # Polygon       — scaling Ethereum, cycles courts
-        "ATOM/USDT",  # Cosmos        — IBC leader, tendances franches
-        "NEAR/USDT",  # NEAR Protocol — L1 émergent, bons patterns
-        "APT/USDT",   # Aptos         — Move VM, volatilité exploitable
-        "OP/USDT",    # Optimism      — L2 Ethereum, momentum solide
+        "ATOM/USDT",  # Cosmos        — IBC leader, tendances franches ✅ remplace MATIC
+        "LTC/USDT",   # Litecoin      — haute liquidité Kraken, cycles nets ✅ remplace NEAR
+        "TRX/USDT",   # TRON          — volume élevé, disponible Kraken ✅ remplace APT
+        "ALGO/USDT",  # Algorand      — disponible Kraken, swings exploitables ✅ remplace OP
+        "XLM/USDT",   # Stellar       — corrélé XRP, bonne volatilité ✅ remplace BNB si erreur
     ])
 
     # ── Timeframes
@@ -146,6 +154,43 @@ class BotConfig:
     # ── Frais Binance Futures (taker)
     fee_pct: float = 0.04  # 0.04% par trade (entrée + sortie = ~0.08%)
 
+    # ── Protection corrélation
+    correlation_filter_enabled: bool = True
+    max_correlated_positions:   int   = 2
+
+    # ── Filtre bougie explosive
+    max_single_candle_pct: float = 3.5  # ignorer si dernière bougie > 3.5%
+
+    # ── Take-profit partiel
+    partial_tp_enabled:  bool  = True
+    partial_tp_trigger:  float = 0.35   # déclenche à +0.35% de gain levierisé
+    partial_tp_size:     float = 0.50   # sécurise 50% du PnL latent
+
+    # ── Cooldown après série de pertes
+    max_consecutive_losses:  int = 4
+    cooldown_after_losses:   int = 1800  # 30 minutes
+
+    # ── Smart Defense (réduction de mise après gain significatif)
+    smart_defense_enabled:         bool  = True
+    smart_defense_trigger:         float = 8.0   # déclenche si capital +8%
+    smart_defense_stake_reduction: float = 0.50  # réduit la mise de 50%
+
+    # ── Corrélation manager (Pearson 1h)
+    correlation_threshold: float = 0.75   # seuil |ρ| max entre positions
+    max_correlated_trades: int   = 2      # max trades dans un même cluster
+
+    # ── Ajustement dynamique de mise selon volatilité
+    volatility_adjust: bool = True
+
+    # ── Persistance d'état
+    enable_persistence: bool = True
+    state_file:         str  = "quantum_edge_state.json"
+
+    # ── Notifications Telegram (désactivé par défaut)
+    use_telegram:       bool = False
+    telegram_token:     str  = ""
+    telegram_chat_id:   str  = ""
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  STRUCTURES DE DONNÉES
@@ -172,10 +217,11 @@ class Trade:
     exit_price:   Optional[float] = None
     exit_time:    Optional[datetime] = None
     pnl_eur:      float = 0.0
-    trailing_stop: Optional[float] = None
-    peak_price:   Optional[float] = None
-    score:        int = 0
-    regime:       MarketRegime = MarketRegime.RANGING
+    trailing_stop:  Optional[float] = None
+    peak_price:     Optional[float] = None
+    score:          int = 0
+    regime:         MarketRegime = MarketRegime.RANGING
+    partial_taken:  bool = False
 
     def position_size(self) -> float:
         """Taille de la position en € (stake × levier)."""
@@ -341,6 +387,13 @@ class Indicators:
             return "BEARISH_DIVERGENCE"
         return None
 
+    @staticmethod
+    def candle_explosion(candle: Candle) -> float:
+        """Retourne le % de mouvement corps de la dernière bougie."""
+        if candle.open == 0:
+            return 0.0
+        return abs(candle.close - candle.open) / candle.open * 100
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  MOTEUR DE SIGNAL
@@ -391,7 +444,6 @@ class SignalEngine:
         ema200_1h = self.ind.ema(closes_1h, 200) if len(closes_1h) >= 200 else self.ind.ema(closes_1h, len(closes_1h)//2 or 1)
         ema_fast_1h = self.ind.ema(closes_1h, 20)
         ema_slow_1h = self.ind.ema(closes_1h, 50)
-
         price = closes_15m[-1]
         macro_bull = len(ema200_1h) > 0 and price > ema200_1h[-1]
         macro_bear = len(ema200_1h) > 0 and price < ema200_1h[-1]
@@ -581,6 +633,17 @@ class SignalEngine:
         else:
             sell_details["volume"] = 0
 
+        # ─── BONUS FORCE MACRO (EMA20/EMA50 1h) ─────────────────────────
+        # Si l'écart EMA20–EMA50 1h est significatif (≥ 1%), tendance forte
+        macro_trend_strength = 0
+        if len(ema_fast_1h) > 0 and len(ema_slow_1h) > 0 and ema_slow_1h[-1] != 0:
+            diff = abs(ema_fast_1h[-1] - ema_slow_1h[-1]) / ema_slow_1h[-1] * 100
+            if diff >= 1.0:
+                macro_trend_strength = 2
+
+        buy_score  += macro_trend_strength
+        sell_score += macro_trend_strength
+
         # ─── FILTRE ANTI-FAKEOUT ─────────────────────────────────────────
         # Si le marché est en range et l'ADX est faible → diviser le score par 2
         if regime == MarketRegime.RANGING and adx_val < 18:
@@ -592,24 +655,35 @@ class SignalEngine:
             buy_score  = int(buy_score * 0.7)
             sell_score = int(sell_score * 0.7)
 
+        # ─── SCORE MINIMUM ADAPTATIF (selon régime) ──────────────────────
+        adaptive_score_min = self.cfg.score_min
+        if regime == MarketRegime.RANGING:
+            adaptive_score_min += 3    # plus strict en range
+        elif regime == MarketRegime.VOLATILE:
+            adaptive_score_min += 5    # très strict en volatilité extrême
+        elif regime in (MarketRegime.TRENDING_UP, MarketRegime.TRENDING_DOWN):
+            adaptive_score_min -= 1    # légèrement assoupli en tendance franche
+
         # ─── DÉCISION ────────────────────────────────────────────────────
         details = {}
-        if buy_score >= self.cfg.score_min and buy_score > sell_score:
+        if buy_score >= adaptive_score_min and buy_score > sell_score:
             details = buy_details
             details["total"] = buy_score
             details["rsi_val"] = round(rsi_val, 1)
             details["adx_val"] = round(adx_val, 1)
             details["vol_ratio"] = round(vol_ratio, 2)
             details["regime"] = regime.value
+            details["adaptive_score_min"] = adaptive_score_min
             return Signal.BUY, buy_score, details, regime
 
-        if sell_score >= self.cfg.score_min and sell_score > buy_score:
+        if sell_score >= adaptive_score_min and sell_score > buy_score:
             details = sell_details
             details["total"] = sell_score
             details["rsi_val"] = round(rsi_val, 1)
             details["adx_val"] = round(adx_val, 1)
             details["vol_ratio"] = round(vol_ratio, 2)
             details["regime"] = regime.value
+            details["adaptive_score_min"] = adaptive_score_min
             return Signal.SELL, sell_score, details, regime
 
         return Signal.NONE, max(buy_score, sell_score), {}, regime
@@ -675,6 +749,24 @@ class RiskManager:
         stake = self.capital * kelly
         return max(10.0, min(stake, self.cfg.stake_eur))
 
+    def adjust_for_volatility(self, base_stake: float, atr_pct: float) -> float:
+        """Ajuste dynamiquement la mise selon la volatilité ATR récente.
+
+        Formule : factor = clamp(0.04 / atr_pct, 0.65, 1.0)
+        → ATR élevé  → factor < 1 → mise réduite (marché trop volatile)
+        → ATR normal → factor ≈ 1 → mise inchangée
+        """
+        if not self.cfg.volatility_adjust or atr_pct <= 0:
+            return base_stake
+        factor = max(0.65, min(1.0, 0.04 / atr_pct))
+        adjusted = round(base_stake * factor, 2)
+        if factor < 1.0:
+            log.debug(
+                f"[VOL ADJ] ATR={atr_pct:.4f}%  factor={factor:.2f}  "
+                f"mise {base_stake:.2f}€ → {adjusted:.2f}€"
+            )
+        return adjusted
+
     def update_trailing_stop(self, trade: Trade, current_price: float) -> Optional[float]:
         """Met à jour le trailing stop. Retourne le nouveau stop ou None."""
         if trade.trailing_stop is None:
@@ -711,6 +803,16 @@ class RiskManager:
                     return new_stop
         return trade.trailing_stop
 
+    def should_partial_take(self, trade: Trade, current_price: float) -> bool:
+        """Vérifie si le take-profit partiel doit être déclenché."""
+        if trade.partial_taken:
+            return False
+        if trade.side == Signal.BUY:
+            pct = (current_price - trade.entry_price) / trade.entry_price * 100 * trade.leverage
+        else:
+            pct = (trade.entry_price - current_price) / trade.entry_price * 100 * trade.leverage
+        return pct >= self.cfg.partial_tp_trigger
+
     def should_exit(self, trade: Trade, current_price: float) -> Tuple[bool, str]:
         """Vérifie si un trade doit être fermé."""
         # Mise à jour trailing
@@ -734,6 +836,198 @@ class RiskManager:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  CORRELATION MANAGER — corrélation Pearson 1h, rafraîchie toutes les 30 min
+# ─────────────────────────────────────────────────────────────────────────────
+class CorrelationManager:
+    """
+    Évite la sur-exposition sur des paires trop corrélées.
+
+    Calcule les coefficients de Pearson sur les clôtures horaires (150 bougies)
+    et met en cache les résultats pendant 30 minutes pour limiter les appels API.
+    Avant chaque ouverture de trade, vérifie que le marché candidat n'est pas
+    trop corrélé (|ρ| ≥ cfg.correlation_threshold) avec les positions déjà ouvertes.
+    """
+
+    def __init__(self, cfg: BotConfig):
+        self.cfg = cfg
+        self.correlation_cache: Dict[str, float] = {}  # clé md5 → ρ
+        self.last_update: float = 0.0
+
+    @staticmethod
+    def _pair_key(m1: str, m2: str) -> str:
+        """Clé de cache déterministe (ordre indépendant)."""
+        pair = ":".join(sorted([m1, m2]))
+        return hashlib.md5(pair.encode()).hexdigest()
+
+    async def update_correlations(self, kraken: "KrakenClient", markets: List[str]):
+        """Met à jour le cache de corrélations toutes les 30 minutes."""
+        if time.time() - self.last_update < 1800:
+            return
+
+        log.info("[CORR MGR] Mise à jour des corrélations 1h entre marchés...")
+        closes: Dict[str, List[float]] = {}
+        for market in markets:
+            candles = await kraken.fetch_ohlcv(market, 60, 150)
+            if len(candles) >= 100:
+                closes[market] = [c.close for c in candles[-120:]]
+
+        count = 0
+        for i, m1 in enumerate(markets):
+            for m2 in markets[i + 1:]:
+                if m1 not in closes or m2 not in closes:
+                    continue
+                try:
+                    corr = statistics.correlation(closes[m1], closes[m2])
+                    self.correlation_cache[self._pair_key(m1, m2)] = corr
+                    count += 1
+                except Exception:
+                    continue
+
+        self.last_update = time.time()
+        log.info(f"[CORR MGR] {count} paires analysées et mises en cache.")
+
+    def can_open_trade(self, market: str, open_trades: Dict[str, "Trade"]) -> bool:
+        """
+        Retourne True si `market` peut être ouvert sans sur-exposer
+        le portefeuille sur des actifs trop corrélés.
+        """
+        correlated_count = 0
+        for open_m in open_trades.keys():
+            key  = self._pair_key(market, open_m)
+            corr = self.correlation_cache.get(key, 0.0)
+            if abs(corr) >= self.cfg.correlation_threshold:
+                correlated_count += 1
+        return correlated_count < self.cfg.max_correlated_trades
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TELEGRAM NOTIFIER — notifications élégantes et professionnelles
+# ─────────────────────────────────────────────────────────────────────────────
+class TelegramNotifier:
+    """
+    Envoie des notifications Telegram HTML-formatées sur les événements clés :
+    ouverture/fermeture de trade, kill switch, cooldown, dashboard périodique.
+
+    Activé uniquement si cfg.use_telegram=True et que token + chat_id sont fournis.
+    Désactivé silencieusement en cas d'erreur réseau pour ne jamais bloquer le bot.
+    """
+
+    def __init__(self, cfg: BotConfig):
+        self.cfg     = cfg
+        self.enabled = cfg.use_telegram and bool(
+            cfg.telegram_token and cfg.telegram_chat_id
+        )
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def send(self, message: str, parse_mode: str = "HTML"):
+        """Envoie un message Telegram. Fail-silent."""
+        if not self.enabled:
+            return
+        try:
+            url     = f"https://api.telegram.org/bot{self.cfg.telegram_token}/sendMessage"
+            payload = {
+                "chat_id":    self.cfg.telegram_chat_id,
+                "text":       message,
+                "parse_mode": parse_mode,
+            }
+            session = await self._get_session()
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5)):
+                pass
+        except Exception as e:
+            log.debug(f"[TELEGRAM] Erreur envoi : {e}")
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  FILTRE DE CORRÉLATION INTER-MARCHÉS
+# ─────────────────────────────────────────────────────────────────────────────
+class CorrelationFilter:
+    """
+    Évite la concentration de risque en bloquant les trades sur des marchés
+    trop corrélés aux positions déjà ouvertes.
+
+    Calcule la corrélation de Pearson sur une fenêtre glissante de N bougies
+    (returns logarithmiques). Si la corrélation absolue dépasse le seuil
+    avec un trade déjà ouvert, le signal est rejeté.
+
+    Cela force le bot à diversifier naturellement ses positions.
+    """
+
+    def __init__(self, cfg: BotConfig):
+        self.cfg = cfg
+        self.correlation_window:    int   = 50    # bougies pour le calcul
+        self.correlation_threshold: float = 0.75  # seuil |ρ| ≥ 0.75 → bloquer
+        # Cache des prix de clôture par marché (fenêtre glissante)
+        self._price_history: Dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=self.correlation_window)
+        )
+
+    def update(self, market: str, closes: List[float]):
+        """Ajoute les derniers prix à l'historique glissant."""
+        if not closes:
+            return
+        for c in closes[-5:]:  # on ajoute les 5 dernières bougies max
+            self._price_history[market].append(c)
+
+    def _log_returns(self, prices: List[float]) -> List[float]:
+        """Calcule les returns logarithmiques."""
+        if len(prices) < 2:
+            return []
+        return [math.log(prices[i] / prices[i - 1]) for i in range(1, len(prices))]
+
+    def _pearson(self, x: List[float], y: List[float]) -> float:
+        """Coefficient de corrélation de Pearson entre deux séries."""
+        n = min(len(x), len(y))
+        if n < 10:
+            return 0.0
+        x, y = x[-n:], y[-n:]
+        mean_x = sum(x) / n
+        mean_y = sum(y) / n
+        cov   = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y))
+        std_x = math.sqrt(sum((xi - mean_x) ** 2 for xi in x))
+        std_y = math.sqrt(sum((yi - mean_y) ** 2 for yi in y))
+        if std_x == 0 or std_y == 0:
+            return 0.0
+        return cov / (std_x * std_y)
+
+    def is_safe_to_open(
+        self, market: str, open_markets: List[str]
+    ) -> Tuple[bool, float]:
+        """
+        Vérifie si `market` peut être tradé sans concentrer le risque.
+
+        Retourne (autorisé, corrélation_maximale_observée).
+        """
+        if not open_markets or market in open_markets:
+            return True, 0.0
+
+        prices_candidate = list(self._price_history.get(market, []))
+        returns_candidate = self._log_returns(prices_candidate)
+        if len(returns_candidate) < 10:
+            return True, 0.0  # pas assez de données → on autorise
+
+        max_corr = 0.0
+        for open_market in open_markets:
+            prices_open  = list(self._price_history.get(open_market, []))
+            returns_open = self._log_returns(prices_open)
+            if len(returns_open) < 10:
+                continue
+            corr     = self._pearson(returns_candidate, returns_open)
+            max_corr = max(max_corr, abs(corr))
+
+        is_safe = max_corr < self.correlation_threshold
+        return is_safe, max_corr
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  CLIENT KRAKEN (source de prix)
 # ─────────────────────────────────────────────────────────────────────────────
 class KrakenClient:
@@ -743,21 +1037,21 @@ class KrakenClient:
 
     # Mapping des symboles Kraken → Binance
     SYMBOL_MAP = {
-        "XBT/USDT": "XBTUSDT",
-        "ETH/USDT": "ETHUSDT",
-        "SOL/USDT": "SOLUSDT",
-        "BNB/USDT": "BNBUSDT",
-        "XRP/USDT": "XRPUSDT",
+        "XBT/USDT":  "XBTUSDT",
+        "ETH/USDT":  "ETHUSDT",
+        "SOL/USDT":  "SOLUSDT",
+        "BNB/USDT":  "BNBUSDT",
+        "XRP/USDT":  "XRPUSDT",
         "AVAX/USDT": "AVAXUSDT",
         "LINK/USDT": "LINKUSDT",
-        "ADA/USDT": "ADAUSDT",
-        "DOT/USDT": "DOTUSDT",
+        "ADA/USDT":  "ADAUSDT",
+        "DOT/USDT":  "DOTUSDT",
         "DOGE/USDT": "DOGEUSDT",
-        "MATIC/USDT": "MATICUSDT",
-        "ATOM/USDT": "ATOMUSDT",
-        "NEAR/USDT": "NEARUSDT",
-        "APT/USDT": "APTUSDT",
-        "OP/USDT": "OPUSDT",
+        "ATOM/USDT": "ATOMUSDT",   # ✅ disponible Kraken
+        "LTC/USDT":  "LTCUSDT",    # ✅ disponible Kraken
+        "TRX/USDT":  "TRXUSDT",    # ✅ disponible Kraken
+        "ALGO/USDT": "ALGOUSDT",   # ✅ disponible Kraken
+        "XLM/USDT":  "XLMUSDT",    # ✅ disponible Kraken
     }
 
     def __init__(self, timeout: int = 10):
@@ -973,6 +1267,24 @@ class QuantumEdgeBot:
         self.paused_until: Dict[str, float] = {}  # market → timestamp
         self._iter   = 0
         self._win_history: deque = deque(maxlen=50)  # pour Kelly dynamique
+        self.global_cooldown_until: float = 0.0
+        self.corr_filter     = CorrelationFilter(cfg)
+        self.correlation_mgr = CorrelationManager(cfg)
+        self.notifier        = TelegramNotifier(cfg)
+        self.state_file      = Path(cfg.state_file)
+        # ── Nouveaux modules v3.0
+        self.store      = DataStore()
+        self.downloader = HistoricalDownloader(self.kraken, self.store)
+        self.dashboard  = DashboardServer(self.perf, self.risk, self.open_trades, port=8080)
+
+        # ── Groupes de corrélation
+        self.market_groups: Dict[str, List[str]] = {
+            "MAJORS":        ["XBT/USDT", "ETH/USDT", "LTC/USDT"],
+            "L1":            ["SOL/USDT", "AVAX/USDT", "ADA/USDT", "DOT/USDT", "ALGO/USDT"],
+            "PAYMENTS":      ["XRP/USDT", "XLM/USDT", "TRX/USDT"],
+            "DEFI_INFRA":    ["LINK/USDT", "ATOM/USDT"],
+            "SPECULATIVE":   ["DOGE/USDT", "BNB/USDT"],
+        }
 
     # ── Propriétés de commodité
     @property
@@ -980,6 +1292,79 @@ class QuantumEdgeBot:
         if not self._win_history:
             return 0.55  # prior conservateur
         return sum(self._win_history) / len(self._win_history)
+
+    # ── Filtre de corrélation
+    def _count_correlated_positions(self, market: str) -> int:
+        """Compte les positions ouvertes dans le même groupe de corrélation."""
+        for _group_name, group in self.market_groups.items():
+            if market in group:
+                return sum(1 for m in self.open_trades if m in group)
+        return 0
+
+    # ── Classement dynamique des marchés
+    async def _rank_markets(self):
+        """Re-trie self.cfg.markets par score ADX + volume pour prioriser les plus actifs."""
+        ranked = []
+        for market in self.cfg.markets:
+            candles = await self.kraken.fetch_ohlcv(market, self.cfg.tf_primary, 50)
+            if not candles:
+                continue
+            adx_val, _, _ = self.engine.ind.adx(candles)
+            vol_ratio      = self.engine.ind.volume_ratio(candles)
+            score          = adx_val + (vol_ratio * 10)
+            ranked.append((market, score))
+        ranked.sort(key=lambda x: x[1], reverse=True)
+        if ranked:
+            self.cfg.markets = [m for m, _ in ranked]
+            log.info(
+                "[MARKETS] Classement mis à jour : "
+                + " > ".join(m.split("/")[0] for m, _ in ranked[:5])
+                + " ..."
+            )
+
+    # ── Persistance d'état
+    def _save_state(self):
+        """Sauvegarde l'état essentiel du bot dans un fichier JSON."""
+        if not self.cfg.enable_persistence:
+            return
+        try:
+            state = {
+                "capital":       self.risk.capital,
+                "peak_capital":  self.risk.peak_capital,
+                "daily_pnl":     self.risk.daily_pnl,
+                "trades_today":  self.risk.trades_today,
+                "saved_at":      datetime.now(timezone.utc).isoformat(),
+            }
+            with open(self.state_file, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2)
+            log.debug(f"[STATE] État sauvegardé → {self.state_file}")
+        except Exception as e:
+            log.error(f"[STATE] Erreur sauvegarde : {e}")
+
+    def _load_state(self):
+        """Restaure l'état du bot depuis le fichier JSON (redémarrage Railway)."""
+        if not self.cfg.enable_persistence or not self.state_file.exists():
+            return
+        try:
+            with open(self.state_file, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            self.risk.capital      = state.get("capital",      self.risk.capital)
+            self.risk.peak_capital = state.get("peak_capital", self.risk.peak_capital)
+            self.risk.daily_pnl    = state.get("daily_pnl",    0.0)
+            self.risk.trades_today = state.get("trades_today", 0)
+            saved_at = state.get("saved_at", "inconnu")
+            log.info(
+                f"[STATE] État restauré — Capital: {self.risk.capital:.2f}€  "
+                f"| sauvegardé le {saved_at}"
+            )
+        except Exception as e:
+            log.warning(f"[STATE] Impossible de restaurer : {e}")
+
+    # ── Notifications Telegram
+    async def _send_notification(self, title: str, message: str):
+        """Enveloppe de notification avec formatage HTML standard."""
+        full_msg = f"<b>⚡ {title}</b>\n{message}"
+        await self.notifier.send(full_msg)
 
     # ── Ouverture d'un trade
     def _open_trade(self, market: str, signal: Signal, price: float, score: int, regime: MarketRegime) -> Trade:
@@ -989,6 +1374,26 @@ class QuantumEdgeBot:
             win_pct  = self.cfg.target_pct / 100,
             loss_pct = self.cfg.stoploss_pct / 100,
         )
+
+        # ── Ajustement volatilité (ATR % sur 14 bougies 15m)
+        # On récupère les candles depuis le cache corr_filter si disponible
+        prices = list(self.corr_filter._price_history.get(market, []))
+        if len(prices) >= 15:
+            recent_range = max(prices[-14:]) - min(prices[-14:])
+            atr_pct = (recent_range / prices[-1]) * 100 if prices[-1] else 0
+            stake = self.risk.adjust_for_volatility(stake, atr_pct)
+
+        # ── Smart Defense : réduire la mise si le capital a bien progressé
+        if self.cfg.smart_defense_enabled:
+            capital_gain_pct = (
+                (self.risk.capital - self.cfg.initial_capital) / self.cfg.initial_capital
+            ) * 100
+            if capital_gain_pct >= self.cfg.smart_defense_trigger:
+                stake *= self.cfg.smart_defense_stake_reduction
+                log.info(
+                    f"[SMART DEFENSE] Capital +{capital_gain_pct:.1f}% — "
+                    f"mise réduite à {stake:.2f}€ pour protéger les gains"
+                )
         trade = Trade(
             market      = market,
             side        = signal,
@@ -1009,6 +1414,14 @@ class QuantumEdgeBot:
             f"target={trade.target_price():.6f}  "
             f"SL={trade.stoploss_price():.6f}"
         )
+        asyncio.ensure_future(self._send_notification(
+            f"📈 TRADE OUVERT — {market}",
+            f"Direction : <b>{signal.value}</b>\n"
+            f"Prix : {price:.6f}\n"
+            f"Mise : {stake:.2f}€ × x{self.cfg.leverage}\n"
+            f"Score : {score}/30  |  Régime : {regime.value}\n"
+            f"Target : {trade.target_price():.6f}  |  SL : {trade.stoploss_price():.6f}"
+        ))
         return trade
 
     # ── Fermeture d'un trade
@@ -1026,6 +1439,19 @@ class QuantumEdgeBot:
 
         self.perf.print_trade_closed(trade, reason)
 
+        # Notification Telegram
+        icon = "✅" if trade.pnl_eur > 0 else "❌"
+        asyncio.ensure_future(self._send_notification(
+            f"{icon} TRADE FERMÉ — {market}",
+            f"Direction : <b>{trade.side.value}</b>  |  Raison : {reason}\n"
+            f"Entrée : {trade.entry_price:.6f}  →  Sortie : {trade.exit_price:.6f}\n"
+            f"PnL : <b>{trade.pnl_eur:+.2f}€</b>\n"
+            f"Capital : {self.risk.capital:.2f}€  |  PnL jour : {self.risk.daily_pnl:+.2f}€"
+        ))
+
+        # Sauvegarde persistante après chaque trade
+        self._save_state()
+
         if self.cfg.simulation_mode:
             log.info(
                 f"[SIM]   Capital simulé : {self.risk.capital:.2f}€  "
@@ -1038,19 +1464,42 @@ class QuantumEdgeBot:
         if market in self.paused_until and time.time() < self.paused_until[market]:
             return
 
-        # Fetch candles
+        # ── Mesure de latence Kraken
+        start = time.perf_counter()
         candles_15m = await self.kraken.fetch_ohlcv(market, self.cfg.tf_primary, self.cfg.candles_required)
         candles_1h  = await self.kraken.fetch_ohlcv(market, self.cfg.tf_confirmation, self.cfg.candles_required)
+        latency = time.perf_counter() - start
+        if latency > 2.0:
+            log.warning(f"[LATENCY] {market} Kraken lent : {latency:.2f}s")
 
         if len(candles_15m) < 50 or len(candles_1h) < 50:
             log.debug(f"[{market}] Données insuffisantes ({len(candles_15m)} bougie(s) 15m)")
             return
 
         price = candles_15m[-1].close
+        closes_15m_list = [c.close for c in candles_15m]
+
+        # ── Persister les nouvelles bougies en SQLite
+        self.store.save_candles(market, self.cfg.tf_primary,     candles_15m[-10:])
+        self.store.save_candles(market, self.cfg.tf_confirmation, candles_1h[-5:])
+
+        # ── Alimenter le filtre de corrélation (historique glissant)
+        self.corr_filter.update(market, closes_15m_list)
 
         # ── Gestion des trades ouverts
         if market in self.open_trades:
             trade = self.open_trades[market]
+
+            # Take-profit partiel
+            if self.cfg.partial_tp_enabled and self.risk.should_partial_take(trade, price):
+                secured = trade.unrealized_pnl(price) * self.cfg.partial_tp_size
+                trade.partial_taken = True
+                self.risk.capital += secured
+                log.info(
+                    f"[PARTIAL TP] {market:<12} profit partiel sécurisé : {secured:+.2f}€  "
+                    f"(50% du PnL latent)"
+                )
+
             should_exit, reason = self.risk.should_exit(trade, price)
             if should_exit:
                 self._close_trade(market, price, reason)
@@ -1060,17 +1509,49 @@ class QuantumEdgeBot:
         if len(self.open_trades) >= self.cfg.max_open_trades:
             return
 
+        # ── Filtre bougie explosive
+        last_candle_move = Indicators.candle_explosion(candles_15m[-1])
+        if last_candle_move >= self.cfg.max_single_candle_pct:
+            log.info(
+                f"[FILTER] {market:<12} ignoré — bougie explosive {last_candle_move:.2f}% "
+                f"(seuil : {self.cfg.max_single_candle_pct}%)"
+            )
+            return
+
+        # ── Filtre corrélation
+        if self.cfg.correlation_filter_enabled:
+            correlated = self._count_correlated_positions(market)
+            if correlated >= self.cfg.max_correlated_positions:
+                log.info(
+                    f"[FILTER] {market:<12} ignoré — "
+                    f"{correlated} positions corrélées déjà ouvertes"
+                )
+                return
+
         # ── Calcul du signal
         signal, score, details, regime = self.engine.compute(candles_15m, candles_1h)
 
         if signal != Signal.NONE:
+            # ── Filtre de corrélation Pearson (inter-marchés, returns log)
+            open_mkts = list(self.open_trades.keys())
+            is_safe, max_corr = self.corr_filter.is_safe_to_open(market, open_mkts)
+            if not is_safe:
+                log.info(
+                    f"[CORR]  {market:<12} signal ignoré — "
+                    f"ρ={max_corr:.3f} ≥ {self.corr_filter.correlation_threshold:.2f} "
+                    f"avec {open_mkts}"
+                )
+                return
+
             log.info(
                 f"[SIGNAL] {market:<12} {signal.value:<4} "
                 f"score={score}/30  "
+                f"seuil={details.get('adaptive_score_min')}  "
                 f"RSI={details.get('rsi_val')}  "
                 f"ADX={details.get('adx_val')}  "
                 f"Vol={details.get('vol_ratio')}x  "
-                f"régime={details.get('regime')}"
+                f"régime={details.get('regime')}  "
+                f"ρmax={max_corr:.3f}"
             )
             self._open_trade(market, signal, price, score, regime)
 
@@ -1082,10 +1563,49 @@ class QuantumEdgeBot:
         log.info(f"║  Score min : {self.cfg.score_min}/30  |  Target : +{self.cfg.target_pct}%  |  SL : -{self.cfg.stoploss_pct}%")
         log.info(f"╚{'═'*50}╝\n")
 
+        # ── Restaurer l'état précédent (redémarrage Railway)
+        self._load_state()
+
+        # ── Démarrer le dashboard HTML en tâche de fond
+        asyncio.ensure_future(self.dashboard.start())
+
+        # ── Téléchargement initial des données historiques (30 jours)
+        log.info("[BOT] Téléchargement des données historiques (30 jours)...")
+        await self.downloader.download_all(self.cfg.markets, interval_min=15, target_days=30)
+        await self.downloader.download_all(self.cfg.markets, interval_min=60, target_days=30)
+        log.info("[BOT] Données historiques prêtes.")
+
+        # ── Notification de démarrage
+        await self._send_notification(
+            "⚡ QUANTUM EDGE démarré",
+            f"Mode : {mode}\nCapital : {self.risk.capital:.2f}€\n"
+            f"Marchés : {len(self.cfg.markets)}  |  Levier : x{self.cfg.leverage}"
+        )
+
         try:
             while True:
                 self._iter += 1
                 self.risk.reset_daily()
+
+                # ── Cooldown après série de pertes
+                if time.time() < self.global_cooldown_until:
+                    remaining = int((self.global_cooldown_until - time.time()) / 60)
+                    log.warning(
+                        f"[COOLDOWN] Bot en pause stratégique — "
+                        f"{remaining} min restantes (série de pertes)"
+                    )
+                    await asyncio.sleep(60)
+                    continue
+
+                # ── Vérifier si nouvelle série de pertes déclenche un cooldown
+                if self.perf.loss_streak >= self.cfg.max_consecutive_losses:
+                    self.global_cooldown_until = time.time() + self.cfg.cooldown_after_losses
+                    log.warning(
+                        f"[COOLDOWN] {self.perf.loss_streak} pertes consécutives — "
+                        f"pause de {self.cfg.cooldown_after_losses // 60} min activée"
+                    )
+                    await asyncio.sleep(60)
+                    continue
 
                 # Kill switch
                 if self.risk.killed:
@@ -1101,6 +1621,13 @@ class QuantumEdgeBot:
                         if price:
                             self._close_trade(market, price, "KILL_SWITCH")
                     continue
+
+                # ── Classement dynamique des marchés (toutes les 100 itérations)
+                if self._iter % 100 == 0:
+                    await self._rank_markets()
+
+                # ── Mise à jour des corrélations 1h (toutes les ~30 min, auto-throttlée)
+                await self.correlation_mgr.update_correlations(self.kraken, self.cfg.markets)
 
                 # Traiter tous les marchés en parallèle (limité à 5 simultanés)
                 sem = asyncio.Semaphore(5)
@@ -1150,23 +1677,778 @@ class QuantumEdgeBot:
             )
         finally:
             await self.kraken.close()
+            await self.notifier.close()
             log.info("[BOT] Connexions fermées. À bientôt. 👋")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  POINT D'ENTRÉE
+#  MODULE 1 — DATA STORE (SQLite local, zéro dépendance externe)
 # ─────────────────────────────────────────────────────────────────────────────
-cfg = BotConfig()
+class DataStore:
+    """
+    Base de données SQLite locale pour stocker et requêter les bougies OHLCV.
 
-if __name__ == "__main__":
-    # ── Lecture des variables d'environnement (Railway / .env)
-    cfg.simulation_mode  = os.environ.get("SIMULATION_MODE", "true").lower() == "true"
-    cfg.initial_capital  = float(os.environ.get("INITIAL_CAPITAL", "200"))
-    cfg.stake_eur        = float(os.environ.get("STAKE_EUR", "50"))
-    cfg.leverage         = int(os.environ.get("LEVERAGE", "3"))
-    cfg.daily_kill_eur   = float(os.environ.get("DAILY_KILL_EUR", "-3"))
-    cfg.score_min        = int(os.environ.get("SCORE_MIN", "14"))
-    cfg.max_open_trades  = int(os.environ.get("MAX_OPEN_TRADES", "3"))
+    Structure :
+      table candles(market TEXT, interval_min INT, timestamp INT,
+                    open REAL, high REAL, low REAL, close REAL, volume REAL)
 
-    bot = QuantumEdgeBot(cfg)
-    asyncio.run(bot.run())
+    Usage :
+      store = DataStore()
+      store.save_candles("XBT/USDT", 15, candles_list)
+      candles = store.load_candles("XBT/USDT", 15, limit=500)
+    """
+
+    def __init__(self, db_path: str = "quantum_edge_data.db"):
+        self.db_path = db_path
+        self._init_db()
+
+    def _conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def _init_db(self):
+        with self._conn() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS candles (
+                    market       TEXT    NOT NULL,
+                    interval_min INTEGER NOT NULL,
+                    timestamp    INTEGER NOT NULL,
+                    open         REAL    NOT NULL,
+                    high         REAL    NOT NULL,
+                    low          REAL    NOT NULL,
+                    close        REAL    NOT NULL,
+                    volume       REAL    NOT NULL,
+                    PRIMARY KEY (market, interval_min, timestamp)
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_candles_market_ts
+                ON candles(market, interval_min, timestamp)
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS backtest_results (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_at      TEXT,
+                    params      TEXT,
+                    win_rate    REAL,
+                    profit_factor REAL,
+                    total_pnl   REAL,
+                    max_drawdown REAL,
+                    total_trades INTEGER,
+                    sharpe      REAL
+                )
+            """)
+        log.info(f"[DATASTORE] Base SQLite initialisée : {self.db_path}")
+
+    def save_candles(self, market: str, interval_min: int, candles: List[Candle]):
+        """Insère ou met à jour les bougies (INSERT OR REPLACE)."""
+        if not candles:
+            return
+        rows = [
+            (market, interval_min, c.timestamp, c.open, c.high, c.low, c.close, c.volume)
+            for c in candles
+        ]
+        with self._conn() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO candles VALUES (?,?,?,?,?,?,?,?)", rows
+            )
+        log.debug(f"[DATASTORE] {len(rows)} bougies sauvegardées — {market} {interval_min}m")
+
+    def load_candles(
+        self, market: str, interval_min: int, limit: int = 1000, after_ts: int = 0
+    ) -> List[Candle]:
+        """Charge les bougies triées par timestamp ASC."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT timestamp, open, high, low, close, volume
+                   FROM candles
+                   WHERE market=? AND interval_min=? AND timestamp>?
+                   ORDER BY timestamp ASC
+                   LIMIT ?""",
+                (market, interval_min, after_ts, limit),
+            ).fetchall()
+        return [Candle(r[0], r[1], r[2], r[3], r[4], r[5]) for r in rows]
+
+    def candle_count(self, market: str, interval_min: int) -> int:
+        """Nombre de bougies stockées pour un marché/intervalle."""
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM candles WHERE market=? AND interval_min=?",
+                (market, interval_min),
+            ).fetchone()[0]
+
+    def save_backtest_result(self, params: Dict, metrics: Dict):
+        """Persiste les résultats d'un run de backtest."""
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO backtest_results
+                   (run_at, params, win_rate, profit_factor, total_pnl,
+                    max_drawdown, total_trades, sharpe)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    json.dumps(params),
+                    metrics.get("win_rate", 0),
+                    metrics.get("profit_factor", 0),
+                    metrics.get("total_pnl", 0),
+                    metrics.get("max_drawdown", 0),
+                    metrics.get("total_trades", 0),
+                    metrics.get("sharpe", 0),
+                ),
+            )
+
+    def best_backtest_results(self, top_n: int = 5) -> List[Dict]:
+        """Retourne les N meilleurs runs par profit_factor."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """SELECT run_at, params, win_rate, profit_factor, total_pnl,
+                          max_drawdown, total_trades, sharpe
+                   FROM backtest_results
+                   ORDER BY profit_factor DESC
+                   LIMIT ?""",
+                (top_n,),
+            ).fetchall()
+        return [
+            {
+                "run_at": r[0], "params": json.loads(r[1]),
+                "win_rate": r[2], "profit_factor": r[3],
+                "total_pnl": r[4], "max_drawdown": r[5],
+                "total_trades": r[6], "sharpe": r[7],
+            }
+            for r in rows
+        ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MODULE 2 — BACKTESTER
+# ─────────────────────────────────────────────────────────────────────────────
+class BacktestResult:
+    """Résultats d'un run de backtest."""
+    def __init__(self):
+        self.trades:        List[Dict]  = []
+        self.capital_curve: List[float] = []
+
+    @property
+    def total_trades(self) -> int:
+        return len(self.trades)
+
+    @property
+    def winning_trades(self) -> int:
+        return sum(1 for t in self.trades if t["pnl"] > 0)
+
+    @property
+    def win_rate(self) -> float:
+        return self.winning_trades / self.total_trades * 100 if self.total_trades else 0.0
+
+    @property
+    def total_pnl(self) -> float:
+        return sum(t["pnl"] for t in self.trades)
+
+    @property
+    def profit_factor(self) -> float:
+        gross_win  = sum(t["pnl"] for t in self.trades if t["pnl"] > 0)
+        gross_loss = abs(sum(t["pnl"] for t in self.trades if t["pnl"] < 0))
+        return gross_win / gross_loss if gross_loss else float("inf")
+
+    @property
+    def max_drawdown(self) -> float:
+        """Max drawdown en % sur la courbe du capital."""
+        if not self.capital_curve:
+            return 0.0
+        peak = self.capital_curve[0]
+        max_dd = 0.0
+        for v in self.capital_curve:
+            peak = max(peak, v)
+            dd   = (peak - v) / peak * 100 if peak else 0
+            max_dd = max(max_dd, dd)
+        return max_dd
+
+    @property
+    def sharpe(self) -> float:
+        pnls = [t["pnl"] for t in self.trades]
+        if len(pnls) < 10:
+            return 0.0
+        mean = sum(pnls) / len(pnls)
+        std  = statistics.stdev(pnls) if len(pnls) > 1 else 1
+        return (mean / std) * math.sqrt(252) if std else 0.0
+
+    def summary(self) -> Dict:
+        return {
+            "total_trades":   self.total_trades,
+            "win_rate":       round(self.win_rate, 1),
+            "total_pnl":      round(self.total_pnl, 2),
+            "profit_factor":  round(self.profit_factor, 3),
+            "max_drawdown":   round(self.max_drawdown, 2),
+            "sharpe":         round(self.sharpe, 3),
+        }
+
+    def print_report(self, label: str = "BACKTEST"):
+        s = self.summary()
+        bar = "─" * 55
+        print(f"\n{bar}")
+        print(f"  📊 {label}")
+        print(bar)
+        print(f"  Trades        : {s['total_trades']}")
+        print(f"  Win rate      : {s['win_rate']:.1f}%")
+        print(f"  PnL total     : {s['total_pnl']:+.2f}€")
+        print(f"  Profit Factor : {s['profit_factor']:.3f}")
+        print(f"  Max Drawdown  : {s['max_drawdown']:.2f}%")
+        print(f"  Sharpe        : {s['sharpe']:.3f}")
+        print(bar)
+
+
+class Backtester:
+    """
+    Rejoue la stratégie SignalEngine sur des données historiques stockées en SQLite.
+
+    Méthodologie :
+    - Fenêtre glissante sur les bougies (warmup = 200 bougies)
+    - Simulation fidèle : un seul trade par marché, max_open_trades respecté
+    - Frais pris en compte (fee_pct × 2)
+    - Résultats sauvegardés en base pour comparaison future
+
+    Usage :
+      bt = Backtester(cfg, store)
+      result = bt.run(["XBT/USDT", "ETH/USDT"], warmup=200)
+      result.print_report()
+    """
+
+    def __init__(self, cfg: BotConfig, store: DataStore):
+        self.cfg    = cfg
+        self.store  = store
+        self.engine = SignalEngine(cfg)
+
+    def run(
+        self,
+        markets:      List[str],
+        interval_min: int = 15,
+        warmup:       int = 200,
+        capital:      float = 200.0,
+    ) -> BacktestResult:
+        result  = BacktestResult()
+        capital = capital
+        open_pos: Dict[str, Dict] = {}  # market → {entry, side, stake}
+
+        # Charger toutes les bougies disponibles pour les marchés
+        all_candles: Dict[str, List[Candle]] = {}
+        for market in markets:
+            c15  = self.store.load_candles(market, interval_min,  limit=5000)
+            c1h  = self.store.load_candles(market, 60,            limit=2000)
+            if len(c15) < warmup + 50:
+                log.warning(f"[BACKTEST] {market} — données insuffisantes ({len(c15)} bougies), ignoré")
+                continue
+            all_candles[market] = {"15m": c15, "1h": c1h}
+
+        if not all_candles:
+            log.error("[BACKTEST] Aucune donnée disponible. Lance d'abord le téléchargement.")
+            return result
+
+        # Trouver la longueur min commune
+        min_len = min(len(v["15m"]) for v in all_candles.values())
+        log.info(f"[BACKTEST] {len(all_candles)} marchés · {min_len} bougies · capital={capital:.2f}€")
+
+        result.capital_curve.append(capital)
+
+        for i in range(warmup, min_len):
+            # ── Gérer les positions ouvertes
+            for market in list(open_pos.keys()):
+                pos   = open_pos[market]
+                price = all_candles[market]["15m"][i].close
+                pnl   = 0.0
+
+                if pos["side"] == Signal.BUY:
+                    pct = (price - pos["entry"]) / pos["entry"]
+                else:
+                    pct = (pos["entry"] - price) / pos["entry"]
+
+                gross = pos["stake"] * self.cfg.leverage * pct
+                fees  = pos["stake"] * self.cfg.leverage * (self.cfg.fee_pct / 100) * 2
+                pnl   = gross - fees
+
+                # Target ou Stop Loss
+                target_hit = pnl >= (pos["stake"] * self.cfg.leverage * self.cfg.target_pct / 100)
+                sl_hit     = pnl <= -(pos["stake"] * self.cfg.leverage * self.cfg.stoploss_pct / 100)
+
+                if target_hit or sl_hit:
+                    capital += pnl
+                    reason   = "TARGET" if target_hit else "STOPLOSS"
+                    result.trades.append({
+                        "market": market, "side": pos["side"].value,
+                        "entry": pos["entry"], "exit": price,
+                        "pnl": round(pnl, 4), "reason": reason,
+                        "candle_idx": i,
+                    })
+                    result.capital_curve.append(capital)
+                    del open_pos[market]
+
+            # ── Chercher de nouveaux signaux
+            if len(open_pos) < self.cfg.max_open_trades:
+                for market, data in all_candles.items():
+                    if market in open_pos:
+                        continue
+                    if len(open_pos) >= self.cfg.max_open_trades:
+                        break
+
+                    candles_15m = data["15m"][max(0, i - 250): i + 1]
+                    candles_1h  = data["1h"][:i + 1][-250:]
+
+                    if len(candles_15m) < 50 or len(candles_1h) < 50:
+                        continue
+
+                    signal, score, _, _ = self.engine.compute(candles_15m, candles_1h)
+                    if signal != Signal.NONE:
+                        stake = min(capital * 0.25, self.cfg.stake_eur)
+                        if stake < 5:
+                            continue
+                        open_pos[market] = {
+                            "entry": data["15m"][i].close,
+                            "side":  signal,
+                            "stake": stake,
+                            "open_at": i,
+                        }
+
+        log.info(f"[BACKTEST] Terminé — {result.total_trades} trades simulés")
+        return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MODULE 3 — OPTIMISEUR DE PARAMÈTRES (Grid Search)
+# ─────────────────────────────────────────────────────────────────────────────
+class ParameterOptimizer:
+    """
+    Cherche la meilleure combinaison de paramètres par grid search exhaustif.
+
+    Paramètres explorés :
+      score_min, adx_min, rsi_oversold, rsi_overbought, volume_mult_min
+
+    Métrique d'optimisation : profit_factor (résistant au surapprentissage)
+    Les résultats sont sauvegardés en SQLite pour consultation future.
+
+    Usage :
+      opt = ParameterOptimizer(cfg, store)
+      best_params, best_metrics = opt.run(markets)
+      print(best_params)
+    """
+
+    # Grille de recherche
+    PARAM_GRID = {
+        "score_min":       [12, 14, 16, 18],
+        "adx_min":         [18, 22, 26],
+        "rsi_oversold":    [30, 35, 40],
+        "rsi_overbought":  [60, 65, 70],
+        "volume_mult_min": [1.1, 1.3, 1.5],
+    }
+
+    def __init__(self, cfg: BotConfig, store: DataStore):
+        self.cfg   = cfg
+        self.store = store
+
+    def _combinations(self) -> List[Dict]:
+        keys   = list(self.PARAM_GRID.keys())
+        values = list(self.PARAM_GRID.values())
+        return [
+            dict(zip(keys, combo))
+            for combo in itertools.product(*values)
+        ]
+
+    def run(
+        self,
+        markets:  List[str],
+        top_n:    int = 5,
+        max_runs: int = 50,
+    ) -> Tuple[Dict, Dict]:
+        """
+        Lance le grid search. Retourne (meilleurs_params, meilleures_métriques).
+        Limite à max_runs pour éviter des temps de calcul trop longs.
+        """
+        combos = self._combinations()
+        # Shuffle pour que même un run partiel soit représentatif
+        random.shuffle(combos)
+        combos = combos[:max_runs]
+
+        total = len(combos)
+        log.info(f"[OPTIMIZER] Démarrage grid search — {total} combinaisons à tester")
+
+        best_params:  Dict = {}
+        best_metrics: Dict = {"profit_factor": 0.0}
+        results: List[Tuple[float, Dict, Dict]] = []
+
+        for idx, params in enumerate(combos, 1):
+            # Appliquer les paramètres au cfg temporaire
+            test_cfg = BotConfig()
+            for k, v in params.items():
+                setattr(test_cfg, k, v)
+
+            bt     = Backtester(test_cfg, self.store)
+            result = bt.run(markets)
+
+            if result.total_trades < 10:
+                continue  # trop peu de trades — pas représentatif
+
+            metrics = result.summary()
+            self.store.save_backtest_result(params, metrics)
+            results.append((metrics["profit_factor"], params, metrics))
+
+            if metrics["profit_factor"] > best_metrics["profit_factor"]:
+                best_params  = params
+                best_metrics = metrics
+                log.info(
+                    f"[OPTIMIZER] [{idx}/{total}] Nouveau meilleur → "
+                    f"PF={metrics['profit_factor']:.3f}  "
+                    f"WR={metrics['win_rate']:.1f}%  "
+                    f"PnL={metrics['total_pnl']:+.2f}€  "
+                    f"Params={params}"
+                )
+
+        # Afficher le top N
+        results.sort(key=lambda x: x[0], reverse=True)
+        print(f"\n{'═'*60}")
+        print(f"  🏆 TOP {min(top_n, len(results))} COMBINAISONS")
+        print(f"{'═'*60}")
+        for rank, (pf, params, metrics) in enumerate(results[:top_n], 1):
+            print(
+                f"  #{rank}  PF={pf:.3f}  WR={metrics['win_rate']:.1f}%  "
+                f"PnL={metrics['total_pnl']:+.2f}€  "
+                f"DD={metrics['max_drawdown']:.1f}%  "
+                f"Sharpe={metrics['sharpe']:.3f}"
+            )
+            print(f"       Params: {params}")
+        print(f"{'═'*60}\n")
+
+        return best_params, best_metrics
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MODULE 4 — WALK-FORWARD TEST
+# ─────────────────────────────────────────────────────────────────────────────
+class WalkForwardTester:
+    """
+    Validation robuste anti-overfitting.
+
+    Principe :
+    ┌──────────────────────────────────────────────────────┐
+    │  Fenêtre 1 :  [train_1 | test_1]                     │
+    │  Fenêtre 2 :        [train_2 | test_2]               │
+    │  Fenêtre 3 :              [train_3 | test_3]         │
+    └──────────────────────────────────────────────────────┘
+
+    Pour chaque fenêtre :
+    1. Optimiser les paramètres sur train
+    2. Tester les meilleurs paramètres sur test (out-of-sample)
+    3. Agréger les métriques test
+
+    Si la stratégie est robuste, les métriques out-of-sample seront
+    cohérentes avec les métriques in-sample.
+
+    Usage :
+      wf = WalkForwardTester(cfg, store)
+      wf.run(markets, n_windows=5, train_ratio=0.7)
+    """
+
+    def __init__(self, cfg: BotConfig, store: DataStore):
+        self.cfg   = cfg
+        self.store = store
+
+    def run(
+        self,
+        markets:     List[str],
+        n_windows:   int   = 4,
+        train_ratio: float = 0.70,
+        max_runs:    int   = 20,
+    ) -> List[Dict]:
+        """
+        Lance le walk-forward. Retourne les métriques out-of-sample par fenêtre.
+        """
+        # Charger toutes les bougies disponibles
+        all_candles: Dict[str, List[Candle]] = {}
+        for market in markets:
+            c = self.store.load_candles(market, 15, limit=5000)
+            if len(c) >= 400:
+                all_candles[market] = c
+
+        if not all_candles:
+            log.error("[WF] Aucune donnée. Lance le téléchargement d'abord.")
+            return []
+
+        min_len = min(len(v) for v in all_candles.values())
+        window_size = min_len // n_windows
+        if window_size < 200:
+            log.error(f"[WF] Fenêtres trop petites ({window_size} bougies). Besoin de plus de données.")
+            return []
+
+        log.info(
+            f"[WF] Démarrage walk-forward — {n_windows} fenêtres · "
+            f"{window_size} bougies/fenêtre · train={train_ratio:.0%}"
+        )
+
+        wf_results = []
+
+        for w in range(n_windows):
+            start = w * window_size
+            end   = start + window_size
+            split = start + int(window_size * train_ratio)
+
+            log.info(f"[WF] Fenêtre {w+1}/{n_windows} — train:[{start}:{split}]  test:[{split}:{end}]")
+
+            # ── Créer un DataStore temporaire en mémoire pour le train
+            train_store = DataStore(":memory:")
+            test_store  = DataStore(":memory:")
+
+            for market, candles in all_candles.items():
+                # Charger aussi les 1h proportionnellement
+                c1h = self.store.load_candles(market, 60, limit=2000)
+                split_1h = int(len(c1h) * split / min_len)
+
+                train_store.save_candles(market, 15, candles[start:split])
+                train_store.save_candles(market, 60, c1h[:split_1h])
+                test_store.save_candles(market, 15,  candles[split:end])
+                test_store.save_candles(market, 60,  c1h[split_1h:int(len(c1h)*end/min_len)])
+
+            # ── Optimiser sur le train
+            opt = ParameterOptimizer(self.cfg, train_store)
+            best_params, _ = opt.run(list(all_candles.keys()), max_runs=max_runs)
+
+            if not best_params:
+                log.warning(f"[WF] Fenêtre {w+1} — optimisation sans résultat, skip")
+                continue
+
+            # ── Tester les meilleurs paramètres sur le test (out-of-sample)
+            test_cfg = BotConfig()
+            for k, v in best_params.items():
+                setattr(test_cfg, k, v)
+
+            bt_test = Backtester(test_cfg, test_store)
+            result  = bt_test.run(list(all_candles.keys()))
+            metrics = result.summary()
+            metrics["window"]      = w + 1
+            metrics["best_params"] = best_params
+            wf_results.append(metrics)
+
+            result.print_report(
+                f"WF Fenêtre {w+1} — OUT-OF-SAMPLE  params={best_params}"
+            )
+
+        # ── Rapport global walk-forward
+        if wf_results:
+            avg_pf  = sum(r["profit_factor"] for r in wf_results) / len(wf_results)
+            avg_wr  = sum(r["win_rate"] for r in wf_results) / len(wf_results)
+            avg_pnl = sum(r["total_pnl"] for r in wf_results) / len(wf_results)
+            avg_dd  = sum(r["max_drawdown"] for r in wf_results) / len(wf_results)
+            consistency = sum(1 for r in wf_results if r["profit_factor"] > 1.0) / len(wf_results) * 100
+
+            print(f"\n{'═'*60}")
+            print(f"  🔬 WALK-FORWARD — RÉSUMÉ GLOBAL ({len(wf_results)} fenêtres)")
+            print(f"{'═'*60}")
+            print(f"  Profit Factor moyen : {avg_pf:.3f}")
+            print(f"  Win Rate moyen      : {avg_wr:.1f}%")
+            print(f"  PnL moyen/fenêtre   : {avg_pnl:+.2f}€")
+            print(f"  Max Drawdown moyen  : {avg_dd:.2f}%")
+            print(f"  Cohérence (PF>1)    : {consistency:.0f}% des fenêtres")
+            if consistency >= 75:
+                print(f"  ✅ Stratégie ROBUSTE (cohérence ≥ 75%)")
+            elif consistency >= 50:
+                print(f"  ⚠️  Stratégie MODÉRÉE (cohérence 50–75%)")
+            else:
+                print(f"  ❌ Stratégie FRAGILE (cohérence < 50%) — revoir les paramètres")
+            print(f"{'═'*60}\n")
+
+        return wf_results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MODULE 5 — DASHBOARD HTML (monitoring temps réel, auto-refresh)
+# ─────────────────────────────────────────────────────────────────────────────
+class DashboardServer:
+    """
+    Serveur HTTP léger (stdlib uniquement) qui expose un dashboard HTML
+    auto-rafraîchi toutes les 30 secondes.
+
+    Accessible sur http://localhost:8080 (ou le port configuré).
+    Affiche : capital, PnL, trades ouverts, historique, métriques clés.
+
+    Usage :
+      dashboard = DashboardServer(perf_tracker, risk_manager, open_trades_ref)
+      asyncio.ensure_future(dashboard.start())
+    """
+
+    HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="refresh" content="30">
+<title>⚡ QUANTUM EDGE — Dashboard</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ background: #0a0e1a; color: #e0e6f0; font-family: 'Courier New', monospace;
+          font-size: 13px; padding: 20px; }}
+  h1 {{ color: #00d4ff; font-size: 20px; margin-bottom: 16px; letter-spacing: 2px; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 20px; }}
+  .card {{ background: #111827; border: 1px solid #1e3a5f; border-radius: 8px; padding: 14px; }}
+  .card .label {{ color: #6b7fa3; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }}
+  .card .value {{ font-size: 22px; font-weight: bold; margin-top: 4px; }}
+  .pos {{ color: #22c55e; }} .neg {{ color: #ef4444; }} .neu {{ color: #00d4ff; }}
+  table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
+  th {{ background: #1e3a5f; color: #00d4ff; padding: 8px; text-align: left; font-size: 11px; }}
+  td {{ padding: 7px 8px; border-bottom: 1px solid #1a2540; font-size: 12px; }}
+  tr:hover td {{ background: #131f35; }}
+  .badge-buy {{ color: #22c55e; font-weight: bold; }}
+  .badge-sell {{ color: #ef4444; font-weight: bold; }}
+  .ts {{ color: #4a5c7a; font-size: 11px; margin-top: 16px; text-align: right; }}
+</style>
+</head>
+<body>
+<h1>⚡ QUANTUM EDGE v3.0 — Live Dashboard</h1>
+<div class="grid">
+  <div class="card"><div class="label">Capital</div>
+    <div class="value neu">{capital:.2f} €</div></div>
+  <div class="card"><div class="label">PnL Total</div>
+    <div class="value {pnl_class}">{total_pnl:+.2f} €</div></div>
+  <div class="card"><div class="label">PnL Journalier</div>
+    <div class="value {dpnl_class}">{daily_pnl:+.2f} €</div></div>
+  <div class="card"><div class="label">Win Rate</div>
+    <div class="value neu">{win_rate:.1f} %</div></div>
+  <div class="card"><div class="label">Profit Factor</div>
+    <div class="value neu">{profit_factor:.3f}</div></div>
+  <div class="card"><div class="label">Trades ouverts</div>
+    <div class="value neu">{open_trades}</div></div>
+  <div class="card"><div class="label">Total Trades</div>
+    <div class="value neu">{total_trades}</div></div>
+  <div class="card"><div class="label">Sharpe Ratio</div>
+    <div class="value neu">{sharpe:.3f}</div></div>
+</div>
+
+<h2 style="color:#6b7fa3;font-size:13px;margin-bottom:8px;">TRADES OUVERTS</h2>
+<table>
+  <tr><th>Marché</th><th>Dir.</th><th>Entrée</th><th>PnL latent</th><th>Score</th><th>Régime</th></tr>
+  {open_rows}
+</table>
+
+<h2 style="color:#6b7fa3;font-size:13px;margin:16px 0 8px;">DERNIERS TRADES FERMÉS</h2>
+<table>
+  <tr><th>Marché</th><th>Dir.</th><th>Entrée</th><th>Sortie</th><th>PnL</th><th>Raison</th></tr>
+  {closed_rows}
+</table>
+
+<div class="ts">Mis à jour : {ts} UTC · Auto-refresh 30s</div>
+</body></html>"""
+
+    def __init__(
+        self,
+        perf:        "PerformanceTracker",
+        risk:        "RiskManager",
+        open_trades: Dict,
+        port:        int = 8080,
+    ):
+        self.perf        = perf
+        self.risk        = risk
+        self.open_trades = open_trades
+        self.port        = port
+
+    def _build_html(self) -> str:
+        pnl   = self.perf.total_pnl
+        dpnl  = self.risk.daily_pnl
+
+        # Lignes trades ouverts
+        open_rows = ""
+        for market, trade in self.open_trades.items():
+            side_cls = "badge-buy" if trade.side == Signal.BUY else "badge-sell"
+            open_rows += (
+                f"<tr><td>{market}</td>"
+                f"<td class='{side_cls}'>{trade.side.value}</td>"
+                f"<td>{trade.entry_price:.6f}</td>"
+                f"<td>—</td>"
+                f"<td>{trade.score}</td>"
+                f"<td>{trade.regime.value}</td></tr>"
+            )
+        if not open_rows:
+            open_rows = "<tr><td colspan='6' style='color:#4a5c7a;text-align:center'>Aucun trade ouvert</td></tr>"
+
+        # Lignes derniers trades fermés (10 derniers)
+        closed_rows = ""
+        for t in reversed(self.perf.all_trades[-10:]):
+            pnl_cls = "pos" if t.pnl_eur > 0 else "neg"
+            side_cls = "badge-buy" if t.side == Signal.BUY else "badge-sell"
+            closed_rows += (
+                f"<tr><td>{t.market}</td>"
+                f"<td class='{side_cls}'>{t.side.value}</td>"
+                f"<td>{t.entry_price:.6f}</td>"
+                f"<td>{t.exit_price:.6f}</td>"
+                f"<td class='{pnl_cls}'>{t.pnl_eur:+.2f}€</td>"
+                f"<td>{t.exit_time.strftime('%H:%M') if t.exit_time else '—'}</td></tr>"
+            )
+        if not closed_rows:
+            closed_rows = "<tr><td colspan='6' style='color:#4a5c7a;text-align:center'>Aucun trade fermé</td></tr>"
+
+        return self.HTML_TEMPLATE.format(
+            capital       = self.risk.capital,
+            total_pnl     = pnl,
+            pnl_class     = "pos" if pnl >= 0 else "neg",
+            daily_pnl     = dpnl,
+            dpnl_class    = "pos" if dpnl >= 0 else "neg",
+            win_rate      = self.perf.win_rate,
+            profit_factor = self.perf.profit_factor,
+            open_trades   = len(self.open_trades),
+            total_trades  = self.perf.total_trades,
+            sharpe        = self.perf.sharpe_ratio(),
+            open_rows     = open_rows,
+            closed_rows   = closed_rows,
+            ts            = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
+    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        try:
+            await reader.read(1024)  # lire la requête HTTP
+            html    = self._build_html().encode("utf-8")
+            headers = (
+                f"HTTP/1.1 200 OK\r\n"
+                f"Content-Type: text/html; charset=utf-8\r\n"
+                f"Content-Length: {len(html)}\r\n"
+                f"Connection: close\r\n\r\n"
+            ).encode()
+            writer.write(headers + html)
+            await writer.drain()
+        except Exception:
+            pass
+        finally:
+            writer.close()
+
+    async def start(self):
+        """Démarre le serveur HTTP en tâche de fond."""
+        try:
+            server = await asyncio.start_server(self._handle, "0.0.0.0", self.port)
+            log.info(f"[DASHBOARD] Serveur démarré → http://0.0.0.0:{self.port}")
+            async with server:
+                await server.serve_forever()
+        except Exception as e:
+            log.warning(f"[DASHBOARD] Impossible de démarrer : {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MODULE 6 — TÉLÉCHARGEUR DE DONNÉES HISTORIQUES
+# ─────────────────────────────────────────────────────────────────────────────
+class HistoricalDownloader:
+    """
+    Télécharge et stocke les données historiques Kraken en SQLite.
+
+    Kraken retourne max 720 bougies par appel.
+    Ce module pagine automatiquement pour remplir la base jusqu'à `target_days`.
+
+    Usage :
+      dl = HistoricalDownloader(kraken_client, store)
+      await dl.download_all(markets, interval_min=15, target_days=180)
+    """
+
+    def __init__(self, kraken: "KrakenClient", store: DataStore):
+        self.kraken = kraken
+        self.store  = store
+
+    async def download_market(
+        self,
+        market:       str,
+        interval_min: int = 15,
+        target_days:  int = 180,
+    ) -> int:
+        """
+        Télécharge j
