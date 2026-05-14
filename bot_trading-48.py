@@ -47,7 +47,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import aiohttp
+try:
+    import aiohttp
+except ImportError:
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "aiohttp==3.9.5", "--quiet"])
+    import aiohttp
 try:
     import psycopg
     from psycopg.rows import dict_row
@@ -2395,7 +2400,4 @@ class ParameterOptimizer:
         max_runs: int = 50,
     ) -> Tuple[Dict, Dict]:
         """
-        Lance le grid search. Retourne (meilleurs_params, meilleures_métriques).
-        Limite à max_runs pour éviter des temps de calcul trop longs.
-        """
-        combos = self._com
+        Lance le grid 
