@@ -985,8 +985,8 @@ class CorrelationFilter:
 
     def __init__(self, cfg: BotConfig):
         self.cfg = cfg
-        self.correlation_window:    int   = 50    # bougies pour le calcul
-        self.correlation_threshold: float = 0.75  # seuil |ρ| ≥ 0.75 → bloquer
+        self.correlation_window:    int   = 50
+        self.correlation_threshold: float = cfg.correlation_threshold  # lit le cfg au lieu du hardcode 0.75
         # Cache des prix de clôture par marché (fenêtre glissante)
         self._price_history: Dict[str, deque] = defaultdict(
             lambda: deque(maxlen=self.correlation_window)
@@ -1576,16 +1576,19 @@ class QuantumEdgeBot:
         signal, score, details, regime = self.engine.compute(candles_15m, candles_1h)
 
         if signal != Signal.NONE:
-            # ── Filtre de corrélation Pearson (inter-marchés, returns log)
-            open_mkts = list(self.open_trades.keys())
-            is_safe, max_corr = self.corr_filter.is_safe_to_open(market, open_mkts)
-            if not is_safe:
-                log.info(
-                    f"[CORR]  {market:<12} signal ignoré — "
-                    f"ρ={max_corr:.3f} ≥ {self.corr_filter.correlation_threshold:.2f} "
-                    f"avec {open_mkts}"
-                )
-                return
+            # ── Filtre de corrélation Pearson — uniquement si activé dans cfg
+            if self.cfg.correlation_filter_enabled:
+                open_mkts = list(self.open_trades.keys())
+                is_safe, max_corr = self.corr_filter.is_safe_to_open(market, open_mkts)
+                if not is_safe:
+                    log.info(
+                        f"[CORR]  {market:<12} signal ignoré — "
+                        f"ρ={max_corr:.3f} ≥ {self.corr_filter.correlation_threshold:.2f} "
+                        f"avec {open_mkts}"
+                    )
+                    return
+            else:
+                max_corr = 0.0
 
             log.info(
                 f"[SIGNAL] {market:<12} {signal.value:<4} "
@@ -1640,6 +1643,11 @@ class QuantumEdgeBot:
                     )
                     await asyncio.sleep(60)
                     continue
+                elif self.global_cooldown_until > 0:
+                    # Cooldown terminé — remettre le compteur à zéro
+                    self.perf.loss_streak = 0
+                    self.global_cooldown_until = 0.0
+                    log.info("[COOLDOWN] Pause terminée — compteur de pertes remis à zéro")
 
                 # ── Vérifier si nouvelle série de pertes déclenche un cooldown
                 if self.perf.loss_streak >= self.cfg.max_consecutive_losses:
@@ -2890,10 +2898,10 @@ if __name__ == "__main__":
     # ── Lecture des variables d'environnement (Railway / .env)
     cfg.simulation_mode  = os.environ.get("SIMULATION_MODE", "true").lower() == "true"
     cfg.initial_capital  = float(os.environ.get("INITIAL_CAPITAL", "200"))
-    cfg.stake_eur        = float(os.environ.get("STAKE_EUR", "50"))
+    cfg.stake_eur        = float(os.environ.get("STAKE_EUR", "15"))   # fixé 50→15
     cfg.leverage         = int(os.environ.get("LEVERAGE", "3"))
     cfg.daily_kill_eur   = float(os.environ.get("DAILY_KILL_EUR", "-3"))
-    cfg.score_min        = int(os.environ.get("SCORE_MIN", "14"))
+    cfg.score_min        = int(os.environ.get("SCORE_MIN", "16"))     # fixé 14→16
     cfg.max_open_trades  = int(os.environ.get("MAX_OPEN_TRADES", "3"))
     # ── Telegram (optionnel)
     cfg.use_telegram      = os.environ.get("USE_TELEGRAM", "false").lower() == "true"
