@@ -1,2 +1,1 @@
 aiohttp==3.9.5
-# quantum-edge-v3.1
