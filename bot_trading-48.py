@@ -122,15 +122,15 @@ class BotConfig:
     candles_required: int = 200 # nb de bougies pour les indicateurs longs
 
     # ── Gestion du capital
-    stake_eur:      float = 50.0    # mise par trade (€)
+    stake_eur:      float = 15.0    # mise max par trade (€) — limitée pour équilibrer risque
     leverage:       int   = 3       # levier
     max_open_trades: int  = 3       # trades simultanés max
-    kelly_fraction: float = 0.25    # fraction Kelly (conservateur)
+    kelly_fraction: float = 0.15    # fraction Kelly réduite — évite surexposition sur ETH/SOL
 
     # ── Profit / Perte
-    target_pct:     float = 0.60    # +0.60% sur position levierisée = ~+0.90€
-    stoploss_pct:   float = 1.50    # -1.50% sur position = ~-2.25€
-    trailing_start: float = 0.45    # déclenche le trailing à +0.45%
+    target_pct:     float = 1.00    # +1.00% sur position levierisée = ~+0.45€ net
+    stoploss_pct:   float = 1.00    # -1.00% sur position = ~-0.45€ — ratio 1:1 équilibré
+    trailing_start: float = 0.60    # déclenche le trailing à +0.60%
     trailing_step:  float = 0.20    # step du trailing stop
 
     # ── Kill switch
