@@ -147,7 +147,7 @@ class BotConfig:
     bb_squeeze_threshold: float = 0.03  # détection d'une compression Bollinger
 
     # ── Scoring (points max = 30)
-    score_min:      int   = 14      # score minimum pour ouvrir un trade
+    score_min:      int   = 16      # relevé 14→16 pour filtrer les faux signaux
 
     # ── Timing
     loop_interval:  int   = 30      # secondes entre chaque cycle
@@ -173,8 +173,8 @@ class BotConfig:
     partial_tp_size:     float = 0.50
 
     # ── Cooldown après série de pertes
-    max_consecutive_losses:  int = 4
-    cooldown_after_losses:   int = 1800  # 30 minutes
+    max_consecutive_losses:  int = 6
+    cooldown_after_losses:   int = 600   # 10 minutes au lieu de 30
 
     # ── Smart Defense (réduction de mise après gain significatif)
     smart_defense_enabled:         bool  = True
