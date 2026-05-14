@@ -112,8 +112,8 @@ class BotConfig:
         "DOT/USDT",   # Polkadot      — interopérabilité, swings propres
         "DOGE/USDT",  # Dogecoin      — forte volatilité, volumes élevés
         "ATOM/USDT",  # Cosmos        — IBC leader, tendances franches ✅ remplace MATIC
-        "LTC/USDT",   # Litecoin          — haute liquidité Kraken
-        "ETC/USDT",   # Ethereum Classic  — disponible Kraken ✅
+        "LTC/USDT",   # Litecoin      — haute liquidité Kraken, cycles nets
+        "APT/USDT",   # Aptos         — confirmé Kraken ✅, volatilité exploitable
         "ALGO/USDT",  # Algorand          — disponible Kraken ✅
         "XTZ/USDT",   # Tezos             — disponible Kraken ✅
     ])
@@ -1079,7 +1079,7 @@ class KrakenClient:
         "DOGE/USDT": "DOGEUSDT",
         "ATOM/USDT": "ATOMUSDT",   # ✅ disponible Kraken
         "LTC/USDT":  "LTCUSDT",    # ✅ Kraken
-        "ETC/USDT":  "ETCUSDT",    # ✅ Kraken
+        "APT/USDT":  "APTUSDT",    # ✅ Kraken
         "ALGO/USDT": "ALGOUSDT",   # ✅ Kraken
         "XTZ/USDT":  "XTZUSDT",    # ✅ Kraken
     }
@@ -1312,7 +1312,7 @@ class QuantumEdgeBot:
             "MAJORS":        ["XBT/USDT", "ETH/USDT", "LTC/USDT"],
             "L1":            ["SOL/USDT", "AVAX/USDT", "ADA/USDT", "DOT/USDT", "ALGO/USDT"],
             "PAYMENTS":      ["XRP/USDT", "DOGE/USDT", "BNB/USDT"],
-            "DEFI":          ["LINK/USDT", "ETC/USDT", "XTZ/USDT"],
+            "DEFI":          ["LINK/USDT", "APT/USDT", "XTZ/USDT"],
             "INFRA":         ["ATOM/USDT"],
         }
 
