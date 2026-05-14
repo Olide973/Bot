@@ -99,9 +99,8 @@ class BotConfig:
     bot_name: str = "QUANTUM_EDGE_V2"
     simulation_mode: bool = True
 
-    # ── Marchés (14 paires confirmées disponibles sur Kraken USDT)
+    # ── Marchés (13 paires confirmées disponibles sur Kraken USDT)
     markets: List[str] = field(default_factory=lambda: [
-        "XBT/USDT",   # Bitcoin       — valeur refuge, haute liquidité
         "ETH/USDT",   # Ethereum      — DeFi leader, très suivi
         "SOL/USDT",   # Solana        — vitesse + écosystème fort
         "BNB/USDT",   # Binance Coin  — corrélé aux volumes d'échange
@@ -1066,7 +1065,6 @@ class KrakenClient:
 
     # Mapping des symboles Kraken → Binance
     SYMBOL_MAP = {
-        "XBT/USDT":  "XBTUSDT",
         "ETH/USDT":  "ETHUSDT",
         "SOL/USDT":  "SOLUSDT",
         "BNB/USDT":  "BNBUSDT",
@@ -1307,7 +1305,7 @@ class QuantumEdgeBot:
 
         # ── Groupes de corrélation
         self.market_groups: Dict[str, List[str]] = {
-            "MAJORS":        ["XBT/USDT", "ETH/USDT", "LTC/USDT"],
+            "MAJORS":        ["ETH/USDT", "LTC/USDT"],
             "L1":            ["SOL/USDT", "AVAX/USDT", "ADA/USDT", "DOT/USDT", "ALGO/USDT"],
             "PAYMENTS":      ["XRP/USDT", "DOGE/USDT", "BNB/USDT"],
             "DEFI":          ["LINK/USDT", "ATOM/USDT", "XTZ/USDT"],
