@@ -116,22 +116,22 @@ class BotConfig:
         "XTZ/USDT",   # Tezos         — disponible Kraken ✅
     ])
 
-    # ── Timeframes
-    tf_primary:     int = 15    # minutes — signal principal
-    tf_confirmation: int = 60   # minutes — filtre macro
-    candles_required: int = 200 # nb de bougies pour les indicateurs longs
+    # ── Timeframes — swing trading 1h (moins de bruit que 15m)
+    tf_primary:     int = 60    # 1h — signaux directionnels fiables
+    tf_confirmation: int = 240  # 4h — filtre macro fort
+    candles_required: int = 200
 
     # ── Gestion du capital
-    stake_eur:      float = 15.0    # mise max par trade (€) — limitée pour équilibrer risque
-    leverage:       int   = 3       # levier
-    max_open_trades: int  = 3       # trades simultanés max
-    kelly_fraction: float = 0.15    # fraction Kelly réduite — évite surexposition sur ETH/SOL
+    stake_eur:      float = 15.0
+    leverage:       int   = 2        # réduit x3→x2 — stop moins serré
+    max_open_trades: int  = 3
+    kelly_fraction: float = 0.15
 
-    # ── Profit / Perte
-    target_pct:     float = 1.00    # +1.00% sur position levierisée = ~+0.45€ net
-    stoploss_pct:   float = 1.00    # -1.00% sur position = ~-0.45€ — ratio 1:1 équilibré
-    trailing_start: float = 0.60    # déclenche le trailing à +0.60%
-    trailing_step:  float = 0.20    # step du trailing stop
+    # ── Profit / Perte — ratio asymétrique 1.5:1
+    target_pct:     float = 1.50    # +1.50% → ~+0.45€ net
+    stoploss_pct:   float = 1.00    # -1.00% → ~-0.30€ max
+    trailing_start: float = 0.80    # trailing après gain solide
+    trailing_step:  float = 0.25    # step large pour laisser respirer
 
     # ── Kill switch
     daily_kill_eur: float = -3.0    # arrêt si PnL journalier < -3€
