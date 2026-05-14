@@ -161,16 +161,16 @@ class BotConfig:
     fee_pct: float = 0.04  # 0.04% par trade (entrée + sortie = ~0.08%)
 
     # ── Protection corrélation
-    correlation_filter_enabled: bool = True
+    correlation_filter_enabled: bool = False  # désactivé — trop restrictif, filtre groupe suffit
     max_correlated_positions:   int   = 2
 
     # ── Filtre bougie explosive
     max_single_candle_pct: float = 3.5  # ignorer si dernière bougie > 3.5%
 
     # ── Take-profit partiel
-    partial_tp_enabled:  bool  = True
-    partial_tp_trigger:  float = 0.50   # déclenche à +0.50% (relevé pour éviter sorties prématurées)
-    partial_tp_size:     float = 0.50   # sécurise 50% du PnL latent
+    partial_tp_enabled:  bool  = False  # désactivé — sortait trop tôt pour +0.01€
+    partial_tp_trigger:  float = 0.50
+    partial_tp_size:     float = 0.50
 
     # ── Cooldown après série de pertes
     max_consecutive_losses:  int = 4
@@ -748,21 +748,8 @@ class RiskManager:
         self.trades_today += 1
 
     def kelly_stake(self, win_rate: float, win_pct: float, loss_pct: float) -> float:
-        """Fraction Kelly conservatrice pour dimensionner la mise.
-        Avant 30 trades : mise fixe 10€ — Kelly pas fiable avec peu de données.
-        Après 30 trades : Kelly dynamique plafonné à stake_eur.
-        """
-        total = len([t for t in [win_rate] if t is not None])  # proxy simple
-        # Mise fixe tant que l'historique est insuffisant (< 30 trades)
-        if win_rate == 0.55:  # prior conservateur = pas encore de vraies données
-            return 10.0
-        if loss_pct == 0:
-            return 10.0
-        b = win_pct / loss_pct
-        kelly = (b * win_rate - (1 - win_rate)) / b
-        kelly = max(0, kelly) * self.cfg.kelly_fraction
-        stake = self.capital * kelly
-        return max(10.0, min(stake, self.cfg.stake_eur))
+        """Mise fixe 10€ — Kelly activé uniquement après 50 trades fiables."""
+        return 10.0
 
     def adjust_for_volatility(self, base_stake: float, atr_pct: float) -> float:
         """Ajuste dynamiquement la mise selon la volatilité ATR récente.
