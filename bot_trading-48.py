@@ -1063,9 +1063,9 @@ class KrakenClient:
         "DOGE/USDT": "DOGEUSDT",
         "ATOM/USDT": "ATOMUSDT",   # ✅ disponible Kraken
         "LTC/USDT":  "LTCUSDT",    # ✅ disponible Kraken
-        "FIL/USDT":  "FILUSDT",    # ✅ disponible Kraken
+        "ETC/USDT":  "ETCUSDT",   # ✅ Kraken
         "ALGO/USDT": "ALGOUSDT",   # ✅ disponible Kraken
-        "GRT/USDT":  "GRTUSDT",    # ✅ disponible Kraken
+        "XTZ/USDT":  "XTZUSDT",   # ✅ Kraken
     }
 
     def __init__(self, timeout: int = 10):
