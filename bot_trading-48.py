@@ -129,10 +129,10 @@ class BotConfig:
     kelly_fraction: float = 0.25    # fraction Kelly (conservateur)
 
     # ── Profit / Perte
-    target_pct:     float = 0.50    # +0.50% sur position levierisée = ~+0.75€
-    stoploss_pct:   float = 1.00    # -1.00% sur position = ~-1.50€
-    trailing_start: float = 0.30    # déclenche le trailing à +0.30%
-    trailing_step:  float = 0.15    # step du trailing stop
+    target_pct:     float = 0.60    # +0.60% sur position levierisée = ~+0.90€
+    stoploss_pct:   float = 1.50    # -1.50% sur position = ~-2.25€
+    trailing_start: float = 0.45    # déclenche le trailing à +0.45%
+    trailing_step:  float = 0.20    # step du trailing stop
 
     # ── Kill switch
     daily_kill_eur: float = -3.0    # arrêt si PnL journalier < -3€
@@ -1311,7 +1311,6 @@ class QuantumEdgeBot:
             "L1":            ["SOL/USDT", "AVAX/USDT", "ADA/USDT", "DOT/USDT", "ALGO/USDT"],
             "PAYMENTS":      ["XRP/USDT", "DOGE/USDT", "BNB/USDT"],
             "DEFI":          ["LINK/USDT", "ATOM/USDT", "XTZ/USDT"],
-            "INFRA":         ["ATOM/USDT"],
         }
 
     # ── Propriétés de commodité
