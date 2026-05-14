@@ -99,7 +99,7 @@ class BotConfig:
     bot_name: str = "QUANTUM_EDGE_V2"
     simulation_mode: bool = True
 
-    # ── Marchés (15 paires choisies pour leur liquidité, volatilité et volume)
+    # ── Marchés (14 paires confirmées disponibles sur Kraken USDT)
     markets: List[str] = field(default_factory=lambda: [
         "XBT/USDT",   # Bitcoin       — valeur refuge, haute liquidité
         "ETH/USDT",   # Ethereum      — DeFi leader, très suivi
@@ -111,11 +111,10 @@ class BotConfig:
         "ADA/USDT",   # Cardano       — cycles réguliers, technique lisible
         "DOT/USDT",   # Polkadot      — interopérabilité, swings propres
         "DOGE/USDT",  # Dogecoin      — forte volatilité, volumes élevés
-        "ATOM/USDT",  # Cosmos        — IBC leader, tendances franches ✅ remplace MATIC
+        "ATOM/USDT",  # Cosmos        — IBC leader, tendances franches
         "LTC/USDT",   # Litecoin      — haute liquidité Kraken, cycles nets
-        "NEAR/USDT",  # NEAR Protocol — confirmé Kraken ✅, L1 émergent
-        "ALGO/USDT",  # Algorand          — disponible Kraken ✅
-        "XTZ/USDT",   # Tezos             — disponible Kraken ✅
+        "ALGO/USDT",  # Algorand      — disponible Kraken ✅
+        "XTZ/USDT",   # Tezos         — disponible Kraken ✅
     ])
 
     # ── Timeframes
@@ -1079,7 +1078,6 @@ class KrakenClient:
         "DOGE/USDT": "DOGEUSDT",
         "ATOM/USDT": "ATOMUSDT",   # ✅ disponible Kraken
         "LTC/USDT":  "LTCUSDT",    # ✅ Kraken
-        "NEAR/USDT": "NEARUSDT",   # ✅ Kraken
         "ALGO/USDT": "ALGOUSDT",   # ✅ Kraken
         "XTZ/USDT":  "XTZUSDT",    # ✅ Kraken
     }
@@ -1312,7 +1310,7 @@ class QuantumEdgeBot:
             "MAJORS":        ["XBT/USDT", "ETH/USDT", "LTC/USDT"],
             "L1":            ["SOL/USDT", "AVAX/USDT", "ADA/USDT", "DOT/USDT", "ALGO/USDT"],
             "PAYMENTS":      ["XRP/USDT", "DOGE/USDT", "BNB/USDT"],
-            "DEFI":          ["LINK/USDT", "NEAR/USDT", "XTZ/USDT"],
+            "DEFI":          ["LINK/USDT", "ATOM/USDT", "XTZ/USDT"],
             "INFRA":         ["ATOM/USDT"],
         }
 
