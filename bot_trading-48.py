@@ -1415,14 +1415,13 @@ class QuantumEdgeBot:
             loss_pct = self.cfg.stoploss_pct / 100,
         )
 
-        # ── Ajustement volatilité (ATR % sur 14 bougies 15m)
-        # On récupère les candles depuis le cache corr_filter si disponible
-        prices = list(self.corr_filter._price_history.get(market, []))
+        # ── Ajustement volatilité désactivé — mise fixe 10€ prioritaire
         atr_pct = 0.0
+        prices = list(self.corr_filter._price_history.get(market, []))
         if len(prices) >= 15:
             recent_range = max(prices[-14:]) - min(prices[-14:])
             atr_pct = (recent_range / prices[-1]) * 100 if prices[-1] else 0
-            stake = self.risk.adjust_for_volatility(stake, atr_pct)
+        # Ne pas ajuster la mise — on garde 10€ fixe
 
         # ── Smart Defense : réduire la mise si le capital a bien progressé
         if self.cfg.smart_defense_enabled:
