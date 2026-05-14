@@ -2401,3 +2401,568 @@ class ParameterOptimizer:
     ) -> Tuple[Dict, Dict]:
         """
         Lance le grid 
+        Limite à max_runs pour éviter des temps de calcul trop longs.
+        """
+        combos = self._combinations()
+        # Shuffle pour que même un run partiel soit représentatif
+        random.shuffle(combos)
+        combos = combos[:max_runs]
+
+        total = len(combos)
+        log.info(f"[OPTIMIZER] Démarrage grid search — {total} combinaisons à tester")
+
+        best_params:  Dict = {}
+        best_metrics: Dict = {"profit_factor": 0.0}
+        results: List[Tuple[float, Dict, Dict]] = []
+
+        for idx, params in enumerate(combos, 1):
+            # Appliquer les paramètres au cfg temporaire
+            test_cfg = BotConfig()
+            for k, v in params.items():
+                setattr(test_cfg, k, v)
+
+            bt     = Backtester(test_cfg, self.store)
+            result = bt.run(markets)
+
+            if result.total_trades < 10:
+                continue  # trop peu de trades — pas représentatif
+
+            metrics = result.summary()
+            self.store.save_backtest_result(params, metrics)
+            results.append((metrics["profit_factor"], params, metrics))
+
+            if metrics["profit_factor"] > best_metrics["profit_factor"]:
+                best_params  = params
+                best_metrics = metrics
+                log.info(
+                    f"[OPTIMIZER] [{idx}/{total}] Nouveau meilleur → "
+                    f"PF={metrics['profit_factor']:.3f}  "
+                    f"WR={metrics['win_rate']:.1f}%  "
+                    f"PnL={metrics['total_pnl']:+.2f}€  "
+                    f"Params={params}"
+                )
+
+        # Afficher le top N
+        results.sort(key=lambda x: x[0], reverse=True)
+        print(f"\n{'═'*60}")
+        print(f"  🏆 TOP {min(top_n, len(results))} COMBINAISONS")
+        print(f"{'═'*60}")
+        for rank, (pf, params, metrics) in enumerate(results[:top_n], 1):
+            print(
+                f"  #{rank}  PF={pf:.3f}  WR={metrics['win_rate']:.1f}%  "
+                f"PnL={metrics['total_pnl']:+.2f}€  "
+                f"DD={metrics['max_drawdown']:.1f}%  "
+                f"Sharpe={metrics['sharpe']:.3f}"
+            )
+            print(f"       Params: {params}")
+        print(f"{'═'*60}\n")
+
+        return best_params, best_metrics
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MODULE 4 — WALK-FORWARD TEST
+# ─────────────────────────────────────────────────────────────────────────────
+class WalkForwardTester:
+    """
+    Validation robuste anti-overfitting.
+
+    Principe :
+    ┌──────────────────────────────────────────────────────┐
+    │  Fenêtre 1 :  [train_1 | test_1]                     │
+    │  Fenêtre 2 :        [train_2 | test_2]               │
+    │  Fenêtre 3 :              [train_3 | test_3]         │
+    └──────────────────────────────────────────────────────┘
+
+    Pour chaque fenêtre :
+    1. Optimiser les paramètres sur train
+    2. Tester les meilleurs paramètres sur test (out-of-sample)
+    3. Agréger les métriques test
+
+    Si la stratégie est robuste, les métriques out-of-sample seront
+    cohérentes avec les métriques in-sample.
+
+    Usage :
+      wf = WalkForwardTester(cfg, store)
+      wf.run(markets, n_windows=5, train_ratio=0.7)
+    """
+
+    def __init__(self, cfg: BotConfig, store: DataStore):
+        self.cfg   = cfg
+        self.store = store
+
+    def run(
+        self,
+        markets:     List[str],
+        n_windows:   int   = 4,
+        train_ratio: float = 0.70,
+        max_runs:    int   = 20,
+    ) -> List[Dict]:
+        """
+        Lance le walk-forward. Retourne les métriques out-of-sample par fenêtre.
+        """
+        # Charger toutes les bougies disponibles
+        all_candles: Dict[str, List[Candle]] = {}
+        for market in markets:
+            c = self.store.load_candles(market, 15, limit=5000)
+            if len(c) >= 400:
+                all_candles[market] = c
+
+        if not all_candles:
+            log.error("[WF] Aucune donnée. Lance le téléchargement d'abord.")
+            return []
+
+        min_len = min(len(v) for v in all_candles.values())
+        window_size = min_len // n_windows
+        if window_size < 200:
+            log.error(f"[WF] Fenêtres trop petites ({window_size} bougies). Besoin de plus de données.")
+            return []
+
+        log.info(
+            f"[WF] Démarrage walk-forward — {n_windows} fenêtres · "
+            f"{window_size} bougies/fenêtre · train={train_ratio:.0%}"
+        )
+
+        wf_results = []
+
+        for w in range(n_windows):
+            start = w * window_size
+            end   = start + window_size
+            split = start + int(window_size * train_ratio)
+
+            log.info(f"[WF] Fenêtre {w+1}/{n_windows} — train:[{start}:{split}]  test:[{split}:{end}]")
+
+            # ── Créer un DataStore temporaire en mémoire pour le train
+            train_store = DataStore(":memory:")
+            test_store  = DataStore(":memory:")
+
+            for market, candles in all_candles.items():
+                # Charger aussi les 1h proportionnellement
+                c1h = self.store.load_candles(market, 60, limit=2000)
+                split_1h = int(len(c1h) * split / min_len)
+
+                train_store.save_candles(market, 15, candles[start:split])
+                train_store.save_candles(market, 60, c1h[:split_1h])
+                test_store.save_candles(market, 15,  candles[split:end])
+                test_store.save_candles(market, 60,  c1h[split_1h:int(len(c1h)*end/min_len)])
+
+            # ── Optimiser sur le train
+            opt = ParameterOptimizer(self.cfg, train_store)
+            best_params, _ = opt.run(list(all_candles.keys()), max_runs=max_runs)
+
+            if not best_params:
+                log.warning(f"[WF] Fenêtre {w+1} — optimisation sans résultat, skip")
+                continue
+
+            # ── Tester les meilleurs paramètres sur le test (out-of-sample)
+            test_cfg = BotConfig()
+            for k, v in best_params.items():
+                setattr(test_cfg, k, v)
+
+            bt_test = Backtester(test_cfg, test_store)
+            result  = bt_test.run(list(all_candles.keys()))
+            metrics = result.summary()
+            metrics["window"]      = w + 1
+            metrics["best_params"] = best_params
+            wf_results.append(metrics)
+
+            result.print_report(
+                f"WF Fenêtre {w+1} — OUT-OF-SAMPLE  params={best_params}"
+            )
+
+        # ── Rapport global walk-forward
+        if wf_results:
+            avg_pf  = sum(r["profit_factor"] for r in wf_results) / len(wf_results)
+            avg_wr  = sum(r["win_rate"] for r in wf_results) / len(wf_results)
+            avg_pnl = sum(r["total_pnl"] for r in wf_results) / len(wf_results)
+            avg_dd  = sum(r["max_drawdown"] for r in wf_results) / len(wf_results)
+            consistency = sum(1 for r in wf_results if r["profit_factor"] > 1.0) / len(wf_results) * 100
+
+            print(f"\n{'═'*60}")
+            print(f"  🔬 WALK-FORWARD — RÉSUMÉ GLOBAL ({len(wf_results)} fenêtres)")
+            print(f"{'═'*60}")
+            print(f"  Profit Factor moyen : {avg_pf:.3f}")
+            print(f"  Win Rate moyen      : {avg_wr:.1f}%")
+            print(f"  PnL moyen/fenêtre   : {avg_pnl:+.2f}€")
+            print(f"  Max Drawdown moyen  : {avg_dd:.2f}%")
+            print(f"  Cohérence (PF>1)    : {consistency:.0f}% des fenêtres")
+            if consistency >= 75:
+                print(f"  ✅ Stratégie ROBUSTE (cohérence ≥ 75%)")
+            elif consistency >= 50:
+                print(f"  ⚠️  Stratégie MODÉRÉE (cohérence 50–75%)")
+            else:
+                print(f"  ❌ Stratégie FRAGILE (cohérence < 50%) — revoir les paramètres")
+            print(f"{'═'*60}\n")
+
+        return wf_results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MODULE 5 — DASHBOARD HTML (monitoring temps réel, auto-refresh)
+# ─────────────────────────────────────────────────────────────────────────────
+class DashboardServer:
+    """
+    Serveur HTTP léger (stdlib uniquement) qui expose un dashboard HTML
+    auto-rafraîchi toutes les 30 secondes.
+
+    Accessible sur http://localhost:8080 (ou le port configuré).
+    Affiche : capital, PnL, trades ouverts, historique, métriques clés.
+
+    Usage :
+      dashboard = DashboardServer(perf_tracker, risk_manager, open_trades_ref)
+      asyncio.ensure_future(dashboard.start())
+    """
+
+    HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="refresh" content="30">
+<title>⚡ QUANTUM EDGE — Dashboard</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ background: #0a0e1a; color: #e0e6f0; font-family: 'Courier New', monospace;
+          font-size: 13px; padding: 20px; }}
+  h1 {{ color: #00d4ff; font-size: 20px; margin-bottom: 16px; letter-spacing: 2px; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 20px; }}
+  .card {{ background: #111827; border: 1px solid #1e3a5f; border-radius: 8px; padding: 14px; }}
+  .card .label {{ color: #6b7fa3; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }}
+  .card .value {{ font-size: 22px; font-weight: bold; margin-top: 4px; }}
+  .pos {{ color: #22c55e; }} .neg {{ color: #ef4444; }} .neu {{ color: #00d4ff; }}
+  table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
+  th {{ background: #1e3a5f; color: #00d4ff; padding: 8px; text-align: left; font-size: 11px; }}
+  td {{ padding: 7px 8px; border-bottom: 1px solid #1a2540; font-size: 12px; }}
+  tr:hover td {{ background: #131f35; }}
+  .badge-buy {{ color: #22c55e; font-weight: bold; }}
+  .badge-sell {{ color: #ef4444; font-weight: bold; }}
+  .ts {{ color: #4a5c7a; font-size: 11px; margin-top: 16px; text-align: right; }}
+</style>
+</head>
+<body>
+<h1>⚡ QUANTUM EDGE v3.0 — Live Dashboard</h1>
+<div class="grid">
+  <div class="card"><div class="label">Capital</div>
+    <div class="value neu">{capital:.2f} €</div></div>
+  <div class="card"><div class="label">PnL Total</div>
+    <div class="value {pnl_class}">{total_pnl:+.2f} €</div></div>
+  <div class="card"><div class="label">PnL Journalier</div>
+    <div class="value {dpnl_class}">{daily_pnl:+.2f} €</div></div>
+  <div class="card"><div class="label">Win Rate</div>
+    <div class="value neu">{win_rate:.1f} %</div></div>
+  <div class="card"><div class="label">Profit Factor</div>
+    <div class="value neu">{profit_factor:.3f}</div></div>
+  <div class="card"><div class="label">Trades ouverts</div>
+    <div class="value neu">{open_trades}</div></div>
+  <div class="card"><div class="label">Total Trades</div>
+    <div class="value neu">{total_trades}</div></div>
+  <div class="card"><div class="label">Sharpe Ratio</div>
+    <div class="value neu">{sharpe:.3f}</div></div>
+</div>
+
+<h2 style="color:#6b7fa3;font-size:13px;margin-bottom:8px;">TRADES OUVERTS</h2>
+<table>
+  <tr><th>Marché</th><th>Dir.</th><th>Entrée</th><th>PnL latent</th><th>Score</th><th>Régime</th></tr>
+  {open_rows}
+</table>
+
+<h2 style="color:#6b7fa3;font-size:13px;margin:16px 0 8px;">DERNIERS TRADES FERMÉS</h2>
+<table>
+  <tr><th>Marché</th><th>Dir.</th><th>Entrée</th><th>Sortie</th><th>PnL</th><th>Raison</th></tr>
+  {closed_rows}
+</table>
+
+<div class="ts">Mis à jour : {ts} UTC · Auto-refresh 30s</div>
+</body></html>"""
+
+    def __init__(
+        self,
+        perf:        "PerformanceTracker",
+        risk:        "RiskManager",
+        open_trades: Dict,
+        port:        int = 8080,
+    ):
+        self.perf        = perf
+        self.risk        = risk
+        self.open_trades = open_trades
+        self.port        = port
+
+    def _build_html(self) -> str:
+        pnl   = self.perf.total_pnl
+        dpnl  = self.risk.daily_pnl
+
+        # Lignes trades ouverts
+        open_rows = ""
+        for market, trade in self.open_trades.items():
+            side_cls = "badge-buy" if trade.side == Signal.BUY else "badge-sell"
+            open_rows += (
+                f"<tr><td>{market}</td>"
+                f"<td class='{side_cls}'>{trade.side.value}</td>"
+                f"<td>{trade.entry_price:.6f}</td>"
+                f"<td>—</td>"
+                f"<td>{trade.score}</td>"
+                f"<td>{trade.regime.value}</td></tr>"
+            )
+        if not open_rows:
+            open_rows = "<tr><td colspan='6' style='color:#4a5c7a;text-align:center'>Aucun trade ouvert</td></tr>"
+
+        # Lignes derniers trades fermés (10 derniers)
+        closed_rows = ""
+        for t in reversed(self.perf.all_trades[-10:]):
+            pnl_cls = "pos" if t.pnl_eur > 0 else "neg"
+            side_cls = "badge-buy" if t.side == Signal.BUY else "badge-sell"
+            closed_rows += (
+                f"<tr><td>{t.market}</td>"
+                f"<td class='{side_cls}'>{t.side.value}</td>"
+                f"<td>{t.entry_price:.6f}</td>"
+                f"<td>{t.exit_price:.6f}</td>"
+                f"<td class='{pnl_cls}'>{t.pnl_eur:+.2f}€</td>"
+                f"<td>{t.exit_time.strftime('%H:%M') if t.exit_time else '—'}</td></tr>"
+            )
+        if not closed_rows:
+            closed_rows = "<tr><td colspan='6' style='color:#4a5c7a;text-align:center'>Aucun trade fermé</td></tr>"
+
+        return self.HTML_TEMPLATE.format(
+            capital       = self.risk.capital,
+            total_pnl     = pnl,
+            pnl_class     = "pos" if pnl >= 0 else "neg",
+            daily_pnl     = dpnl,
+            dpnl_class    = "pos" if dpnl >= 0 else "neg",
+            win_rate      = self.perf.win_rate,
+            profit_factor = self.perf.profit_factor,
+            open_trades   = len(self.open_trades),
+            total_trades  = self.perf.total_trades,
+            sharpe        = self.perf.sharpe_ratio(),
+            open_rows     = open_rows,
+            closed_rows   = closed_rows,
+            ts            = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
+    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        try:
+            await reader.read(1024)  # lire la requête HTTP
+            html    = self._build_html().encode("utf-8")
+            headers = (
+                f"HTTP/1.1 200 OK\r\n"
+                f"Content-Type: text/html; charset=utf-8\r\n"
+                f"Content-Length: {len(html)}\r\n"
+                f"Connection: close\r\n\r\n"
+            ).encode()
+            writer.write(headers + html)
+            await writer.drain()
+        except Exception:
+            pass
+        finally:
+            writer.close()
+
+    async def start(self):
+        """Démarre le serveur HTTP en tâche de fond."""
+        try:
+            server = await asyncio.start_server(self._handle, "0.0.0.0", self.port)
+            log.info(f"[DASHBOARD] Serveur démarré → http://0.0.0.0:{self.port}")
+            async with server:
+                await server.serve_forever()
+        except Exception as e:
+            log.warning(f"[DASHBOARD] Impossible de démarrer : {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MODULE 6 — TÉLÉCHARGEUR DE DONNÉES HISTORIQUES
+# ─────────────────────────────────────────────────────────────────────────────
+class HistoricalDownloader:
+    """
+    Télécharge et stocke les données historiques Kraken en SQLite.
+
+    Kraken retourne max 720 bougies par appel.
+    Ce module pagine automatiquement pour remplir la base jusqu'à `target_days`.
+
+    Usage :
+      dl = HistoricalDownloader(kraken_client, store)
+      await dl.download_all(markets, interval_min=15, target_days=180)
+    """
+
+    def __init__(self, kraken: "KrakenClient", store: DataStore):
+        self.kraken = kraken
+        self.store  = store
+
+    async def download_market(
+        self,
+        market:       str,
+        interval_min: int = 15,
+        target_days:  int = 180,
+    ) -> int:
+        """
+        Télécharge jusqu'à `target_days` jours de données pour un marché.
+        Retourne le nombre de bougies sauvegardées.
+        """
+        target_candles = target_days * 24 * 60 // interval_min
+        existing       = self.store.candle_count(market, interval_min)
+
+        if existing >= target_candles * 0.95:
+            log.info(f"[DL] {market} {interval_min}m — déjà à jour ({existing} bougies)")
+            return 0
+
+        log.info(
+            f"[DL] {market} {interval_min}m — téléchargement "
+            f"(objectif {target_candles}, en base {existing})"
+        )
+
+        total_saved = 0
+        oldest_ts = 0
+        # Récupérer le timestamp le plus ancien déjà stocké
+        try:
+            if self.store.use_postgres:
+                with self.store._pg_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT MIN(timestamp) FROM candles WHERE market=%s AND interval_min=%s",
+                            (market, interval_min),
+                        )
+                        row = cur.fetchone()
+                        if row and row.get("min"):
+                            oldest_ts = int(row["min"])
+            else:
+                with self.store._sqlite_conn() as conn:
+                    row = conn.execute(
+                        "SELECT MIN(timestamp) FROM candles WHERE market=? AND interval_min=?",
+                        (market, interval_min),
+                    ).fetchone()
+                    if row and row[0]:
+                        oldest_ts = row[0]
+        except Exception:
+            oldest_ts = 0
+
+        for _ in range(20):  # max 20 pages = ~14 400 bougies
+            candles = await self.kraken.fetch_ohlcv(market, interval_min, count=720)
+            if not candles:
+                break
+
+            new_candles = (
+                [c for c in candles if c.timestamp < oldest_ts]
+                if oldest_ts else candles
+            )
+            if not new_candles:
+                break
+
+            self.store.save_candles(market, interval_min, new_candles)
+            total_saved += len(new_candles)
+            oldest_ts    = min(c.timestamp for c in new_candles)
+
+            current_count = self.store.candle_count(market, interval_min)
+            if current_count >= target_candles:
+                break
+
+            await asyncio.sleep(0.5)  # respecter le rate limit Kraken
+
+        log.info(f"[DL] {market} {interval_min}m — {total_saved} nouvelles bougies sauvegardées")
+        return total_saved
+
+    async def download_all(
+        self,
+        markets:      List[str],
+        interval_min: int = 15,
+        target_days:  int = 180,
+    ) -> Dict[str, int]:
+        """Télécharge toutes les paires en séquentiel (respecte le rate limit)."""
+        results: Dict[str, int] = {}
+        for market in markets:
+            n = await self.download_market(market, interval_min, target_days)
+            # Télécharger aussi les 1h pour les indicateurs macro
+            n1h = await self.download_market(market, 60, target_days)
+            results[market] = n + n1h
+            await asyncio.sleep(1.0)  # pause entre marchés
+        total = sum(results.values())
+        log.info(f"[DL] Téléchargement terminé — {total} bougies au total")
+        return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  POINT D'ENTRÉE
+# ─────────────────────────────────────────────────────────────────────────────
+cfg = BotConfig()
+
+if __name__ == "__main__":
+    # ── Lecture des variables d'environnement (Railway / .env)
+    cfg.simulation_mode  = os.environ.get("SIMULATION_MODE", "true").lower() == "true"
+    cfg.initial_capital  = float(os.environ.get("INITIAL_CAPITAL", "200"))
+    cfg.stake_eur        = float(os.environ.get("STAKE_EUR", "50"))
+    cfg.leverage         = int(os.environ.get("LEVERAGE", "3"))
+    cfg.daily_kill_eur   = float(os.environ.get("DAILY_KILL_EUR", "-3"))
+    cfg.score_min        = int(os.environ.get("SCORE_MIN", "14"))
+    cfg.max_open_trades  = int(os.environ.get("MAX_OPEN_TRADES", "3"))
+    # ── Telegram (optionnel)
+    cfg.use_telegram      = os.environ.get("USE_TELEGRAM", "false").lower() == "true"
+    cfg.telegram_token    = os.environ.get("TELEGRAM_TOKEN", "")
+    cfg.telegram_chat_id  = os.environ.get("TELEGRAM_CHAT_ID", "")
+    # ── PostgreSQL (Railway fournit DATABASE_URL automatiquement)
+    cfg.database_url      = os.environ.get("DATABASE_URL", "")
+
+    # ────────────────────────────────────────────────────────────────────────
+    #  MODE CLI — usage : python bot_trading.py [commande]
+    #
+    #  Commandes disponibles :
+    #    (aucune)         → démarrer le bot en mode normal
+    #    download         → télécharger 180j de données historiques
+    #    backtest         → lancer un backtest sur les données stockées
+    #    optimize         → grid search des paramètres optimaux
+    #    walkforward      → validation walk-forward anti-overfitting
+    # ────────────────────────────────────────────────────────────────────────
+    command = sys.argv[1] if len(sys.argv) > 1 else "run"
+
+    store = DataStore()
+
+    if command == "download":
+        # ── Télécharger les données historiques (180 jours)
+        async def _download():
+            kraken = KrakenClient()
+            dl     = HistoricalDownloader(kraken, store)
+            print("\n📥 Téléchargement des données historiques (180 jours)...")
+            await dl.download_all(cfg.markets, interval_min=15, target_days=180)
+            await dl.download_all(cfg.markets, interval_min=60, target_days=180)
+            await kraken.close()
+            print("\n✅ Téléchargement terminé. Lance maintenant : python bot_trading.py backtest")
+        asyncio.run(_download())
+
+    elif command == "backtest":
+        # ── Backtest sur les données stockées
+        print("\n🔬 Lancement du backtest...")
+        bt     = Backtester(cfg, store)
+        result = bt.run(cfg.markets)
+        result.print_report("BACKTEST COMPLET")
+        # Afficher les 5 meilleurs résultats historiques
+        best = store.best_backtest_results(top_n=5)
+        if best:
+            print(f"\n🏆 TOP 5 BACKTESTS EN BASE :")
+            for r in best:
+                print(
+                    f"  {r['run_at'][:16]}  "
+                    f"PF={r['profit_factor']:.3f}  WR={r['win_rate']:.1f}%  "
+                    f"PnL={r['total_pnl']:+.2f}€  DD={r['max_drawdown']:.1f}%"
+                )
+
+    elif command == "optimize":
+        # ── Grid search des paramètres
+        print("\n⚙️  Lancement de l'optimisation (grid search)...")
+        opt = ParameterOptimizer(cfg, store)
+        best_params, best_metrics = opt.run(cfg.markets, top_n=5, max_runs=50)
+        if best_params:
+            print(f"\n✅ Meilleurs paramètres trouvés :")
+            for k, v in best_params.items():
+                print(f"   {k} = {v}")
+            print(f"\n   PF={best_metrics['profit_factor']:.3f}  "
+                  f"WR={best_metrics['win_rate']:.1f}%  "
+                  f"PnL={best_metrics['total_pnl']:+.2f}€  "
+                  f"Sharpe={best_metrics['sharpe']:.3f}")
+            print("\n💡 Applique ces valeurs dans BotConfig ou via variables d'environnement.")
+
+    elif command == "walkforward":
+        # ── Walk-forward test
+        print("\n🔬 Lancement du walk-forward test (4 fenêtres)...")
+        wf      = WalkForwardTester(cfg, store)
+        windows = wf.run(cfg.markets, n_windows=4, train_ratio=0.70, max_runs=20)
+        if not windows:
+            print("❌ Pas assez de données. Lance d'abord : python bot_trading.py download")
+
+    else:
+        # ── Mode normal : démarrer le bot
+        bot = QuantumEdgeBot(cfg)
+        asyncio.run(bot.run())
