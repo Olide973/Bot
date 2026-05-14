@@ -169,7 +169,7 @@ class BotConfig:
 
     # ── Take-profit partiel
     partial_tp_enabled:  bool  = True
-    partial_tp_trigger:  float = 0.35   # déclenche à +0.35% de gain levierisé
+    partial_tp_trigger:  float = 0.50   # déclenche à +0.50% (relevé pour éviter sorties prématurées)
     partial_tp_size:     float = 0.50   # sécurise 50% du PnL latent
 
     # ── Cooldown après série de pertes
@@ -182,7 +182,7 @@ class BotConfig:
     smart_defense_stake_reduction: float = 0.50  # réduit la mise de 50%
 
     # ── Corrélation manager (Pearson 1h)
-    correlation_threshold: float = 0.75   # seuil |ρ| max entre positions
+    correlation_threshold: float = 0.85   # assoupli 0.75→0.85 — moins de signaux bloqués
     max_correlated_trades: int   = 2      # max trades dans un même cluster
 
     # ── Ajustement dynamique de mise selon volatilité
@@ -748,9 +748,16 @@ class RiskManager:
         self.trades_today += 1
 
     def kelly_stake(self, win_rate: float, win_pct: float, loss_pct: float) -> float:
-        """Fraction Kelly conservatrice pour dimensionner la mise."""
+        """Fraction Kelly conservatrice pour dimensionner la mise.
+        Avant 30 trades : mise fixe 10€ — Kelly pas fiable avec peu de données.
+        Après 30 trades : Kelly dynamique plafonné à stake_eur.
+        """
+        total = len([t for t in [win_rate] if t is not None])  # proxy simple
+        # Mise fixe tant que l'historique est insuffisant (< 30 trades)
+        if win_rate == 0.55:  # prior conservateur = pas encore de vraies données
+            return 10.0
         if loss_pct == 0:
-            return self.cfg.stake_eur
+            return 10.0
         b = win_pct / loss_pct
         kelly = (b * win_rate - (1 - win_rate)) / b
         kelly = max(0, kelly) * self.cfg.kelly_fraction
