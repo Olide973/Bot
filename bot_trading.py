@@ -2801,16 +2801,29 @@ class HistoricalDownloader:
         )
 
         total_saved = 0
-        # Kraken renvoie toujours les 720 dernières bougies + depuis `since`
-        # On pagine en remontant dans le temps depuis le plus ancien stocké
         oldest_ts = 0
-        with self.store._conn() as conn:
-            row = conn.execute(
-                "SELECT MIN(timestamp) FROM candles WHERE market=? AND interval_min=?",
-                (market, interval_min),
-            ).fetchone()
-            if row and row[0]:
-                oldest_ts = row[0]
+        # Récupérer le timestamp le plus ancien déjà stocké
+        try:
+            if self.store.use_postgres:
+                with self.store._pg_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT MIN(timestamp) FROM candles WHERE market=%s AND interval_min=%s",
+                            (market, interval_min),
+                        )
+                        row = cur.fetchone()
+                        if row and row.get("min"):
+                            oldest_ts = int(row["min"])
+            else:
+                with self.store._sqlite_conn() as conn:
+                    row = conn.execute(
+                        "SELECT MIN(timestamp) FROM candles WHERE market=? AND interval_min=?",
+                        (market, interval_min),
+                    ).fetchone()
+                    if row and row[0]:
+                        oldest_ts = row[0]
+        except Exception:
+            oldest_ts = 0
 
         for _ in range(20):  # max 20 pages = ~14 400 bougies
             candles = await self.kraken.fetch_ohlcv(market, interval_min, count=720)
