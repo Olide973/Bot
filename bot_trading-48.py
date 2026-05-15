@@ -74,28 +74,28 @@ def get_multiplicateur_atr(pnl):
             return mult
     return 2.50
 
-# ── Marchés (13 au lieu de 8)
+# ── Marchés (13 marchés confirmés sur Kraken)
 MARCHES = [
     "XRPUSDT",  "ATOMUSDT", "LINKUSDT", "ADAUSDT",
     "SOLUSDT",  "AVAXUSDT", "DOTUSDT",  "ETHUSDT",
-    "BNBUSDT",  "DOGEUSDT", "LTCUSDT",  "XBTUSDT",
-    "MATICUSDT"
+    "BNBUSDT",  "DOGEUSDT", "LTCUSDT",  "NEARUSDT",
+    "ALGOUSDT"
 ]
 
 KRAKEN_SYMBOLS = {
-    "XRPUSDT":   "XXRPZUSD",
-    "ATOMUSDT":  "ATOMUSD",
-    "LINKUSDT":  "LINKUSD",
-    "ADAUSDT":   "ADAUSD",
-    "SOLUSDT":   "SOLUSD",
-    "AVAXUSDT":  "AVAXUSD",
-    "DOTUSDT":   "DOTUSD",
-    "ETHUSDT":   "XETHZUSD",
-    "BNBUSDT":   "BNBUSD",
-    "DOGEUSDT":  "XDGUSD",
-    "LTCUSDT":   "XLTCZUSD",
-    "XBTUSDT":   "XXBTZUSD",
-    "MATICUSDT": "MATICUSD",
+    "XRPUSDT":  "XXRPZUSD",
+    "ATOMUSDT": "ATOMUSD",
+    "LINKUSDT": "LINKUSD",
+    "ADAUSDT":  "ADAUSD",
+    "SOLUSDT":  "SOLUSD",
+    "AVAXUSDT": "AVAXUSD",
+    "DOTUSDT":  "DOTUSD",
+    "ETHUSDT":  "XETHZUSD",
+    "BNBUSDT":  "BNBUSD",
+    "DOGEUSDT": "XDGUSD",
+    "LTCUSDT":  "XLTCZUSD",
+    "NEARUSDT": "NEARUSD",
+    "ALGOUSDT": "ALGOUSD",
 }
 
 # ── État global
