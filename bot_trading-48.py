@@ -1,723 +1,514 @@
 """
-╔══════════════════════════════════════════════════════════════════════════════╗
-║           QUANTUM EDGE V4 — MULTI-MARCHÉS + STRUCTURE V7.4                 ║
-║                                                                              ║
-║  Base     : Quantum Edge (multi-marchés, score composite)                   ║
-║  Structure: V7.4 (trailing ATR progressif, break-even, swing trading)       ║
-║                                                                              ║
-║  Marchés  : 13 paires USDT — jusqu'à 3 trades simultanés                   ║
-║  Signaux  : ADX + RSI + Volume (simple et efficace)                         ║
-║  Trailing : Paliers progressifs +0.75€ → +3€ → +7.50€ → ...               ║
-║  Break-even: Stop remonte au prix d'entrée dès +ATR×1.0                    ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════╗
+║        BOT MEAN REVERSION V7.4 — MULTI-MARCHÉS             ║
+║   Base exacte V7.4 + 3 trades simultanés                   ║
+║   RSI < 30 → ACHAT | RSI > 70 → VENTE                     ║
+║   13 marchés | H1 | Stop ATR×2.5 | Ratio 1:2              ║
+║   Trailing Stop CONTINU + BREAK-EVEN VERROUILLÉ            ║
+║   Paliers : +0.75€, +3€, +7.50€, +12€, +18€...            ║
+╚══════════════════════════════════════════════════════════════╝
 """
 
-import asyncio
-import logging
-import os
-import sys
+import requests
 import time
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+import os
+import logging
+import threading
+import pandas as pd
+from ta.trend import ADXIndicator
+from ta.volatility import AverageTrueRange
+from ta.momentum import RSIIndicator
+from datetime import datetime
 
-import aiohttp
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  LOGGING
-# ─────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-    force=True,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
 )
-# Forcer le flush immédiat des logs sur Railway
-if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(line_buffering=True)
-log = logging.getLogger("QE_V4")
+log = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  TRAILING STOP PALIERS (structure V7.4)
-#  PnL en € → multiplicateur ATR pour le trailing
-# ─────────────────────────────────────────────────────────────────────────────
-TRAILING_PALIERS = [
-    (100.0, 0.05),
-    ( 75.0, 0.07),
-    ( 50.0, 0.10),
-    ( 35.0, 0.15),
-    ( 25.0, 0.20),
-    ( 18.0, 0.30),
-    ( 12.0, 0.50),
-    (  7.5, 0.80),
-    (  3.0, 1.50),
-    (  0.75, 2.00),
-    (  0.0, 2.50),
+# ── Paramètres (identiques V7.4)
+CAPITAL_INITIAL         = 200.0
+LEVIER                  = 3
+MISE_FIXE_PCT           = 0.05      # 5% du capital = 10€ par trade
+MAX_TRADES_SIMULTANES   = 3         # nouveauté vs V7.4
+ATR_MULTIPLIER          = 2.5
+RATIO_RR                = 2.0
+RATIO_PARTIEL           = 1.0
+PAUSE                   = 120
+CHECK_INTERVAL          = 15
+TIMEOUT_TRADE           = 12 * 3600
+RSI_ACHAT               = 30
+RSI_VENTE               = 70
+VOLUME_MINI             = 0.40
+ADX_MAX                 = 40
+MAX_PERTES_CONSECUTIVES = 4
+PAUSE_DUREE             = 600       # 10 minutes
+DAILY_KILL              = -5.0      # kill switch journalier
+
+# ── Break-even (identique V7.4)
+BREAK_EVEN_TRIGGER_PNL  = 0.75
+BREAK_EVEN_BUFFER_PCT   = 0.001
+
+TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_TOKEN', '')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
+
+# ── Paliers trailing stop (identiques V7.4)
+TRAILING_NIVEAUX = [
+    (100,  0.05),
+    ( 75,  0.07),
+    ( 50,  0.10),
+    ( 35,  0.15),
+    ( 25,  0.20),
+    ( 18,  0.30),
+    ( 12,  0.50),
+    (7.5,  0.80),
+    (  3,  1.50),
+    (0.75, 2.00),
+    (  0,  2.50),
 ]
 
-def get_trailing_mult(pnl_eur: float) -> float:
-    """Retourne le multiplicateur ATR selon le PnL en euros."""
-    if pnl_eur <= 0:
-        return 2.50  # stop fixe tant que pas en gain
-    for seuil, mult in TRAILING_PALIERS:
-        if pnl_eur >= seuil:
+def get_multiplicateur_atr(pnl):
+    for seuil, mult in TRAILING_NIVEAUX:
+        if pnl >= seuil:
             return mult
     return 2.50
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  CONFIGURATION
-# ─────────────────────────────────────────────────────────────────────────────
-@dataclass
-class Config:
-    simulation_mode:  bool  = True
-    initial_capital:  float = 200.0
-    stake_eur:        float = 10.0      # mise fixe par trade
-    leverage:         int   = 3         # levier
-    max_open_trades:  int   = 3         # trades simultanés max
+# ── Marchés (13 au lieu de 8)
+MARCHES = [
+    "XRPUSDT",  "ATOMUSDT", "LINKUSDT", "ADAUSDT",
+    "SOLUSDT",  "AVAXUSDT", "DOTUSDT",  "ETHUSDT",
+    "BNBUSDT",  "DOGEUSDT", "LTCUSDT",  "XBTUSDT",
+    "MATICUSDT"
+]
 
-    # Filtres signal
-    adx_min:          int   = 25        # ADX minimum
-    rsi_oversold:     int   = 35        # RSI achat
-    rsi_overbought:   int   = 65        # RSI vente
-    volume_min:       float = 0.40      # volume min vs moyenne 24h
-    score_min:        int   = 2         # score minimum sur 3
-
-    # Risk management (ATR-based comme V7.4)
-    atr_multiplier:   float = 2.5       # stop = ATR × 2.5
-    ratio_rr:         float = 2.0       # objectif = stop × 2
-    timeout_hours:    int   = 12        # timeout trade
-
-    # Kill switch
-    daily_kill_eur:   float = -5.0      # stop journalier
-    max_losses_streak: int  = 4         # pertes consécutives max
-    cooldown_minutes: int   = 10        # pause après série de pertes
-
-    # Marchés
-    markets: List[str] = field(default_factory=lambda: [
-        "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
-        "AVAX/USDT", "LINK/USDT", "ADA/USDT", "DOT/USDT",
-        "DOGE/USDT", "ATOM/USDT", "LTC/USDT", "ALGO/USDT", "XTZ/USDT",
-    ])
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  KRAKEN CLIENT
-# ─────────────────────────────────────────────────────────────────────────────
-SYMBOL_MAP = {
-    # Paires Kraken officelles (format OHLC endpoint)
-    "ETH/USDT":  "ETHUSDT",
-    "SOL/USDT":  "SOLUSDT",
-    "BNB/USDT":  "BNBUSDT",   # pas disponible sur Kraken → ignoré
-    "XRP/USDT":  "XRPUSDT",
-    "AVAX/USDT": "AVAXUSDT",
-    "LINK/USDT": "LINKUSDT",
-    "ADA/USDT":  "ADAUSDT",
-    "DOT/USDT":  "DOTUSDT",
-    "DOGE/USDT": "DOGEUSDT",
-    "ATOM/USDT": "ATOMUSDT",
-    "LTC/USDT":  "LTCUSDT",
-    "ALGO/USDT": "ALGOUSDT",
-    "XTZ/USDT":  "XTZUSDT",
+KRAKEN_SYMBOLS = {
+    "XRPUSDT":   "XXRPZUSD",
+    "ATOMUSDT":  "ATOMUSD",
+    "LINKUSDT":  "LINKUSD",
+    "ADAUSDT":   "ADAUSD",
+    "SOLUSDT":   "SOLUSD",
+    "AVAXUSDT":  "AVAXUSD",
+    "DOTUSDT":   "DOTUSD",
+    "ETHUSDT":   "XETHZUSD",
+    "BNBUSDT":   "BNBUSD",
+    "DOGEUSDT":  "XDGUSD",
+    "LTCUSDT":   "XLTCZUSD",
+    "XBTUSDT":   "XXBTZUSD",
+    "MATICUSDT": "MATICUSD",
 }
 
-# Noms alternatifs Kraken si le nom standard échoue
-SYMBOL_FALLBACK = {
-    "ETH/USDT":  "ETHUSD",
-    "SOL/USDT":  "SOLUSD",
-    "XRP/USDT":  "XRPUSDT",
-    "AVAX/USDT": "AVAXUSD",
-    "LINK/USDT": "LINKUSD",
-    "ADA/USDT":  "ADAUSD",
-    "DOT/USDT":  "DOTUSD",
-    "DOGE/USDT": "XDGUSD",
-    "ATOM/USDT": "ATOMUSD",
-    "LTC/USDT":  "XLTCZUSD",
-    "ALGO/USDT": "ALGOUSD",
-    "XTZ/USDT":  "XTZUSD",
-}
+# ── État global
+capital             = CAPITAL_INITIAL
+pnl_journalier      = 0.0
+nb_trades           = 0
+nb_wins             = 0
+nb_losses           = 0
+total_gagne         = 0.0
+total_perdu         = 0.0
+pertes_consecutives = 0
+pause_until         = 0
+trades_actifs       = {}   # {symbole: thread}
+lock                = threading.Lock()
 
-class KrakenClient:
-    BASE = "https://api.kraken.com/0/public"
+log.info("=" * 55)
+log.info("  BOT MEAN REVERSION V7.4 MULTI-MARCHÉS")
+log.info(f"  Capital : {CAPITAL_INITIAL}€ | Levier x{LEVIER} | Mise {MISE_FIXE_PCT*100}%")
+log.info(f"  RSI < {RSI_ACHAT} → ACHAT | RSI > {RSI_VENTE} → VENTE")
+log.info(f"  Stop ATR×{ATR_MULTIPLIER} | Ratio 1:{RATIO_RR}")
+log.info(f"  Max trades simultanés : {MAX_TRADES_SIMULTANES}")
+log.info(f"  Break-even dès +{BREAK_EVEN_TRIGGER_PNL}€")
+log.info(f"  Marchés : {len(MARCHES)}")
+log.info("=" * 55)
 
-    def __init__(self):
-        self._session: Optional[aiohttp.ClientSession] = None
+def telegram(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=10)
+    except Exception as e:
+        log.error(f"Erreur Telegram : {e}")
 
-    async def _get(self):
-        if not self._session or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=10)
-            )
-        return self._session
-
-    async def close(self):
-        if self._session and not self._session.closed:
-            await self._session.close()
-
-    async def get_candles(self, market: str, interval: int = 60, count: int = 100) -> List[dict]:
-        """Récupère les bougies OHLCV depuis Kraken — avec fallback automatique."""
-        session = await self._get()
-
-        # Essai avec le nom principal, puis fallback
-        pairs_to_try = [SYMBOL_MAP.get(market, market.replace("/", ""))]
-        fallback = SYMBOL_FALLBACK.get(market)
-        if fallback:
-            pairs_to_try.append(fallback)
-
-        for pair in pairs_to_try:
-            try:
-                async with session.get(
-                    f"{self.BASE}/OHLC",
-                    params={"pair": pair, "interval": interval}
-                ) as resp:
-                    data = await resp.json()
-                    if data.get("error"):
-                        continue  # essayer le fallback
-                    result = data.get("result", {})
-                    keys = [k for k in result if k != "last"]
-                    if not keys:
-                        continue
-                    raw = result[keys[0]][-count:]
-                    candles = [
-                        {
-                            "time":   int(c[0]),
-                            "open":   float(c[1]),
-                            "high":   float(c[2]),
-                            "low":    float(c[3]),
-                            "close":  float(c[4]),
-                            "volume": float(c[6]),
-                        }
-                        for c in raw
-                    ]
-                    if candles:
-                        return candles
-            except Exception as e:
-                log.warning(f"[KRAKEN] {market} ({pair}) erreur : {e}")
-                continue
-
-        log.warning(f"[KRAKEN] {market} — aucune donnée disponible")
-        return []
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  INDICATEURS TECHNIQUES
-# ─────────────────────────────────────────────────────────────────────────────
-def calc_rsi(closes: List[float], period: int = 14) -> float:
-    if len(closes) < period + 1:
-        return 50.0
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        d = closes[i] - closes[i-1]
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
-    ag = sum(gains[-period:]) / period
-    al = sum(losses[-period:]) / period
-    if al == 0:
-        return 100.0
-    rs = ag / al
-    return round(100 - 100 / (1 + rs), 2)
-
-def calc_atr(candles: List[dict], period: int = 14) -> float:
-    if len(candles) < period + 1:
-        return 0.0
-    trs = []
-    for i in range(1, len(candles)):
-        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i-1]["close"]
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    return round(sum(trs[-period:]) / period, 8)
-
-def calc_adx(candles: List[dict], period: int = 14) -> float:
-    if len(candles) < period * 2:
-        return 0.0
-    plus_dm, minus_dm, trs = [], [], []
-    for i in range(1, len(candles)):
-        h, l   = candles[i]["high"],   candles[i]["low"]
-        ph, pl = candles[i-1]["high"], candles[i-1]["low"]
-        pc     = candles[i-1]["close"]
-        up, down = h - ph, pl - l
-        plus_dm.append(up if up > down and up > 0 else 0)
-        minus_dm.append(down if down > up and down > 0 else 0)
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    def smooth(arr):
-        s = sum(arr[:period])
-        out = [s]
-        for v in arr[period:]:
-            s = s - s / period + v
-            out.append(s)
-        return out
-    atr_s  = smooth(trs)
-    pdm_s  = smooth(plus_dm)
-    mdm_s  = smooth(minus_dm)
-    dx_vals = []
-    for a, p, m in zip(atr_s, pdm_s, mdm_s):
-        if a == 0:
-            continue
-        pdi, mdi = 100 * p / a, 100 * m / a
-        dx = 100 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) > 0 else 0
-        dx_vals.append(dx)
-    if not dx_vals:
-        return 0.0
-    return round(sum(dx_vals[-period:]) / min(len(dx_vals), period), 2)
-
-def calc_volume_ratio(candles: List[dict]) -> float:
-    """
-    Compare le volume de la dernière bougie FERMÉE (index -2)
-    à la moyenne des 24 bougies précédentes.
-    La dernière bougie (index -1) est en cours → volume incomplet → exclue.
-    """
-    if len(candles) < 26:
-        return 0.0
-    # Bougies fermées : toutes sauf la dernière
-    closed = candles[:-1]
-    avg = sum(c["volume"] for c in closed[-24:]) / 24
-    if avg == 0:
-        return 0.0
-    # Volume de la dernière bougie fermée
-    last_closed_vol = closed[-1]["volume"]
-    return round(last_closed_vol / avg, 4)
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  SIGNAL (score simple sur 3 critères comme V7.4)
-# ─────────────────────────────────────────────────────────────────────────────
-def compute_signal(candles: List[dict], cfg: Config) -> Tuple[str, int, dict]:
-    """
-    Retourne (direction, score, details)
-    direction : "BUY" | "SELL" | "NONE"
-    score     : 0-3
-
-    Score sur 3 :
-      +1 RSI en zone (< oversold ou > overbought)
-      +1 ADX fort (> adx_min + 10, soit > 35)
-      +1 RSI extrême (< oversold-10 ou > overbought+10)
-    Score min 2 requis.
-    """
-    if len(candles) < 30:
-        return "NONE", 0, {}
-
-    closes = [c["close"] for c in candles]
-    rsi    = calc_rsi(closes)
-    adx    = calc_adx(candles)
-    atr    = calc_atr(candles)
-    vol_r  = calc_volume_ratio(candles)
-
-    details = {"rsi": rsi, "adx": adx, "atr": atr, "vol_ratio": vol_r}
-
-    # Filtres bloquants
-    if vol_r < cfg.volume_min:
-        return "NONE", 0, details
-    if adx < cfg.adx_min:
-        return "NONE", 0, details
-
-    score = 0
-    direction = "NONE"
-
-    if rsi < cfg.rsi_oversold:
-        direction = "BUY"
-        score += 1                              # RSI en zone survente
-        if adx > cfg.adx_min + 10:
-            score += 1                          # tendance forte
-        if rsi < cfg.rsi_oversold - 10:
-            score += 1                          # RSI très bas (< 25)
-
-    elif rsi > cfg.rsi_overbought:
-        direction = "SELL"
-        score += 1                              # RSI en zone surachat
-        if adx > cfg.adx_min + 10:
-            score += 1                          # tendance forte
-        if rsi > cfg.rsi_overbought + 10:
-            score += 1                          # RSI très haut (> 75)
-
-    if score < cfg.score_min:
-        return "NONE", 0, details
-
-    return direction, score, details
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  TRADE
-# ─────────────────────────────────────────────────────────────────────────────
-@dataclass
-class Trade:
-    market:       str
-    side:         str       # "BUY" | "SELL"
-    entry_price:  float
-    stake:        float
-    leverage:     int
-    atr:          float
-    stop_loss:    float
-    target:       float
-    entry_time:   datetime
-    score:        int
-    stop_current: float     = 0.0
-    peak_price:   float     = 0.0
-    break_even:   bool      = False
-    trailing_mult: float    = 2.50
-
-    def __post_init__(self):
-        self.stop_current = self.stop_loss
-        self.peak_price   = self.entry_price
-
-    @property
-    def position_size(self) -> float:
-        return self.stake * self.leverage
-
-    def pnl(self, current_price: float) -> float:
-        """PnL en euros sur la position."""
-        if self.side == "BUY":
-            pct = (current_price - self.entry_price) / self.entry_price
-        else:
-            pct = (self.entry_price - current_price) / self.entry_price
-        gross = self.position_size * pct
-        fees  = self.position_size * 0.0004 * 2  # 0.04% × 2
-        return round(gross - fees, 4)
-
-    def update_trailing(self, current_price: float) -> bool:
-        """
-        Met à jour le trailing stop selon les paliers V7.4.
-        Retourne True si le stop a bougé.
-        """
-        pnl_eur = self.pnl(current_price)
-        mult    = get_trailing_mult(pnl_eur)
-        self.trailing_mult = mult
-        distance = self.atr * mult
-
-        # Break-even : dès que PnL > 0, on remonte le stop au prix d'entrée
-        if pnl_eur > 0 and not self.break_even:
-            if self.side == "BUY":
-                be_stop = self.entry_price * (1 - 0.0002)  # légèrement sous l'entrée
-                if be_stop > self.stop_current:
-                    self.stop_current = be_stop
-                    self.break_even   = True
-                    log.info(f"  [{self.market}] 🔒 BREAK-EVEN activé @ {be_stop:.6f} (PnL={pnl_eur:+.2f}€)")
-                    return True
-            else:
-                be_stop = self.entry_price * (1 + 0.0002)
-                if be_stop < self.stop_current:
-                    self.stop_current = be_stop
-                    self.break_even   = True
-                    log.info(f"  [{self.market}] 🔒 BREAK-EVEN activé @ {be_stop:.6f} (PnL={pnl_eur:+.2f}€)")
-                    return True
-
-        # Trailing progressif
-        moved = False
-        if self.side == "BUY":
-            if current_price > self.peak_price:
-                self.peak_price = current_price
-            new_stop = self.peak_price - distance
-            if new_stop > self.stop_current:
-                self.stop_current = new_stop
-                moved = True
-        else:
-            if current_price < self.peak_price:
-                self.peak_price = current_price
-            new_stop = self.peak_price + distance
-            if new_stop < self.stop_current:
-                self.stop_current = new_stop
-                moved = True
-
-        return moved
-
-    def is_stopped(self, current_price: float) -> bool:
-        if self.side == "BUY":
-            return current_price <= self.stop_current
-        return current_price >= self.stop_current
-
-    def is_target(self, current_price: float) -> bool:
-        if self.side == "BUY":
-            return current_price >= self.target
-        return current_price <= self.target
-
-    def duration_minutes(self) -> int:
-        return int((datetime.now(timezone.utc) - self.entry_time).total_seconds() / 60)
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  PERFORMANCE TRACKER
-# ─────────────────────────────────────────────────────────────────────────────
-class PerfTracker:
-    def __init__(self, initial_capital: float):
-        self.capital      = initial_capital
-        self.initial      = initial_capital
-        self.pnl_today    = 0.0
-        self.trades_total = 0
-        self.wins         = 0
-        self.losses       = 0
-        self.loss_streak  = 0
-        self.total_won    = 0.0
-        self.total_lost   = 0.0
-
-    def record(self, pnl: float):
-        self.capital   = round(self.capital + pnl, 4)
-        self.pnl_today = round(self.pnl_today + pnl, 4)
-        self.trades_total += 1
-        if pnl >= 0:
-            self.wins       += 1
-            self.total_won  += pnl
-            self.loss_streak = 0
-        else:
-            self.losses     += 1
-            self.total_lost += abs(pnl)
-            self.loss_streak += 1
-
-    @property
-    def win_rate(self) -> float:
-        if self.trades_total == 0:
-            return 0.0
-        return round(self.wins / self.trades_total * 100, 1)
-
-    @property
-    def profit_factor(self) -> float:
-        if self.total_lost == 0:
-            return float("inf")
-        return round(self.total_won / self.total_lost, 2)
-
-    def dashboard(self) -> str:
-        return (
-            f"\n{'═'*55}\n"
-            f"  ⚡ QUANTUM EDGE V4 — TABLEAU DE BORD\n"
-            f"{'═'*55}\n"
-            f"  💰 Capital      : {self.capital:.2f}€ (départ: {self.initial:.2f}€)\n"
-            f"  📊 PnL journalier: {self.pnl_today:+.2f}€\n"
-            f"  🔒 Trades total : {self.trades_total}\n"
-            f"  ✅ Win rate     : {self.win_rate}%\n"
-            f"  🏆 Profit Factor: {self.profit_factor}\n"
-            f"  📈 Total gagné  : +{self.total_won:.2f}€\n"
-            f"  📉 Total perdu  : -{self.total_lost:.2f}€\n"
-            f"{'═'*55}"
-        )
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  BOT PRINCIPAL
-# ─────────────────────────────────────────────────────────────────────────────
-class QuantumEdgeV4:
-    def __init__(self, cfg: Config):
-        self.cfg    = cfg
-        self.kraken = KrakenClient()
-        self.perf   = PerfTracker(cfg.initial_capital)
-        self.open_trades: Dict[str, Trade] = {}
-        self.cooldown_until: float = 0.0
-        self.cycle = 0
-
-    async def _get_price(self, market: str) -> Optional[float]:
-        candles = await self.kraken.get_candles(market, interval=1, count=2)
-        if not candles:
+def get_prix_actuel(symbole):
+    kraken_symbol = KRAKEN_SYMBOLS.get(symbole, symbole)
+    try:
+        r = requests.get("https://api.kraken.com/0/public/Ticker", params={"pair": kraken_symbol}, timeout=10)
+        data = r.json()
+        if data.get("error") and data["error"]:
             return None
-        return candles[-1]["close"]
+        result = data.get("result", {})
+        if not result:
+            return None
+        key = list(result.keys())[0]
+        return float(result[key]["c"][0])
+    except Exception as e:
+        log.error(f"Erreur prix {symbole} : {e}")
+        return None
 
-    async def _analyze(self, market: str) -> Tuple[str, int, dict, float]:
-        """Analyse un marché — retourne (direction, score, details, atr)."""
-        candles = await self.kraken.get_candles(market, interval=60, count=150)
-        if not candles:
-            return "NONE", 0, {}, 0.0
-        direction, score, details = compute_signal(candles, self.cfg)
-        atr = details.get("atr", 0.0)
-        return direction, score, details, atr
+def get_klines(symbole, limite=100):
+    kraken_symbol = KRAKEN_SYMBOLS.get(symbole, symbole)
+    try:
+        r = requests.get("https://api.kraken.com/0/public/OHLC",
+                         params={"pair": kraken_symbol, "interval": 60}, timeout=15)
+        data = r.json()
+        if data.get("error") and data["error"]:
+            return None
+        result = data.get("result", {})
+        keys = [k for k in result.keys() if k != "last"]
+        if not keys:
+            return None
+        candles = result[keys[0]]
+        df = pd.DataFrame(candles, columns=['time','open','high','low','close','vwap','volume','count'])
+        df = df.astype({'high': float, 'low': float, 'close': float, 'volume': float})
+        return df.tail(limite).reset_index(drop=True)
+    except Exception as e:
+        log.error(f"Erreur klines {symbole} : {e}")
+        return None
 
-    async def _open_trade(self, market: str, direction: str, score: int, atr: float):
-        price = await self._get_price(market)
-        if not price or atr == 0:
-            return
+def calculer_adx(df, periode=14):
+    try:
+        ind = ADXIndicator(high=df['high'], low=df['low'], close=df['close'], window=periode)
+        val = ind.adx().iloc[-1]
+        return round(float(val), 2) if not pd.isna(val) else 0
+    except:
+        return 0
 
-        stake    = self.cfg.stake_eur
-        distance = atr * self.cfg.atr_multiplier
+def calculer_atr(df, periode=14):
+    try:
+        ind = AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=periode)
+        val = ind.average_true_range().iloc[-1]
+        return round(float(val), 8) if not pd.isna(val) else 0
+    except:
+        return 0
 
-        if direction == "BUY":
-            stop   = round(price - distance, 8)
-            target = round(price + distance * self.cfg.ratio_rr, 8)
+def calculer_rsi(df, periode=14):
+    try:
+        ind = RSIIndicator(close=df['close'], window=periode)
+        val = ind.rsi().iloc[-1]
+        return round(float(val), 2) if not pd.isna(val) else 50
+    except:
+        return 50
+
+def verifier_volume(df):
+    volumes = df['volume'].tolist()
+    if len(volumes) < 10:
+        return True, 0
+    moyenne_24h   = sum(volumes[-24:]) / len(volumes[-24:])
+    volume_recent = volumes[-1]
+    ratio = volume_recent / moyenne_24h if moyenne_24h > 0 else 0
+    return ratio >= VOLUME_MINI, round(ratio * 100, 1)
+
+def analyser_marche(symbole):
+    df = get_klines(symbole, limite=100)
+    if df is None or len(df) < 30:
+        return "NEUTRE", {}
+    adx = calculer_adx(df)
+    atr = calculer_atr(df)
+    rsi = calculer_rsi(df)
+    volume_ok, volume_ratio = verifier_volume(df)
+    if not volume_ok:
+        log.info(f"  {symbole} : Volume {volume_ratio}% < {VOLUME_MINI*100}% → skip")
+        return "NEUTRE", {}
+    if adx > ADX_MAX:
+        log.info(f"  {symbole} : ADX {adx} > {ADX_MAX} → skip")
+        return "NEUTRE", {}
+    prix    = float(df['close'].iloc[-1])
+    atr_pct = (atr / prix) * 100
+    details = {"adx": adx, "atr": atr, "rsi": rsi, "atr_pct": atr_pct, "volume_ratio": volume_ratio}
+    if rsi < RSI_ACHAT:
+        log.info(f"  {symbole} : RSI {rsi} < {RSI_ACHAT} → SURVENDU → ACHAT")
+        return "ACHAT", details
+    elif rsi > RSI_VENTE:
+        log.info(f"  {symbole} : RSI {rsi} > {RSI_VENTE} → SURACHETÉ → VENTE")
+        return "VENTE", details
+    else:
+        log.info(f"  {symbole} : RSI {rsi} | ADX {adx} → pas de signal")
+        return "NEUTRE", details
+
+def executer_trade(symbole, direction, details):
+    """Exécute un trade dans un thread séparé — logique identique V7.4."""
+    global capital, pnl_journalier, nb_trades, nb_wins, nb_losses
+    global total_gagne, total_perdu, pertes_consecutives, trades_actifs
+
+    prix_entree = get_prix_actuel(symbole)
+    if prix_entree is None:
+        with lock:
+            trades_actifs.pop(symbole, None)
+        return
+
+    atr  = details.get("atr", 0)
+    with lock:
+        mise = round(capital * MISE_FIXE_PCT, 2)
+    mise = max(mise, 5.0)
+
+    if direction == "ACHAT":
+        stop_loss        = round(prix_entree - (atr * ATR_MULTIPLIER), 8)
+        objectif_partiel = round(prix_entree + (atr * ATR_MULTIPLIER * RATIO_PARTIEL), 8)
+        objectif_final   = round(prix_entree + (atr * ATR_MULTIPLIER * RATIO_RR), 8)
+    else:
+        stop_loss        = round(prix_entree + (atr * ATR_MULTIPLIER), 8)
+        objectif_partiel = round(prix_entree - (atr * ATR_MULTIPLIER * RATIO_PARTIEL), 8)
+        objectif_final   = round(prix_entree - (atr * ATR_MULTIPLIER * RATIO_RR), 8)
+
+    with lock:
+        nb_trades += 1
+        num = nb_trades
+
+    log.info(f"\n  {'='*50}")
+    log.info(f"  TRADE #{num} — {symbole} ({direction}) — {datetime.now().strftime('%H:%M:%S')}")
+    log.info(f"  Prix: {prix_entree} | Stop: {stop_loss} | Obj: {objectif_final} | Mise: {mise}€×{LEVIER}")
+    log.info(f"  Break-even dès +{BREAK_EVEN_TRIGGER_PNL}€")
+    telegram(f"📊 <b>TRADE #{num} OUVERT</b>\n{'🟢' if direction=='ACHAT' else '🔴'} {symbole}\n"
+             f"RSI: {details.get('rsi',0)} | Prix: {prix_entree}\nStop: {stop_loss} | Obj: {objectif_final}\n"
+             f"Mise: {mise}€×{LEVIER}")
+
+    debut             = time.time()
+    stop_actuel       = stop_loss
+    meilleur_prix     = prix_entree
+    dernier_log       = 0
+    partiel_execute   = False
+    gain_partiel      = 0
+    niveau_actuel     = 2.50
+    break_even_locked = False
+    pnl_max_atteint   = 0
+
+    while True:
+        time.sleep(CHECK_INTERVAL)
+        prix_actuel = get_prix_actuel(symbole)
+        if prix_actuel is None:
+            continue
+
+        if direction == "ACHAT":
+            pnl = round((prix_actuel - prix_entree) / prix_entree * mise * LEVIER, 2)
         else:
-            stop   = round(price + distance, 8)
-            target = round(price - distance * self.cfg.ratio_rr, 8)
+            pnl = round((prix_entree - prix_actuel) / prix_entree * mise * LEVIER, 2)
 
-        trade = Trade(
-            market      = market,
-            side        = direction,
-            entry_price = price,
-            stake       = stake,
-            leverage    = self.cfg.leverage,
-            atr         = atr,
-            stop_loss   = stop,
-            target      = target,
-            entry_time  = datetime.now(timezone.utc),
-            score       = score,
-        )
-        self.open_trades[market] = trade
+        if pnl > pnl_max_atteint:
+            pnl_max_atteint = pnl
 
-        mode = "🔴 SIM" if self.cfg.simulation_mode else "🟢 LIVE"
-        log.info(
-            f"[OPEN] {mode} {market} {direction} @ {price:.6f} | "
-            f"Stop: {stop:.6f} | Target: {target:.6f} | "
-            f"Mise: {stake:.0f}€×{self.cfg.leverage} | Score: {score}/3"
-        )
+        multiplicateur    = get_multiplicateur_atr(pnl)
+        distance_trailing = atr * multiplicateur
 
-    async def _monitor_trades(self):
-        """Surveille les trades ouverts — trailing stop + sorties."""
-        to_close = []
-
-        for market, trade in list(self.open_trades.items()):
-            price = await self._get_price(market)
-            if not price:
-                continue
-
-            pnl  = trade.pnl(price)
-            mins = trade.duration_minutes()
-            moved = trade.update_trailing(price)
-
-            if moved:
-                log.info(
-                    f"  [{market}] Trailing ×{trade.trailing_mult} | "
-                    f"Stop: {trade.stop_current:.6f} | PnL: {pnl:+.2f}€ | {mins}min"
-                )
-
-            # Timeout
-            if mins >= self.cfg.timeout_hours * 60:
-                to_close.append((market, trade, price, "TIMEOUT"))
-                continue
-
-            # Stop touché
-            if trade.is_stopped(price):
-                to_close.append((market, trade, price, "STOPLOSS"))
-                continue
-
-            # Target atteint
-            if trade.is_target(price):
-                to_close.append((market, trade, price, "TARGET"))
-                continue
-
-            log.info(
-                f"  [OPEN] {market} {trade.side} @ {price:.6f} | "
-                f"PnL: {pnl:+.2f}€ | Stop: {trade.stop_current:.6f} | {mins}min"
-            )
-
-        for market, trade, price, reason in to_close:
-            await self._close_trade(market, trade, price, reason)
-
-    async def _close_trade(self, market: str, trade: Trade, price: float, reason: str):
-        pnl  = trade.pnl(price)
-        mins = trade.duration_minutes()
-        icon = "✅" if pnl >= 0 else "❌"
-
-        self.perf.record(pnl)
-        del self.open_trades[market]
-
-        log.info(
-            f"{icon} TRADE FERMÉ {market} {trade.side} | "
-            f"Entrée: {trade.entry_price:.6f} Sortie: {price:.6f} | "
-            f"PnL: {pnl:+.2f}€ ({reason}) | Score: {trade.score}/3 | Durée: {mins}min"
-        )
-        log.info(f"  [SIM] Capital: {self.perf.capital:.2f}€ | PnL jour: {self.perf.pnl_today:+.2f}€")
-
-        # Cooldown si trop de pertes consécutives
-        if self.perf.loss_streak >= self.cfg.max_losses_streak:
-            self.cooldown_until = time.time() + self.cfg.cooldown_minutes * 60
-            self.perf.loss_streak = 0
-            log.warning(
-                f"[COOLDOWN] {self.cfg.max_losses_streak} pertes consécutives — "
-                f"pause {self.cfg.cooldown_minutes} min"
-            )
-
-    async def run(self):
-        log.info("🚀 QUANTUM EDGE V4 démarré — Mode: " + ("SIMULATION" if self.cfg.simulation_mode else "LIVE"))
-        log.info(f"   Marchés: {len(self.cfg.markets)} | Max trades: {self.cfg.max_open_trades} | Mise: {self.cfg.stake_eur}€×{self.cfg.leverage}")
-
-        # ── Diagnostic Kraken au démarrage
-        log.info("\n🔍 Test connexion Kraken...")
-        ok, ko = [], []
-        for market in self.cfg.markets:
-            candles = await self.kraken.get_candles(market, interval=60, count=30)
-            if candles and len(candles) >= 5:
-                vol = round(candles[-2]["volume"], 2)
-                ok.append(f"{market}(✅ {len(candles)}b vol={vol})")
+        # Break-even
+        if not break_even_locked and pnl_max_atteint >= BREAK_EVEN_TRIGGER_PNL:
+            if direction == "ACHAT":
+                stop_be = round(prix_entree * (1 + BREAK_EVEN_BUFFER_PCT), 8)
+                if stop_be > stop_actuel:
+                    stop_actuel = stop_be
             else:
-                ko.append(market)
-            await asyncio.sleep(0.3)
-        log.info(f"   OK  : {', '.join(ok) if ok else 'aucun'}")
-        if ko:
-            log.warning(f"   KO  : {', '.join(ko)} — ces marchés seront ignorés")
-        log.info("")
+                stop_be = round(prix_entree * (1 - BREAK_EVEN_BUFFER_PCT), 8)
+                if stop_be < stop_actuel:
+                    stop_actuel = stop_be
+            break_even_locked = True
+            log.info(f"  🔒 BREAK-EVEN {symbole} → Stop: {stop_actuel} (PnL max: +{pnl_max_atteint}€)")
+            telegram(f"🔒 <b>Break-even</b>\n{symbole} | Stop: {stop_actuel} | PnL max: +{pnl_max_atteint}€")
 
-        last_dashboard = 0
+        # Trailing stop
+        stop_modifie = False
+        if direction == "ACHAT":
+            if prix_actuel > meilleur_prix:
+                meilleur_prix = prix_actuel
+            nouveau_stop = round(meilleur_prix - distance_trailing, 8)
+            if nouveau_stop > stop_actuel:
+                stop_actuel = nouveau_stop
+                stop_modifie = True
+            # Protection break-even — stop ne descend jamais sous break-even
+            if break_even_locked:
+                stop_be_min = round(prix_entree * (1 + BREAK_EVEN_BUFFER_PCT), 8)
+                if stop_actuel < stop_be_min:
+                    stop_actuel = stop_be_min
+        else:
+            if prix_actuel < meilleur_prix:
+                meilleur_prix = prix_actuel
+            nouveau_stop = round(meilleur_prix + distance_trailing, 8)
+            if nouveau_stop < stop_actuel:
+                stop_actuel = nouveau_stop
+                stop_modifie = True
+            # Protection break-even — stop ne remonte jamais au-dessus break-even
+            if break_even_locked:
+                stop_be_max = round(prix_entree * (1 - BREAK_EVEN_BUFFER_PCT), 8)
+                if stop_actuel > stop_be_max:
+                    stop_actuel = stop_be_max
 
-        while True:
-            try:
-                self.cycle += 1
+        if multiplicateur != niveau_actuel and stop_modifie:
+            if direction == "ACHAT":
+                gain_protege = round((stop_actuel - prix_entree) / prix_entree * mise * LEVIER, 2)
+            else:
+                gain_protege = round((prix_entree - stop_actuel) / prix_entree * mise * LEVIER, 2)
+            log.info(f"  [TRAILING] {symbole} PnL {pnl:+.2f}€ → ATR×{multiplicateur} | Stop: {stop_actuel} | Protège: ~{gain_protege}€")
+            niveau_actuel = multiplicateur
 
-                # ── Kill switch journalier
-                if self.perf.pnl_today <= self.cfg.daily_kill_eur:
-                    log.warning(f"[KILL SWITCH] PnL journalier {self.perf.pnl_today:.2f}€ ≤ {self.cfg.daily_kill_eur}€ — arrêt")
-                    break
+        # Conditions de sortie
+        if direction == "ACHAT":
+            atteint_partiel = not partiel_execute and prix_actuel >= objectif_partiel
+            atteint_final   = prix_actuel >= objectif_final
+            atteint_stop    = prix_actuel <= stop_actuel
+        else:
+            atteint_partiel = not partiel_execute and prix_actuel <= objectif_partiel
+            atteint_final   = prix_actuel <= objectif_final
+            atteint_stop    = prix_actuel >= stop_actuel
 
-                # ── Cooldown
-                if time.time() < self.cooldown_until:
-                    remaining = int((self.cooldown_until - time.time()) / 60)
-                    log.info(f"[COOLDOWN] {remaining} min restantes")
-                    await asyncio.sleep(60)
-                    continue
+        duree = int((time.time() - debut) / 60)
+        if time.time() - dernier_log >= 60:
+            be_flag = " 🔒" if break_even_locked else ""
+            log.info(f"  [{datetime.now().strftime('%H:%M:%S')}] {symbole}: {prix_actuel} | "
+                     f"PnL: {pnl:+.2f}€ | Stop: {stop_actuel} (ATR×{multiplicateur}){be_flag} | {duree}min")
+            dernier_log = time.time()
 
-                # ── Surveiller les trades ouverts
-                if self.open_trades:
-                    await self._monitor_trades()
+        if atteint_partiel:
+            gain_partiel    = round(pnl * 0.5, 2)
+            partiel_execute = True
+            log.info(f"  ⚡ PARTIEL {symbole} : +{gain_partiel}€")
+            telegram(f"⚡ <b>PARTIEL</b> {symbole} | +{gain_partiel}€")
+            continue
 
-                # ── Dashboard toutes les 20 minutes
-                if time.time() - last_dashboard > 1200:
-                    log.info(self.perf.dashboard())
-                    last_dashboard = time.time()
+        gain_total = None
+        resultat   = None
 
-                # ── Chercher nouveaux signaux si place disponible
-                if len(self.open_trades) < self.cfg.max_open_trades:
-                    log.info(f"\n[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Scan — {len(self.cfg.markets)} marchés...")
-                    candidates = []
-                    for market in self.cfg.markets:
-                        if market in self.open_trades:
-                            continue
-                        direction, score, details, atr = await self._analyze(market)
-                        rsi   = details.get('rsi', 0)
-                        adx   = details.get('adx', 0)
-                        vol_r = details.get('vol_ratio', 0)
-                        if direction == "NONE":
-                            if vol_r < self.cfg.volume_min:
-                                log.info(f"  {market} : Volume {vol_r:.2f}x < {self.cfg.volume_min}x → skip")
-                            elif adx < self.cfg.adx_min:
-                                log.info(f"  {market} : ADX {adx:.1f} < {self.cfg.adx_min} → skip")
-                            else:
-                                log.info(f"  {market} : RSI {rsi:.1f} | ADX {adx:.1f} → pas de signal")
-                        else:
-                            candidates.append((score, market, direction, atr, details))
-                            log.info(
-                                f"  [SIGNAL] {market} {direction} | Score: {score}/3 | "
-                                f"RSI: {rsi:.1f} | ADX: {adx:.1f} | Vol: {vol_r:.2f}x"
-                            )
-                        await asyncio.sleep(0.5)
+        if atteint_final:
+            gain_final = round(pnl * 0.5, 2) if partiel_execute else pnl
+            gain_total = round(gain_partiel + gain_final, 2)
+            resultat   = "GAGNE"
+            log.info(f"  🎯 OBJECTIF {symbole} : +{gain_total}€ ({duree}min)")
+            telegram(f"🎯 <b>OBJECTIF</b> {symbole}\nGain: +{gain_total}€ | {duree}min")
 
-                    if not candidates:
-                        log.info("  => Aucun signal. Prochaine analyse dans 30s...")
+        elif atteint_stop:
+            if partiel_execute:
+                gain_reste = round(pnl * 0.5, 2)
+                gain_total = round(gain_partiel + gain_reste, 2)
+                resultat   = "GAGNE" if gain_total > 0 else "PERDU"
+            else:
+                gain_total = pnl
+                resultat   = "PERDU"
+            if break_even_locked and gain_total >= 0:
+                log.info(f"  🔒 STOP BREAK-EVEN {symbole} : +{gain_total}€ ({duree}min)")
+                telegram(f"🔒 <b>BREAK-EVEN</b> {symbole} | +{gain_total}€ | {duree}min")
+            else:
+                log.info(f"  🛑 STOP {symbole} : {gain_total:+.2f}€ ({duree}min)")
+                telegram(f"🛑 <b>STOP</b> {symbole} | {gain_total:+.2f}€ | {duree}min")
 
-                    # Ouvrir les meilleurs signaux
-                    candidates.sort(reverse=True)
-                    for score, market, direction, atr, _ in candidates:
-                        if len(self.open_trades) >= self.cfg.max_open_trades:
-                            break
-                        await self._open_trade(market, direction, score, atr)
+        elif time.time() - debut >= TIMEOUT_TRADE:
+            if partiel_execute:
+                gain_total = round(gain_partiel + round(pnl * 0.5, 2), 2)
+            else:
+                gain_total = pnl
+            resultat = "GAGNE" if gain_total > 0 else "PERDU"
+            log.info(f"  ⏱ TIMEOUT {symbole} : {gain_total:+.2f}€")
+            telegram(f"⏱ <b>TIMEOUT</b> {symbole} | {gain_total:+.2f}€")
 
-                await asyncio.sleep(30)
+        if gain_total is not None:
+            with lock:
+                capital          = round(capital + gain_total, 2)
+                pnl_journalier   = round(pnl_journalier + gain_total, 2)
+                if resultat == "GAGNE":
+                    nb_wins             += 1
+                    total_gagne         = round(total_gagne + gain_total, 2)
+                    pertes_consecutives  = 0
+                else:
+                    nb_losses           += 1
+                    total_perdu         = round(total_perdu + abs(gain_total), 2)
+                    pertes_consecutives += 1
+                trades_actifs.pop(symbole, None)
 
-            except KeyboardInterrupt:
-                log.info("Arrêt demandé.")
+            win_rate = nb_wins / nb_trades * 100 if nb_trades > 0 else 0
+            log.info(f"\n  Capital: {capital:.2f}€ | PnL jour: {pnl_journalier:+.2f}€ | "
+                     f"WR: {win_rate:.1f}% | Trades: {nb_trades}")
+            break
+
+def afficher_tableau_de_bord():
+    win_rate = (nb_wins / nb_trades * 100) if nb_trades > 0 else 0
+    perf     = ((capital - CAPITAL_INITIAL) / CAPITAL_INITIAL * 100)
+    log.info(f"\n  {'='*55}")
+    log.info(f"  BOT V7.4 MULTI-MARCHÉS — TABLEAU DE BORD")
+    log.info(f"  {'='*55}")
+    log.info(f"  💰 Capital      : {capital:.2f}€ ({perf:+.2f}%)")
+    log.info(f"  📊 PnL journalier: {pnl_journalier:+.2f}€")
+    log.info(f"  🔒 Trades actifs : {len(trades_actifs)}/{MAX_TRADES_SIMULTANES}")
+    log.info(f"  📈 Trades total  : {nb_trades} | WR: {win_rate:.1f}%")
+    log.info(f"  ✅ Gagné        : +{total_gagne:.2f}€")
+    log.info(f"  ❌ Perdu        : -{total_perdu:.2f}€")
+    log.info(f"  💎 NET          : {capital - CAPITAL_INITIAL:+.2f}€")
+    log.info(f"  {'='*55}")
+
+def demarrer_bot():
+    global pause_until, pertes_consecutives, pnl_journalier
+
+    while True:
+        try:
+            # Kill switch journalier
+            if pnl_journalier <= DAILY_KILL:
+                log.warning(f"[KILL SWITCH] PnL jour {pnl_journalier:.2f}€ ≤ {DAILY_KILL}€ — arrêt")
                 break
-            except Exception as e:
-                log.error(f"Erreur cycle {self.cycle}: {e}")
-                await asyncio.sleep(60)
 
-        await self.kraken.close()
-        log.info(self.perf.dashboard())
+            # Cooldown
+            if time.time() < pause_until:
+                restant = int((pause_until - time.time()) / 60)
+                log.info(f"  [COOLDOWN] {restant} min restantes")
+                time.sleep(60)
+                continue
+            elif pause_until > 0:
+                pertes_consecutives = 0
+                pause_until = 0
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  POINT D'ENTRÉE
-# ─────────────────────────────────────────────────────────────────────────────
+            # Déclenchement cooldown
+            if pertes_consecutives >= MAX_PERTES_CONSECUTIVES:
+                pause_until = time.time() + PAUSE_DUREE
+                pertes_consecutives = 0
+                log.warning(f"[COOLDOWN] {MAX_PERTES_CONSECUTIVES} pertes → pause {PAUSE_DUREE//60} min")
+                telegram(f"⚠️ <b>COOLDOWN</b>\n{MAX_PERTES_CONSECUTIVES} pertes consécutives\nPause {PAUSE_DUREE//60} min")
+                continue
+
+            # Dashboard toutes les 20 cycles
+            afficher_tableau_de_bord()
+
+            # Scanner les marchés si place disponible
+            with lock:
+                nb_actifs = len(trades_actifs)
+
+            if nb_actifs < MAX_TRADES_SIMULTANES:
+                log.info(f"\n[{datetime.now().strftime('%H:%M:%S')}] Scan — {len(MARCHES)} marchés "
+                         f"({nb_actifs}/{MAX_TRADES_SIMULTANES} trades actifs)...")
+
+                signaux = []
+                for marche in MARCHES:
+                    with lock:
+                        if marche in trades_actifs:
+                            continue
+                    direction, details = analyser_marche(marche)
+                    if direction != "NEUTRE":
+                        signaux.append((marche, direction, details))
+                    time.sleep(0.5)
+
+                # Trier par RSI le plus extrême (comme V7.4)
+                signaux.sort(key=lambda x: abs(x[2].get("rsi", 50) - 50), reverse=True)
+
+                for marche, direction, details in signaux:
+                    with lock:
+                        if len(trades_actifs) >= MAX_TRADES_SIMULTANES:
+                            break
+                        if marche in trades_actifs:
+                            continue
+                        t = threading.Thread(
+                            target=executer_trade,
+                            args=(marche, direction, details),
+                            daemon=True
+                        )
+                        trades_actifs[marche] = t
+                        t.start()
+                        log.info(f"  => TRADE LANCÉ : {marche} {direction}")
+
+                if not signaux:
+                    log.info("  => Aucun signal. Prochaine analyse dans 2 min...")
+
+            time.sleep(PAUSE)
+
+        except KeyboardInterrupt:
+            log.info("Arrêt demandé.")
+            break
+        except Exception as e:
+            log.error(f"Erreur : {e}")
+            time.sleep(60)
+
 if __name__ == "__main__":
-    # Forcer output non-bufferisé sur Railway
-    os.environ["PYTHONUNBUFFERED"] = "1"
-    cfg = Config()
-    cfg.simulation_mode = os.environ.get("SIMULATION_MODE", "true").lower() == "true"
-    cfg.initial_capital = float(os.environ.get("INITIAL_CAPITAL", "200"))
-    cfg.stake_eur       = float(os.environ.get("STAKE_EUR", "10"))
-    cfg.leverage        = int(os.environ.get("LEVERAGE", "3"))
-    cfg.daily_kill_eur  = float(os.environ.get("DAILY_KILL_EUR", "-5"))
-    cfg.score_min       = int(os.environ.get("SCORE_MIN", "2"))
-
-    bot = QuantumEdgeV4(cfg)
-    asyncio.run(bot.run())
+    demarrer_bot()
