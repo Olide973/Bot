@@ -228,12 +228,21 @@ def calc_adx(candles: List[dict], period: int = 14) -> float:
     return round(sum(dx_vals[-period:]) / min(len(dx_vals), period), 2)
 
 def calc_volume_ratio(candles: List[dict]) -> float:
-    if len(candles) < 25:
+    """
+    Compare le volume de la dernière bougie FERMÉE (index -2)
+    à la moyenne des 24 bougies précédentes.
+    La dernière bougie (index -1) est en cours → volume incomplet → exclue.
+    """
+    if len(candles) < 26:
         return 0.0
-    avg = sum(c["volume"] for c in candles[-25:-1]) / 24
+    # Bougies fermées : toutes sauf la dernière
+    closed = candles[:-1]
+    avg = sum(c["volume"] for c in closed[-24:]) / 24
     if avg == 0:
         return 0.0
-    return round(candles[-1]["volume"] / avg, 4)
+    # Volume de la dernière bougie fermée
+    last_closed_vol = closed[-1]["volume"]
+    return round(last_closed_vol / avg, 4)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  SIGNAL (score simple sur 3 critères comme V7.4)
