@@ -601,19 +601,32 @@ class QuantumEdgeV4:
 
                 # ── Chercher nouveaux signaux si place disponible
                 if len(self.open_trades) < self.cfg.max_open_trades:
+                    log.info(f"\n[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Scan — {len(self.cfg.markets)} marchés...")
                     candidates = []
                     for market in self.cfg.markets:
                         if market in self.open_trades:
                             continue
                         direction, score, details, atr = await self._analyze(market)
-                        if direction != "NONE" and score >= self.cfg.score_min:
+                        rsi   = details.get('rsi', 0)
+                        adx   = details.get('adx', 0)
+                        vol_r = details.get('vol_ratio', 0)
+                        if direction == "NONE":
+                            if vol_r < self.cfg.volume_min:
+                                log.info(f"  {market} : Volume {vol_r:.2f}x < {self.cfg.volume_min}x → skip")
+                            elif adx < self.cfg.adx_min:
+                                log.info(f"  {market} : ADX {adx:.1f} < {self.cfg.adx_min} → skip")
+                            else:
+                                log.info(f"  {market} : RSI {rsi:.1f} | ADX {adx:.1f} → pas de signal")
+                        else:
                             candidates.append((score, market, direction, atr, details))
                             log.info(
                                 f"  [SIGNAL] {market} {direction} | Score: {score}/3 | "
-                                f"RSI: {details.get('rsi', 0):.1f} | ADX: {details.get('adx', 0):.1f} | "
-                                f"Vol: {details.get('vol_ratio', 0):.2f}x"
+                                f"RSI: {rsi:.1f} | ADX: {adx:.1f} | Vol: {vol_r:.2f}x"
                             )
                         await asyncio.sleep(0.5)
+
+                    if not candidates:
+                        log.info("  => Aucun signal. Prochaine analyse dans 30s...")
 
                     # Ouvrir les meilleurs signaux
                     candidates.sort(reverse=True)
