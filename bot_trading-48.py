@@ -103,9 +103,10 @@ class Config:
 #  KRAKEN CLIENT
 # ─────────────────────────────────────────────────────────────────────────────
 SYMBOL_MAP = {
+    # Paires Kraken officelles (format OHLC endpoint)
     "ETH/USDT":  "ETHUSDT",
     "SOL/USDT":  "SOLUSDT",
-    "BNB/USDT":  "BNBUSDT",
+    "BNB/USDT":  "BNBUSDT",   # pas disponible sur Kraken → ignoré
     "XRP/USDT":  "XRPUSDT",
     "AVAX/USDT": "AVAXUSDT",
     "LINK/USDT": "LINKUSDT",
@@ -116,6 +117,22 @@ SYMBOL_MAP = {
     "LTC/USDT":  "LTCUSDT",
     "ALGO/USDT": "ALGOUSDT",
     "XTZ/USDT":  "XTZUSDT",
+}
+
+# Noms alternatifs Kraken si le nom standard échoue
+SYMBOL_FALLBACK = {
+    "ETH/USDT":  "ETHUSD",
+    "SOL/USDT":  "SOLUSD",
+    "XRP/USDT":  "XRPUSDT",
+    "AVAX/USDT": "AVAXUSD",
+    "LINK/USDT": "LINKUSD",
+    "ADA/USDT":  "ADAUSD",
+    "DOT/USDT":  "DOTUSD",
+    "DOGE/USDT": "XDGUSD",
+    "ATOM/USDT": "ATOMUSD",
+    "LTC/USDT":  "XLTCZUSD",
+    "ALGO/USDT": "ALGOUSD",
+    "XTZ/USDT":  "XTZUSD",
 }
 
 class KrakenClient:
@@ -136,36 +153,48 @@ class KrakenClient:
             await self._session.close()
 
     async def get_candles(self, market: str, interval: int = 60, count: int = 100) -> List[dict]:
-        """Récupère les bougies OHLCV depuis Kraken."""
-        pair = SYMBOL_MAP.get(market, market.replace("/", ""))
+        """Récupère les bougies OHLCV depuis Kraken — avec fallback automatique."""
         session = await self._get()
-        try:
-            async with session.get(
-                f"{self.BASE}/OHLC",
-                params={"pair": pair, "interval": interval}
-            ) as resp:
-                data = await resp.json()
-                if data.get("error"):
-                    return []
-                result = data.get("result", {})
-                keys = [k for k in result if k != "last"]
-                if not keys:
-                    return []
-                raw = result[keys[0]][-count:]
-                return [
-                    {
-                        "time":   int(c[0]),
-                        "open":   float(c[1]),
-                        "high":   float(c[2]),
-                        "low":    float(c[3]),
-                        "close":  float(c[4]),
-                        "volume": float(c[6]),
-                    }
-                    for c in raw
-                ]
-        except Exception as e:
-            log.warning(f"[KRAKEN] {market} erreur : {e}")
-            return []
+
+        # Essai avec le nom principal, puis fallback
+        pairs_to_try = [SYMBOL_MAP.get(market, market.replace("/", ""))]
+        fallback = SYMBOL_FALLBACK.get(market)
+        if fallback:
+            pairs_to_try.append(fallback)
+
+        for pair in pairs_to_try:
+            try:
+                async with session.get(
+                    f"{self.BASE}/OHLC",
+                    params={"pair": pair, "interval": interval}
+                ) as resp:
+                    data = await resp.json()
+                    if data.get("error"):
+                        continue  # essayer le fallback
+                    result = data.get("result", {})
+                    keys = [k for k in result if k != "last"]
+                    if not keys:
+                        continue
+                    raw = result[keys[0]][-count:]
+                    candles = [
+                        {
+                            "time":   int(c[0]),
+                            "open":   float(c[1]),
+                            "high":   float(c[2]),
+                            "low":    float(c[3]),
+                            "close":  float(c[4]),
+                            "volume": float(c[6]),
+                        }
+                        for c in raw
+                    ]
+                    if candles:
+                        return candles
+            except Exception as e:
+                log.warning(f"[KRAKEN] {market} ({pair}) erreur : {e}")
+                continue
+
+        log.warning(f"[KRAKEN] {market} — aucune donnée disponible")
+        return []
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  INDICATEURS TECHNIQUES
@@ -252,6 +281,12 @@ def compute_signal(candles: List[dict], cfg: Config) -> Tuple[str, int, dict]:
     Retourne (direction, score, details)
     direction : "BUY" | "SELL" | "NONE"
     score     : 0-3
+
+    Score sur 3 :
+      +1 RSI en zone (< oversold ou > overbought)
+      +1 ADX fort (> adx_min + 10, soit > 35)
+      +1 RSI extrême (< oversold-10 ou > overbought+10)
+    Score min 2 requis.
     """
     if len(candles) < 30:
         return "NONE", 0, {}
@@ -264,11 +299,9 @@ def compute_signal(candles: List[dict], cfg: Config) -> Tuple[str, int, dict]:
 
     details = {"rsi": rsi, "adx": adx, "atr": atr, "vol_ratio": vol_r}
 
-    # Volume insuffisant
+    # Filtres bloquants
     if vol_r < cfg.volume_min:
         return "NONE", 0, details
-
-    # ADX insuffisant
     if adx < cfg.adx_min:
         return "NONE", 0, details
 
@@ -277,19 +310,19 @@ def compute_signal(candles: List[dict], cfg: Config) -> Tuple[str, int, dict]:
 
     if rsi < cfg.rsi_oversold:
         direction = "BUY"
-        score += 1
+        score += 1                              # RSI en zone survente
+        if adx > cfg.adx_min + 10:
+            score += 1                          # tendance forte
         if rsi < cfg.rsi_oversold - 10:
-            score += 1  # RSI très bas = signal plus fort
-        if adx > 35:
-            score += 1  # tendance forte
+            score += 1                          # RSI très bas (< 25)
 
     elif rsi > cfg.rsi_overbought:
         direction = "SELL"
-        score += 1
+        score += 1                              # RSI en zone surachat
+        if adx > cfg.adx_min + 10:
+            score += 1                          # tendance forte
         if rsi > cfg.rsi_overbought + 10:
-            score += 1
-        if adx > 35:
-            score += 1
+            score += 1                          # RSI très haut (> 75)
 
     if score < cfg.score_min:
         return "NONE", 0, details
@@ -580,6 +613,22 @@ class QuantumEdgeV4:
     async def run(self):
         log.info("🚀 QUANTUM EDGE V4 démarré — Mode: " + ("SIMULATION" if self.cfg.simulation_mode else "LIVE"))
         log.info(f"   Marchés: {len(self.cfg.markets)} | Max trades: {self.cfg.max_open_trades} | Mise: {self.cfg.stake_eur}€×{self.cfg.leverage}")
+
+        # ── Diagnostic Kraken au démarrage
+        log.info("\n🔍 Test connexion Kraken...")
+        ok, ko = [], []
+        for market in self.cfg.markets:
+            candles = await self.kraken.get_candles(market, interval=60, count=30)
+            if candles and len(candles) >= 5:
+                vol = round(candles[-2]["volume"], 2)
+                ok.append(f"{market}(✅ {len(candles)}b vol={vol})")
+            else:
+                ko.append(market)
+            await asyncio.sleep(0.3)
+        log.info(f"   OK  : {', '.join(ok) if ok else 'aucun'}")
+        if ko:
+            log.warning(f"   KO  : {', '.join(ko)} — ces marchés seront ignorés")
+        log.info("")
 
         last_dashboard = 0
 
