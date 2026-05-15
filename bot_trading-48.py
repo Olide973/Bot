@@ -13,12 +13,10 @@
 """
 
 import asyncio
-import json
 import logging
 import os
 import sys
 import time
-from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
@@ -32,7 +30,11 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
+    force=True,
 )
+# Forcer le flush immédiat des logs sur Railway
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(line_buffering=True)
 log = logging.getLogger("QE_V4")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -470,7 +472,6 @@ class QuantumEdgeV4:
             return
 
         stake    = self.cfg.stake_eur
-        position = stake * self.cfg.leverage
         distance = atr * self.cfg.atr_multiplier
 
         if direction == "BUY":
@@ -637,6 +638,8 @@ class QuantumEdgeV4:
 #  POINT D'ENTRÉE
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # Forcer output non-bufferisé sur Railway
+    os.environ["PYTHONUNBUFFERED"] = "1"
     cfg = Config()
     cfg.simulation_mode = os.environ.get("SIMULATION_MODE", "true").lower() == "true"
     cfg.initial_capital = float(os.environ.get("INITIAL_CAPITAL", "200"))
