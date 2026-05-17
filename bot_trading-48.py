@@ -29,17 +29,20 @@ log = logging.getLogger(__name__)
 
 # ── Paramètres (identiques V7.4)
 CAPITAL_INITIAL         = 200.0
-LEVIER                  = 3
-MISE_FIXE_PCT           = 0.05      # 5% du capital = 10€ par trade
-MAX_TRADES_SIMULTANES   = 3         # nouveauté vs V7.4
+LEVIER                  = 10
+MISE_FIXE_PCT           = 0.20      # 20% du capital comme V7.4
+KELLY_FRACTION          = 0.25
+KELLY_CAP               = 0.20
+MIN_TRADES_KELLY        = 30
+MAX_TRADES_SIMULTANES   = 3
 ATR_MULTIPLIER          = 2.5
 RATIO_RR                = 2.0
 RATIO_PARTIEL           = 1.0
 PAUSE                   = 120
 CHECK_INTERVAL          = 15
 TIMEOUT_TRADE           = 12 * 3600
-RSI_ACHAT               = 30
-RSI_VENTE               = 70
+RSI_ACHAT               = 29.95
+RSI_VENTE               = 70.05
 VOLUME_MINI             = 0.40
 ADX_MAX                 = 40
 MAX_PERTES_CONSECUTIVES = 4
@@ -239,8 +242,23 @@ def executer_trade(symbole, direction, details):
 
     atr  = details.get("atr", 0)
     with lock:
-        mise = round(capital * MISE_FIXE_PCT, 2)
+        cap_actuel = capital
+        nb_t       = nb_trades
+        w_rate     = nb_wins / nb_t if nb_t > 0 else 0.50
+        avg_w      = total_gagne / nb_wins * LEVIER / cap_actuel * 100 if nb_wins > 0 else 0
+        avg_l      = total_perdu / nb_losses * LEVIER / cap_actuel * 100 if nb_losses > 0 else 0
+
+    # Kelly comme V7.4
+    if nb_t < MIN_TRADES_KELLY or avg_l <= 0:
+        mise = cap_actuel * MISE_FIXE_PCT
+    else:
+        b          = avg_w / avg_l
+        kelly_full = (w_rate * b - (1 - w_rate)) / b
+        kelly_frac = max(0, min(kelly_full * KELLY_FRACTION, KELLY_CAP))
+        mise       = cap_actuel * kelly_frac
     mise = max(mise, 5.0)
+    mise = min(mise, cap_actuel * 0.30)
+    mise = round(mise, 2)
 
     if direction == "ACHAT":
         stop_loss        = round(prix_entree - (atr * ATR_MULTIPLIER), 8)
