@@ -109,7 +109,10 @@ KRAKEN_SYMBOLS = {
 # ═══════════════════════════════════════════════════════════════
 trades_ouverts  = {}    # { symbole: True }
 prix_reference  = {}    # { symbole: prix_au_moment_du_scan }
+cooldown_marche = {}    # { symbole: timestamp_fin_cooldown }
 trades_lock     = None  # initialisé dans boucle_principale()
+
+COOLDOWN_APRES_TRADE = 1800  # 30 minutes après fermeture d'un trade
 
 log.info("=" * 60)
 log.info("  BOT HUMAIN — OLIDE973 V4")
@@ -446,9 +449,11 @@ async def executer_trade(session, symbole, direction, capital, details, etat, et
             gain_final = pnl
             break
 
-    # Libérer le marché
+    # Libérer le marché + cooldown 5 min
     async with trades_lock:
         trades_ouverts.pop(symbole, None)
+        cooldown_marche[symbole] = time.time() + COOLDOWN_APRES_TRADE
+        log.info(f"  ⏳ Cooldown 30min [{symbole}] — disponible à {datetime.fromtimestamp(cooldown_marche[symbole]).strftime('%H:%M:%S')}")
 
     # Mettre à jour l'état global sous lock
     async with trades_lock:
@@ -865,7 +870,12 @@ async def boucle_principale():
                 for marche in marches_disponibles:
                     direction, details = await analyser_marche(session, marche)
                     if direction != "NEUTRE":
-                        signaux[marche] = {"direction": direction, "details": details}
+                        # Vérifier cooldown par marché
+                        cd_fin = cooldown_marche.get(marche, 0)
+                        if time.time() < cd_fin:
+                            log.info(f"  ⏳ {marche} en cooldown — {int(cd_fin - time.time())}s restantes")
+                        else:
+                            signaux[marche] = {"direction": direction, "details": details}
                     await asyncio.sleep(0.3)
 
                 if not signaux:
