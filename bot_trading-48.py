@@ -12,7 +12,7 @@ import aiohttp
 import os
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 import pandas as pd
 from ta.volatility import AverageTrueRange
 from database import init_database, charger_etat, sauvegarder_etat, enregistrer_trade
@@ -830,7 +830,7 @@ async def boucle_principale():
                 reset_pnl_jour_si_nouveau_jour(etat)
 
                 # ── Rapport hebdomadaire chaque lundi à 8h UTC
-                maintenant = datetime.utcnow()
+                maintenant = datetime.now(timezone.utc).replace(tzinfo=None)
                 if (maintenant.weekday() == 0 and  # lundi
                     maintenant.hour == 8 and
                     maintenant.minute < 1 and
