@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║         BOT HUMAIN — OLIDE973 V4                                ║
+║         BOT HUMAIN — OLIDE973 V4                            ║
 ║  Mean Reversion 0.50% | Surveillance prix temps réel            ║
 ║  Lock Profits Paliers | 20 trades simultanés                    ║
 ║  Capital 1000€ | Architecture async aiohttp                     ║
@@ -15,6 +15,7 @@ import time
 from datetime import datetime, timezone
 import pandas as pd
 from ta.volatility import AverageTrueRange
+from ta.momentum import RSIIndicator
 from database import init_database, charger_etat, sauvegarder_etat, enregistrer_trade
 
 logging.basicConfig(
@@ -39,8 +40,17 @@ MAX_TRADES_SIMULTANES   = 20
 
 # ── Détection signal mean reversion — surveillance temps réel
 SEUIL_MOUVEMENT_PCT     = 0.50   # dès que le prix bouge de 0.50% → signal
-VOLUME_MINI             = 0.30   # volume min vs moyenne 24h
-STOP_LOSS_EUR           = 5.0    # stop loss fixe à -5€ par trade
+VOLUME_MINI             = 0.25   # volume min vs moyenne 24h
+STOP_LOSS_PCT           = 2.0    # perte maximum = 2% du capital (comme les paliers)
+STOP_LOSS_MISE_MAX_PCT  = 0.50   # stop plafonné à 50% de la mise
+
+# ── Filtre RSI 1h
+RSI_SEUIL_BAS           = 45     # RSI < 45 → marché baissier → inverser ACHAT en VENTE
+RSI_SEUIL_HAUT          = 55     # RSI > 55 → marché haussier → inverser VENTE en ACHAT
+RSI_PERIODE             = 14     # période RSI standard
+
+# ── Cooldown après perte uniquement
+COOLDOWN_APRES_PERTE    = 43200  # 12h après stop loss ou timeout négatif
 
 # ── Lock profits par paliers proportionnels au capital
 # Les paliers s'adaptent automatiquement selon le capital actuel
@@ -67,6 +77,8 @@ KELLY_CAP               = 0.20
 # ── Protections
 KILL_SWITCH_JOUR        = -50.0
 SEUIL_RUINE             = 600.0
+MAX_PERTES_CONSECUTIVES = 2
+COOLDOWN_PERTES         = 1800   # 30 min
 
 TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
@@ -105,9 +117,10 @@ KRAKEN_SYMBOLS = {
 # ═══════════════════════════════════════════════════════════════
 #  ÉTAT GLOBAL
 # ═══════════════════════════════════════════════════════════════
-trades_ouverts  = {}    # { symbole: True }
-prix_reference  = {}    # { symbole: prix_au_moment_du_scan }
-trades_lock     = None  # initialisé dans boucle_principale()
+trades_ouverts    = {}    # { symbole: True }
+prix_reference    = {}    # { symbole: prix_au_moment_du_scan }
+cooldown_marches  = {}    # { symbole: timestamp_fin_cooldown }
+trades_lock       = None  # initialisé dans boucle_principale()
 
 log.info("=" * 60)
 log.info("  BOT HUMAIN — OLIDE973 V4")
@@ -115,7 +128,10 @@ log.info(f"  Capital : {CAPITAL_INITIAL}€ | Levier x{LEVIER}")
 log.info(f"  Marchés : {len(MARCHES)} cryptos | Max {MAX_TRADES_SIMULTANES} trades")
 log.info(f"  Signal : mouvement ≥ {SEUIL_MOUVEMENT_PCT}% depuis le prix de référence")
 log.info(f"  Surveillance temps réel — peu importe la durée")
+log.info(f"  RSI 1h : seuil bas={RSI_SEUIL_BAS} | seuil haut={RSI_SEUIL_HAUT} | inversion auto")
+log.info(f"  Stop : {STOP_LOSS_PCT}% capital | plafonné {int(STOP_LOSS_MISE_MAX_PCT*100)}% mise")
 log.info(f"  Lock paliers : {LOCK_PALIERS_PCT}% du capital")
+log.info(f"  Cooldown : 12h après perte | 0 après gain")
 log.info(f"  Kill switch : {KILL_SWITCH_JOUR}€/jour | Ruine : {SEUIL_RUINE}€")
 log.info(f"  Telegram : {'ON' if TELEGRAM_TOKEN else 'OFF'}")
 log.info("=" * 60)
@@ -212,6 +228,14 @@ def calc_volume_ratio(df):
     except:
         return 0.0
 
+def calc_rsi_1h(df, periode=14):
+    """Calcule le RSI sur les bougies 1h."""
+    try:
+        val = RSIIndicator(close=df['close'], window=periode).rsi().iloc[-1]
+        return round(float(val), 2) if not pd.isna(val) else 50.0
+    except:
+        return 50.0
+
 # ═══════════════════════════════════════════════════════════════
 #  DÉTECTION SIGNAL — SURVEILLANCE TEMPS RÉEL
 #  1. Prix de référence enregistré au démarrage
@@ -236,11 +260,15 @@ async def analyser_marche(session, symbole):
     variation_pct = (prix_actuel - prix_ref) / prix_ref * 100
 
     df_15m    = await get_klines(session, symbole, interval=15, limite=50)
+    df_1h     = await get_klines(session, symbole, interval=60, limite=50)
     vol_ratio = 0.0
     atr_val   = 0.0
+    rsi_1h    = 50.0
     if df_15m is not None and len(df_15m) >= 15:
         vol_ratio = calc_volume_ratio(df_15m)
         atr_val   = calc_atr(df_15m)
+    if df_1h is not None and len(df_1h) >= 20:
+        rsi_1h = calc_rsi_1h(df_1h, RSI_PERIODE)
 
     if vol_ratio < VOLUME_MINI:
         log.info(f"  {symbole} : Vol {vol_ratio:.2f}x | Variation={variation_pct:+.2f}% → skip")
@@ -249,22 +277,35 @@ async def analyser_marche(session, symbole):
     details = {
         "atr":           atr_val,
         "vol_ratio":     vol_ratio,
+        "rsi_1h":        rsi_1h,
         "variation_pct": abs(variation_pct),
         "prix_ref":      prix_ref,
         "prix_actuel":   prix_actuel,
     }
 
     if variation_pct <= -SEUIL_MOUVEMENT_PCT:
-        log.info(f"  {symbole} ✅ ACHAT | Chute={variation_pct:.2f}% | Vol={vol_ratio:.2f}x")
-        prix_reference[symbole] = prix_actuel
-        return "ACHAT", details
+        if rsi_1h < RSI_SEUIL_BAS:
+            # Marché baissier → inverser ACHAT en VENTE
+            log.info(f"  {symbole} 🔄 ACHAT→VENTE | RSI={rsi_1h} < {RSI_SEUIL_BAS} | Vol={vol_ratio:.2f}x")
+            prix_reference[symbole] = prix_actuel
+            return "VENTE", details
+        else:
+            log.info(f"  {symbole} ✅ ACHAT | Chute={variation_pct:.2f}% | RSI={rsi_1h} | Vol={vol_ratio:.2f}x")
+            prix_reference[symbole] = prix_actuel
+            return "ACHAT", details
 
     if variation_pct >= SEUIL_MOUVEMENT_PCT:
-        log.info(f"  {symbole} ✅ VENTE | Montée={variation_pct:.2f}% | Vol={vol_ratio:.2f}x")
-        prix_reference[symbole] = prix_actuel
-        return "VENTE", details
+        if rsi_1h > RSI_SEUIL_HAUT:
+            # Marché haussier → inverser VENTE en ACHAT
+            log.info(f"  {symbole} 🔄 VENTE→ACHAT | RSI={rsi_1h} > {RSI_SEUIL_HAUT} | Vol={vol_ratio:.2f}x")
+            prix_reference[symbole] = prix_actuel
+            return "ACHAT", details
+        else:
+            log.info(f"  {symbole} ✅ VENTE | Montée={variation_pct:.2f}% | RSI={rsi_1h} | Vol={vol_ratio:.2f}x")
+            prix_reference[symbole] = prix_actuel
+            return "VENTE", details
 
-    log.info(f"  {symbole} : Variation={variation_pct:+.2f}% (seuil ±{SEUIL_MOUVEMENT_PCT}%)")
+    log.info(f"  {symbole} : Variation={variation_pct:+.2f}% | RSI={rsi_1h} (seuil ±{SEUIL_MOUVEMENT_PCT}%)")
     return "NEUTRE", {}
 
 # ═══════════════════════════════════════════════════════════════
@@ -311,8 +352,17 @@ async def executer_trade(session, symbole, direction, capital, details, etat, et
 
     mise = calculer_mise(capital, etat)
 
-    # Stop loss fixe à -5€ par trade
-    stop_loss_eur  = STOP_LOSS_EUR
+    # Stop loss proportionnel au capital — 2% du capital
+    # Plafonné à 50% de la mise pour éviter un stop trop large
+    stop_loss_eur = round(capital * STOP_LOSS_PCT / 100, 2)
+    stop_loss_max_mise = round(mise * STOP_LOSS_MISE_MAX_PCT, 2)
+    if stop_loss_eur > stop_loss_max_mise:
+        stop_loss_eur = stop_loss_max_mise
+        log.info(f"  ⚠️ Stop plafonné à 50% mise : -{stop_loss_eur}€")
+
+    rsi_1h = details.get("rsi_1h", 50.0)
+
+    # Stop loss initial
     if direction == "ACHAT":
         stop_initial   = round(prix_entree * (1 - stop_loss_eur / (mise * LEVIER)), 8)
         objectif_final = round(prix_entree * (1 + stop_loss_eur / (mise * LEVIER) * 2), 8)
@@ -330,7 +380,7 @@ async def executer_trade(session, symbole, direction, capital, details, etat, et
     log.info(f"  {symbole} ({direction})")
     log.info(f"  Variation : {details.get('variation_pct', 0):.2f}% | "
              f"Ref={details.get('prix_ref')} → {details.get('prix_actuel')}")
-    log.info(f"  Vol={details.get('vol_ratio', 0):.2f}x | Stop fixe : -{stop_loss_eur}€")
+    log.info(f"  Vol={details.get('vol_ratio', 0):.2f}x | RSI 1h={rsi_1h} | Stop : -{stop_loss_eur}€")
     log.info(f"  Prix entrée : {prix_entree} | Stop : {stop_initial}")
     log.info(f"  Mise : {mise}€ × x{LEVIER} = {round(mise*LEVIER,2)}€")
     log.info(f"  Trades ouverts : {len(trades_ouverts)}/{MAX_TRADES_SIMULTANES}\n")
@@ -339,9 +389,9 @@ async def executer_trade(session, symbole, direction, capital, details, etat, et
         f"📊 <b>TRADE #{numero_trade} — OLIDE973 V4</b>\n"
         f"{'🟢 ACHAT' if direction == 'ACHAT' else '🔴 VENTE'} {symbole}\n"
         f"Variation : {details.get('variation_pct', 0):.2f}% depuis ref\n"
-        f"Volume : {details.get('vol_ratio', 0):.2f}x\n"
+        f"Volume : {details.get('vol_ratio', 0):.2f}x | RSI 1h : {rsi_1h}\n"
         f"Prix : {prix_entree} | Stop : {stop_initial}\n"
-        f"Mise : {mise}€ × x{LEVIER}\n"
+        f"Mise : {mise}€ × x{LEVIER} | Stop max : -{stop_loss_eur}€\n"
         f"Trades : {len(trades_ouverts)}/{MAX_TRADES_SIMULTANES}\n"
         f"🎯 Lock paliers : {LOCK_PALIERS_PCT[:4]}%..."
     )
@@ -399,8 +449,9 @@ async def executer_trade(session, symbole, direction, capital, details, etat, et
             gain_final     = lock_actuel
             break
 
-        # ── Stop loss fixe à -5€ — vérification directe sur le PnL
-        atteint_stop = pnl <= -STOP_LOSS_EUR
+        # ── Stop loss initial — protection max -2% du capital
+        atteint_stop = (prix_actuel <= stop_initial if direction == "ACHAT"
+                        else prix_actuel >= stop_initial)
 
         duree = int((time.time() - debut) / 60)
 
@@ -419,12 +470,13 @@ async def executer_trade(session, symbole, direction, capital, details, etat, et
         }
 
         if atteint_stop:
-            resultat_final = "PERDU"
-            log.info(f"\n  🛑 STOP -5€ [{symbole}] {pnl:.2f}€ | {duree}min")
+            resultat_final = "GAGNE" if pnl > 0 else "PERDU"
+            log.info(f"\n  🛑 STOP [{symbole}] "
+                     f"{'+' if pnl>=0 else ''}{pnl:.2f}€ | {duree}min")
             await telegram(session,
-                f"🛑 <b>STOP -5€</b>\n"
+                f"🛑 <b>STOP</b>\n"
                 f"{symbole} {direction}\n"
-                f"Résultat : {pnl:.2f}€\n"
+                f"Résultat : {'+' if pnl>=0 else ''}{pnl:.2f}€\n"
                 f"Durée : {duree} min"
             )
             gain_final = pnl
@@ -439,10 +491,16 @@ async def executer_trade(session, symbole, direction, capital, details, etat, et
             gain_final = pnl
             break
 
-    # Libérer le marché — disponible immédiatement
+    # Libérer le marché
+    # Cooldown 12h uniquement si trade perdu ou timeout négatif
     async with trades_lock:
         trades_ouverts.pop(symbole, None)
-        log.info(f"  ✅ [{symbole}] libéré — disponible immédiatement")
+        if resultat_final == "PERDU" or (resultat_final != "GAGNE" and gain_final < 0):
+            cooldown_marches[symbole] = time.time() + COOLDOWN_APRES_PERTE
+            log.info(f"  ❄️ Cooldown 12h [{symbole}] — marché en pause jusqu'à demain")
+        else:
+            cooldown_marches.pop(symbole, None)
+            log.info(f"  ✅ [{symbole}] libéré immédiatement — trade gagnant")
 
     # Mettre à jour l'état global sous lock
     async with trades_lock:
@@ -496,7 +554,7 @@ async def executer_trade(session, symbole, direction, capital, details, etat, et
         'score':         None,
         'adx':           None,
         'atr':           None,
-        'rsi':           None,
+        'rsi':           rsi_1h,
     })
     sauvegarder_etat(etat_global)
     afficher_tableau_de_bord(etat_global)
@@ -531,6 +589,21 @@ def verifier_protections(etat, capital):
     if etat.get("pnl_jour", 0.0) <= KILL_SWITCH_JOUR:
         log.warning(f"⚠️ KILL SWITCH — PnL jour {etat.get('pnl_jour', 0)}€")
         return "KILL_SWITCH"
+    cooldown_until = etat.get("cooldown_until", 0)
+    if time.time() < cooldown_until:
+        restant = int((cooldown_until - time.time()) / 60)
+        log.info(f"  ❄️ Cooldown — {restant} min restantes")
+        return "COOLDOWN"
+    if cooldown_until > 0 and time.time() >= cooldown_until:
+        etat["pertes_consecutives"] = 0
+        etat["cooldown_until"]      = 0
+        sauvegarder_etat(etat)
+    if etat.get("pertes_consecutives", 0) >= MAX_PERTES_CONSECUTIVES:
+        log.warning(f"  {MAX_PERTES_CONSECUTIVES} pertes → cooldown {COOLDOWN_PERTES//60} min")
+        etat["cooldown_until"]      = int(time.time()) + COOLDOWN_PERTES
+        etat["pertes_consecutives"] = 0
+        sauvegarder_etat(etat)
+        return "COOLDOWN"
     return "OK"
 
 def reset_pnl_jour_si_nouveau_jour(etat):
@@ -761,6 +834,7 @@ def afficher_tableau_de_bord(etat):
     log.info(f"  PnL jour   : {'+' if etat.get('pnl_jour',0)>=0 else ''}{round(etat.get('pnl_jour',0),2)}€")
     log.info(f"  Trades     : {nb_trades} | Wins : {nb_wins} ({win_rate:.1f}%)")
     log.info(f"  Ouverts    : {len(trades_ouverts)}/{MAX_TRADES_SIMULTANES}")
+    log.info(f"  Pertes c.  : {etat.get('pertes_consecutives',0)}/{MAX_PERTES_CONSECUTIVES}")
     log.info(f"  Wins c.    : {etat.get('wins_consecutifs',0)}")
     log.info(f"  Gagné      : +{round(etat.get('total_gagne',0),2)}€")
     log.info(f"  Perdu      : -{round(etat.get('total_perdu',0),2)}€")
@@ -785,7 +859,7 @@ async def boucle_principale():
 
     for champ, valeur in [
         ("pnl_jour", 0.0), ("date_jour", ""), ("wins_consecutifs", 0),
-        ("nb_skips", 0)
+        ("cooldown_until", 0), ("nb_skips", 0)
     ]:
         if champ not in etat:
             etat[champ] = valeur
@@ -798,7 +872,7 @@ async def boucle_principale():
             f"🚀 <b>BOT HUMAIN OLIDE973 V4 DÉMARRÉ</b>\n"
             f"Capital : {round(etat['capital'],2)}€\n"
             f"Signal : mouvement ≥ {SEUIL_MOUVEMENT_PCT}% depuis prix référence\n"
-            f"Lock paliers | Stop fixe -{STOP_LOSS_EUR}€ par trade\n"
+            f"Lock paliers | Stop max -{STOP_LOSS_PCT}% du capital\n"
             f"Kill switch : {KILL_SWITCH_JOUR}€/jour\n"
             f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
@@ -822,14 +896,18 @@ async def boucle_principale():
                     await telegram(session,
                         f"🚨 <b>SEUIL RUINE !</b>\nCapital : {etat['capital']}€\nBot arrêté !")
                     break
-                if statut == "KILL_SWITCH":
+                if statut in ("KILL_SWITCH", "COOLDOWN"):
                     await asyncio.sleep(60)
                     etat = charger_etat()
                     continue
 
                 async with trades_lock:
                     slots_libres        = MAX_TRADES_SIMULTANES - len(trades_ouverts)
-                    marches_disponibles = [m for m in MARCHES if m not in trades_ouverts]
+                    marches_disponibles = [
+                        m for m in MARCHES
+                        if m not in trades_ouverts
+                        and time.time() >= cooldown_marches.get(m, 0)
+                    ]
 
                 if slots_libres <= 0:
                     log.info(f"  {MAX_TRADES_SIMULTANES}/{MAX_TRADES_SIMULTANES} trades — attente...")
