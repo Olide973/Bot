@@ -39,9 +39,8 @@ MAX_TRADES_SIMULTANES   = 20
 
 # ── Détection signal mean reversion — surveillance temps réel
 SEUIL_MOUVEMENT_PCT     = 0.50   # dès que le prix bouge de 0.50% → signal
-VOLUME_MINI             = 0.25   # volume min vs moyenne 24h
+VOLUME_MINI             = 0.30   # volume min vs moyenne 24h
 STOP_LOSS_EUR           = 5.0    # stop loss fixe à -5€ par trade
-BAN_APRES_STOP          = 86400  # 24h de ban sur le marché après stop
 
 # ── Lock profits par paliers proportionnels au capital
 # Les paliers s'adaptent automatiquement selon le capital actuel
@@ -68,8 +67,6 @@ KELLY_CAP               = 0.20
 # ── Protections
 KILL_SWITCH_JOUR        = -50.0
 SEUIL_RUINE             = 600.0
-MAX_PERTES_CONSECUTIVES = 2
-COOLDOWN_PERTES         = 1800   # 30 min
 
 TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
@@ -110,7 +107,6 @@ KRAKEN_SYMBOLS = {
 # ═══════════════════════════════════════════════════════════════
 trades_ouverts  = {}    # { symbole: True }
 prix_reference  = {}    # { symbole: prix_au_moment_du_scan }
-ban_marche      = {}    # { symbole: timestamp_fin_ban_24h }
 trades_lock     = None  # initialisé dans boucle_principale()
 
 log.info("=" * 60)
@@ -424,13 +420,12 @@ async def executer_trade(session, symbole, direction, capital, details, etat, et
 
         if atteint_stop:
             resultat_final = "PERDU"
-            log.info(f"\n  🛑 STOP -5€ [{symbole}] {pnl:.2f}€ | {duree}min → BAN 24h")
+            log.info(f"\n  🛑 STOP -5€ [{symbole}] {pnl:.2f}€ | {duree}min")
             await telegram(session,
                 f"🛑 <b>STOP -5€</b>\n"
                 f"{symbole} {direction}\n"
                 f"Résultat : {pnl:.2f}€\n"
-                f"Durée : {duree} min\n"
-                f"⛔ Banni 24h"
+                f"Durée : {duree} min"
             )
             gain_final = pnl
             break
@@ -444,14 +439,10 @@ async def executer_trade(session, symbole, direction, capital, details, etat, et
             gain_final = pnl
             break
 
-    # Libérer le marché — ban 24h si stop, sinon disponible immédiatement
+    # Libérer le marché — disponible immédiatement
     async with trades_lock:
         trades_ouverts.pop(symbole, None)
-        if resultat_final == "PERDU" and gain_final <= -STOP_LOSS_EUR:
-            ban_marche[symbole] = time.time() + BAN_APRES_STOP
-            log.info(f"  ⛔ BAN 24h [{symbole}] — disponible à {datetime.fromtimestamp(ban_marche[symbole]).strftime('%H:%M:%S')}")
-        else:
-            log.info(f"  ✅ [{symbole}] libéré — disponible immédiatement")
+        log.info(f"  ✅ [{symbole}] libéré — disponible immédiatement")
 
     # Mettre à jour l'état global sous lock
     async with trades_lock:
@@ -540,21 +531,6 @@ def verifier_protections(etat, capital):
     if etat.get("pnl_jour", 0.0) <= KILL_SWITCH_JOUR:
         log.warning(f"⚠️ KILL SWITCH — PnL jour {etat.get('pnl_jour', 0)}€")
         return "KILL_SWITCH"
-    cooldown_until = etat.get("cooldown_until", 0)
-    if time.time() < cooldown_until:
-        restant = int((cooldown_until - time.time()) / 60)
-        log.info(f"  ❄️ Cooldown — {restant} min restantes")
-        return "COOLDOWN"
-    if cooldown_until > 0 and time.time() >= cooldown_until:
-        etat["pertes_consecutives"] = 0
-        etat["cooldown_until"]      = 0
-        sauvegarder_etat(etat)
-    if etat.get("pertes_consecutives", 0) >= MAX_PERTES_CONSECUTIVES:
-        log.warning(f"  {MAX_PERTES_CONSECUTIVES} pertes → cooldown {COOLDOWN_PERTES//60} min")
-        etat["cooldown_until"]      = int(time.time()) + COOLDOWN_PERTES
-        etat["pertes_consecutives"] = 0
-        sauvegarder_etat(etat)
-        return "COOLDOWN"
     return "OK"
 
 def reset_pnl_jour_si_nouveau_jour(etat):
@@ -785,7 +761,6 @@ def afficher_tableau_de_bord(etat):
     log.info(f"  PnL jour   : {'+' if etat.get('pnl_jour',0)>=0 else ''}{round(etat.get('pnl_jour',0),2)}€")
     log.info(f"  Trades     : {nb_trades} | Wins : {nb_wins} ({win_rate:.1f}%)")
     log.info(f"  Ouverts    : {len(trades_ouverts)}/{MAX_TRADES_SIMULTANES}")
-    log.info(f"  Pertes c.  : {etat.get('pertes_consecutives',0)}/{MAX_PERTES_CONSECUTIVES}")
     log.info(f"  Wins c.    : {etat.get('wins_consecutifs',0)}")
     log.info(f"  Gagné      : +{round(etat.get('total_gagne',0),2)}€")
     log.info(f"  Perdu      : -{round(etat.get('total_perdu',0),2)}€")
@@ -810,7 +785,7 @@ async def boucle_principale():
 
     for champ, valeur in [
         ("pnl_jour", 0.0), ("date_jour", ""), ("wins_consecutifs", 0),
-        ("cooldown_until", 0), ("nb_skips", 0)
+        ("nb_skips", 0)
     ]:
         if champ not in etat:
             etat[champ] = valeur
@@ -847,18 +822,14 @@ async def boucle_principale():
                     await telegram(session,
                         f"🚨 <b>SEUIL RUINE !</b>\nCapital : {etat['capital']}€\nBot arrêté !")
                     break
-                if statut in ("KILL_SWITCH", "COOLDOWN"):
+                if statut == "KILL_SWITCH":
                     await asyncio.sleep(60)
                     etat = charger_etat()
                     continue
 
                 async with trades_lock:
                     slots_libres        = MAX_TRADES_SIMULTANES - len(trades_ouverts)
-                    marches_disponibles = [
-                        m for m in MARCHES
-                        if m not in trades_ouverts
-                        and time.time() >= ban_marche.get(m, 0)
-                    ]
+                    marches_disponibles = [m for m in MARCHES if m not in trades_ouverts]
 
                 if slots_libres <= 0:
                     log.info(f"  {MAX_TRADES_SIMULTANES}/{MAX_TRADES_SIMULTANES} trades — attente...")
