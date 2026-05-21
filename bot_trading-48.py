@@ -35,7 +35,7 @@ MISE_MIN                = 10.0
 MISE_MAX_PCT            = 0.25
 CHECK_INTERVAL          = 10         # secondes entre chaque check prix
 PAUSE_SCAN              = 30         # secondes entre chaque scan de nouveaux marchés
-TIMEOUT_TRADE           = 12 * 3600  # 12h max par trade
+TIMEOUT_TRADE           = 4 * 3600   # 4h max par trade
 MAX_TRADES_SIMULTANES   = 20
 
 # ── Détection signal mean reversion — surveillance temps réel
