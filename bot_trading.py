@@ -1,1172 +1,1164 @@
 """
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                                                                              ║
-║          ██████╗  ██████╗ ████████╗    ██╗   ██╗██████╗                     ║
-║          ██╔══██╗██╔═══██╗╚══██╔══╝    ██║   ██║╚════██╗                    ║
-║          ██████╔╝██║   ██║   ██║       ██║   ██║ █████╔╝                    ║
-║          ██╔══██╗██║   ██║   ██║       ╚██╗ ██╔╝ ╚═══██╗                   ║
-║          ██████╔╝╚██████╔╝   ██║        ╚████╔╝ ██████╔╝                    ║
-║          ╚═════╝  ╚═════╝    ╚═╝         ╚═══╝  ╚═════╝                     ║
-║                                                                              ║
-║                  QUANTUM EDGE TRADING SYSTEM — v2.0                         ║
-║          Multi-Signal · Risk-Controlled · Adaptive Intelligence              ║
-║                                                                              ║
-║  Marchés  : 15 paires crypto soigneusement sélectionnées                    ║
-║  Signaux  : ADX · EMA · RSI · Bollinger · Volume · Tendance Macro           ║
-║  Gestion  : Trailing Stop · Kill Switch · Drawdown Guard · Kelly Sizing     ║
-║  Source   : Kraken API (prix) — compatible Binance Futures (live)           ║
-║                                                                              ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-
-AVERTISSEMENT : Le trading de crypto-monnaies implique un risque de perte en
-capital. Ce bot est conçu pour maximiser les probabilités de succès, mais
-aucun système ne garantit des profits constants. Tradez avec prudence.
+╔══════════════════════════════════════════════════════════════════╗
+║         BOT HUMAIN — VÉRONIQUE973 V4                            ║
+║  Mean Reversion 0.50% | Surveillance prix temps réel            ║
+║  Lock Profits Paliers | 20 trades simultanés                    ║
+║  Capital 500€ | Architecture async aiohttp                      ║
+╚══════════════════════════════════════════════════════════════════╝
 """
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  IMPORTS
-# ─────────────────────────────────────────────────────────────────────────────
 import asyncio
-import logging
-import math
-import os
-import statistics
-import sys
-import time
-from collections import defaultdict, deque
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from enum import Enum
-from typing import Dict, List, Optional, Tuple
-
 import aiohttp
+import os
+import logging
+import time
+from datetime import datetime
+import pandas as pd
+from ta.volatility import AverageTrueRange
+from ta.momentum import RSIIndicator
+from database import init_database, charger_etat, sauvegarder_etat, enregistrer_trade
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  LOGGING
-# ─────────────────────────────────────────────────────────────────────────────
-LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s"
 logging.basicConfig(
     level=logging.INFO,
-    format=LOG_FORMAT,
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("bot_v2.log", encoding="utf-8"),
-    ],
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
 )
-log = logging.getLogger("QUANTUM_EDGE")
+log = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  ENUMS
-# ─────────────────────────────────────────────────────────────────────────────
-class Signal(Enum):
-    BUY   = "BUY"
-    SELL  = "SELL"
-    NONE  = "NONE"
-
-class TradeState(Enum):
-    IDLE    = "IDLE"
-    OPEN    = "OPEN"
-    CLOSED  = "CLOSED"
-
-class MarketRegime(Enum):
-    TRENDING_UP   = "TRENDING_UP"
-    TRENDING_DOWN = "TRENDING_DOWN"
-    RANGING       = "RANGING"
-    VOLATILE      = "VOLATILE"
-
-# ─────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
 #  CONFIGURATION
-# ─────────────────────────────────────────────────────────────────────────────
-@dataclass
-class BotConfig:
-    # ── Identité
-    bot_name: str = "QUANTUM_EDGE_V2"
-    simulation_mode: bool = True
+# ═══════════════════════════════════════════════════════════════
+CAPITAL_INITIAL         = 500.0
+LEVIER                  = 10
+MISE_BASE_PCT           = 0.10
+MISE_MIN                = 10.0
+MISE_MAX_PCT            = 0.25
+CHECK_INTERVAL          = 10         # secondes entre chaque check prix
+PAUSE_SCAN              = 30         # secondes entre chaque scan de nouveaux marchés
+TIMEOUT_TRADE           = 10 * 3600  # 10h max par trade
+MAX_TRADES_SIMULTANES   = 20
 
-    # ── Marchés (15 paires choisies pour leur liquidité, volatilité et volume)
-    markets: List[str] = field(default_factory=lambda: [
-        "XBT/USDT",   # Bitcoin       — valeur refuge, haute liquidité
-        "ETH/USDT",   # Ethereum      — DeFi leader, très suivi
-        "SOL/USDT",   # Solana        — vitesse + écosystème fort
-        "BNB/USDT",   # Binance Coin  — corrélé aux volumes d'échange
-        "XRP/USDT",   # Ripple        — fort momentum institutionnel
-        "AVAX/USDT",  # Avalanche     — L1 compétitif, bons mouvements
-        "LINK/USDT",  # Chainlink     — oracle leader, tendances nettes
-        "ADA/USDT",   # Cardano       — cycles réguliers, technique lisible
-        "DOT/USDT",   # Polkadot      — interopérabilité, swings propres
-        "DOGE/USDT",  # Dogecoin      — forte volatilité, volumes élevés
-        "MATIC/USDT", # Polygon       — scaling Ethereum, cycles courts
-        "ATOM/USDT",  # Cosmos        — IBC leader, tendances franches
-        "NEAR/USDT",  # NEAR Protocol — L1 émergent, bons patterns
-        "APT/USDT",   # Aptos         — Move VM, volatilité exploitable
-        "OP/USDT",    # Optimism      — L2 Ethereum, momentum solide
-    ])
+# ── Détection signal mean reversion — surveillance temps réel
+SEUIL_MOUVEMENT_PCT     = 0.50   # dès que le prix bouge de 0.50% → signal
+VOLUME_MINI             = 0.25   # volume min vs moyenne 24h
+STOP_LOSS_PCT           = 2.0    # perte maximum = 2% du capital (comme les paliers)
+STOP_LOSS_MISE_MAX_PCT  = 0.50   # stop plafonné à 50% de la mise
 
-    # ── Timeframes
-    tf_primary:     int = 15    # minutes — signal principal
-    tf_confirmation: int = 60   # minutes — filtre macro
-    candles_required: int = 200 # nb de bougies pour les indicateurs longs
+# ── Filtre RSI 1h
+RSI_SEUIL_BAS           = 45     # RSI < 45 → marché baissier → inverser ACHAT en VENTE
+RSI_SEUIL_HAUT          = 55     # RSI > 55 → marché haussier → inverser VENTE en ACHAT
+RSI_PERIODE             = 14     # période RSI standard
 
-    # ── Gestion du capital
-    stake_eur:      float = 50.0    # mise par trade (€)
-    leverage:       int   = 3       # levier
-    max_open_trades: int  = 3       # trades simultanés max
-    kelly_fraction: float = 0.25    # fraction Kelly (conservateur)
+# ── Cooldown après perte uniquement
+COOLDOWN_APRES_PERTE    = 43200  # 12h après stop loss ou timeout négatif
 
-    # ── Profit / Perte
-    target_pct:     float = 0.50    # +0.50% sur position levierisée = ~+0.75€
-    stoploss_pct:   float = 1.00    # -1.00% sur position = ~-1.50€
-    trailing_start: float = 0.30    # déclenche le trailing à +0.30%
-    trailing_step:  float = 0.15    # step du trailing stop
+# ── Lock profits par paliers proportionnels au capital
+# Les paliers s'adaptent automatiquement selon le capital actuel
+# Exprimés en % du capital
+LOCK_PALIERS_PCT = [0.15, 0.20, 0.30, 0.60, 1.00, 1.60, 2.40, 3.60, 5.00, 7.00, 10.00, 15.00, 20.00, 30.00, 40.00]
 
-    # ── Kill switch
-    daily_kill_eur: float = -3.0    # arrêt si PnL journalier < -3€
-    max_drawdown_pct: float = 5.0   # arrêt si drawdown > 5% du capital total
+def get_palier_lock(pnl_max, capital):
+    """Retourne le gain garanti selon le PnL max atteint — proportionnel au capital."""
+    lock = 0.0
+    for pct in LOCK_PALIERS_PCT:
+        palier_eur = round(capital * pct / 100, 2)
+        if pnl_max >= palier_eur:
+            lock = palier_eur
+    return lock
 
-    # ── Filtres de qualité du signal
-    adx_min:        int   = 22      # ADX minimum pour valider une tendance
-    rsi_oversold:   int   = 35      # RSI en survente (signal BUY)
-    rsi_overbought: int   = 65      # RSI en surachat (signal SELL)
-    rsi_extreme_low:  int = 25      # RSI extrême bas — filtre anti-fakeout
-    rsi_extreme_high: int = 75      # RSI extrême haut — filtre anti-fakeout
-    volume_mult_min: float = 1.3    # volume ≥ 1.3× la moyenne pour confirmer
-    bb_squeeze_threshold: float = 0.03  # détection d'une compression Bollinger
+# ── Gestion mise dynamique
+WINS_CONFIANCE          = 3
+BOOST_CONFIANCE         = 1.20
+REDUCTION_PERTES        = 0.50
+MIN_TRADES_KELLY        = 30
+KELLY_FRACTION          = 0.25
+KELLY_CAP               = 0.20
 
-    # ── Scoring (points max = 30)
-    score_min:      int   = 14      # score minimum pour ouvrir un trade
+# ── Protections
+KILL_SWITCH_JOUR        = -10.0
+SEUIL_RUINE             = 300.0
+MAX_PERTES_CONSECUTIVES = 2
+COOLDOWN_PERTES         = 1800   # 30 min
 
-    # ── Timing
-    loop_interval:  int   = 30      # secondes entre chaque cycle
-    pause_after_trade: int = 120    # pause (s) après fermeture d'un trade
-    candle_fetch_timeout: int = 10  # timeout Kraken API (s)
+TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_TOKEN', '')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
-    # ── Capital initial (simulation)
-    initial_capital: float = 200.0
+# ── Horaires de trading (heure Guyane = UTC-3)
+# Groupe 00h-17h : actif de minuit à 17h Guyane — 8 marchés
+# Groupe NUIT    : 00h-09h Guyane = 03h-12h UTC — 14 marchés
+# Groupe JOUR    : 09h-17h Guyane = 12h-20h UTC — 1 marché (TAO)
+# Pause totale   : 17h-00h Guyane = 20h-03h UTC
 
-    # ── Frais Binance Futures (taker)
-    fee_pct: float = 0.04  # 0.04% par trade (entrée + sortie = ~0.08%)
+# Groupe 1 — 00h-17h Guyane
+MARCHES_24H = [
+    "ATOMUSDT", "NEARUSDT", "TRXUSDT",
+    "UNIUSDT",  "ARBUSDT",  "FTMUSDT",
+    "SUIUSDT",  "XMRUSDT",
+]
 
+# Groupe 2 — Session NUIT (03h-12h UTC = 00h-09h Guyane)
+MARCHES_NUIT = [
+    "ETHUSDT",  "XRPUSDT",  "SOLUSDT",  "ADAUSDT",
+    "LINKUSDT", "AVAXUSDT", "DOTUSDT",  "DOGEUSDT",
+    "LTCUSDT",  "ALGOUSDT", "FILUSDT",  "AAVEUSDT",
+    "POLUSDT",  "APEUSDT",
+]
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  STRUCTURES DE DONNÉES
-# ─────────────────────────────────────────────────────────────────────────────
-@dataclass
-class Candle:
-    timestamp: int
-    open:   float
-    high:   float
-    low:    float
-    close:  float
-    volume: float
+# Groupe 3 — Session JOUR (12h-20h UTC = 09h-17h Guyane)
+MARCHES_JOUR = [
+    "TAOUSDT",
+]
 
+KRAKEN_SYMBOLS = {
+    # Groupe 00h-17h Guyane
+    "ATOMUSDT":  "ATOMUSD",
+    "NEARUSDT":  "NEARUSD",
+    "TRXUSDT":   "TRXUSD",
+    "UNIUSDT":   "UNIUSD",
+    "ARBUSDT":   "ARBUSD",
+    "FTMUSDT":   "FTMUSD",
+    "SUIUSDT":   "SUIUSD",
+    "XMRUSDT":   "XMRUSD",
+    # Groupe NUIT
+    "ETHUSDT":   "XETHZUSD",
+    "XRPUSDT":   "XXRPZUSD",
+    "SOLUSDT":   "SOLUSD",
+    "ADAUSDT":   "ADAUSD",
+    "LINKUSDT":  "LINKUSD",
+    "AVAXUSDT":  "AVAXUSD",
+    "DOTUSDT":   "DOTUSD",
+    "DOGEUSDT":  "XDGUSD",
+    "LTCUSDT":   "XLTCZUSD",
+    "ALGOUSDT":  "ALGOUSD",
+    "FILUSDT":   "FILUSD",
+    "AAVEUSDT":  "AAVEUSD",
+    "POLUSDT":   "POLUSD",
+    "APEUSDT":   "APEUSD",
+    # Groupe JOUR
+    "TAOUSDT":   "TAOUSD",
+}
 
-@dataclass
-class Trade:
-    market:       str
-    side:         Signal
-    entry_price:  float
-    stake:        float
-    leverage:     int
-    entry_time:   datetime
-    state:        TradeState = TradeState.OPEN
-    exit_price:   Optional[float] = None
-    exit_time:    Optional[datetime] = None
-    pnl_eur:      float = 0.0
-    trailing_stop: Optional[float] = None
-    peak_price:   Optional[float] = None
-    score:        int = 0
-    regime:       MarketRegime = MarketRegime.RANGING
-
-    def position_size(self) -> float:
-        """Taille de la position en € (stake × levier)."""
-        return self.stake * self.leverage
-
-    def unrealized_pnl(self, current_price: float) -> float:
-        """PnL non réalisé en €."""
-        if self.side == Signal.BUY:
-            pct = (current_price - self.entry_price) / self.entry_price
-        else:
-            pct = (self.entry_price - current_price) / self.entry_price
-        gross = self.position_size() * pct
-        fees  = self.position_size() * (cfg.fee_pct / 100) * 2
-        return gross - fees
-
-    def target_price(self) -> float:
-        mult = 1 + cfg.target_pct / 100 / cfg.leverage
-        if self.side == Signal.BUY:
-            return self.entry_price * mult
-        return self.entry_price / mult
-
-    def stoploss_price(self) -> float:
-        mult = 1 + cfg.stoploss_pct / 100 / cfg.leverage
-        if self.side == Signal.BUY:
-            return self.entry_price / mult
-        return self.entry_price * mult
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  INDICATEURS TECHNIQUES
-# ─────────────────────────────────────────────────────────────────────────────
-class Indicators:
-    """Calculs d'indicateurs purement numériques, sans dépendances externes."""
-
-    @staticmethod
-    def ema(values: List[float], period: int) -> List[float]:
-        if len(values) < period:
-            return []
-        k = 2 / (period + 1)
-        result = [sum(values[:period]) / period]
-        for v in values[period:]:
-            result.append(v * k + result[-1] * (1 - k))
-        return result
-
-    @staticmethod
-    def sma(values: List[float], period: int) -> List[float]:
-        return [
-            sum(values[i:i+period]) / period
-            for i in range(len(values) - period + 1)
-        ]
-
-    @staticmethod
-    def rsi(closes: List[float], period: int = 14) -> float:
-        if len(closes) < period + 1:
-            return 50.0
-        deltas = [closes[i+1] - closes[i] for i in range(len(closes)-1)]
-        gains  = [max(d, 0) for d in deltas[-period:]]
-        losses = [abs(min(d, 0)) for d in deltas[-period:]]
-        avg_gain = sum(gains) / period
-        avg_loss = sum(losses) / period
-        if avg_loss == 0:
-            return 100.0
-        rs = avg_gain / avg_loss
-        return 100 - (100 / (1 + rs))
-
-    @staticmethod
-    def adx(candles: List[Candle], period: int = 14) -> Tuple[float, float, float]:
-        """Retourne (ADX, +DI, -DI)."""
-        if len(candles) < period + 1:
-            return 0.0, 0.0, 0.0
-
-        tr_list, pdm_list, ndm_list = [], [], []
-        for i in range(1, len(candles)):
-            h, l, pc = candles[i].high, candles[i].low, candles[i-1].close
-            tr  = max(h - l, abs(h - pc), abs(l - pc))
-            pdm = max(h - candles[i-1].high, 0) if (h - candles[i-1].high) > (candles[i-1].low - l) else 0
-            ndm = max(candles[i-1].low - l, 0) if (candles[i-1].low - l) > (h - candles[i-1].high) else 0
-            tr_list.append(tr)
-            pdm_list.append(pdm)
-            ndm_list.append(ndm)
-
-        def smoothed(lst):
-            s = sum(lst[:period])
-            result = [s]
-            for v in lst[period:]:
-                result.append(result[-1] - result[-1]/period + v)
-            return result
-
-        atr  = smoothed(tr_list)
-        pDM  = smoothed(pdm_list)
-        nDM  = smoothed(ndm_list)
-
-        dx_list = []
-        pdi_list, ndi_list = [], []
-        for i in range(len(atr)):
-            pdi = 100 * pDM[i] / atr[i] if atr[i] else 0
-            ndi = 100 * nDM[i] / atr[i] if atr[i] else 0
-            pdi_list.append(pdi)
-            ndi_list.append(ndi)
-            s = pdi + ndi
-            dx_list.append(100 * abs(pdi - ndi) / s if s else 0)
-
-        if len(dx_list) < period:
-            return 0.0, pdi_list[-1] if pdi_list else 0.0, ndi_list[-1] if ndi_list else 0.0
-
-        adx_val = sum(dx_list[-period:]) / period
-        return adx_val, pdi_list[-1], ndi_list[-1]
-
-    @staticmethod
-    def bollinger_bands(closes: List[float], period: int = 20, std_dev: float = 2.0) -> Tuple[float, float, float]:
-        """Retourne (upper, middle, lower)."""
-        if len(closes) < period:
-            c = closes[-1]
-            return c, c, c
-        window = closes[-period:]
-        mid    = sum(window) / period
-        std    = statistics.stdev(window)
-        return mid + std_dev * std, mid, mid - std_dev * std
-
-    @staticmethod
-    def atr(candles: List[Candle], period: int = 14) -> float:
-        if len(candles) < period + 1:
-            return 0.0
-        trs = []
-        for i in range(1, len(candles)):
-            h, l, pc = candles[i].high, candles[i].low, candles[i-1].close
-            trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-        return sum(trs[-period:]) / period
-
-    @staticmethod
-    def volume_ratio(candles: List[Candle], period: int = 20) -> float:
-        """Volume de la dernière bougie vs moyenne des N précédentes."""
-        if len(candles) < period + 1:
-            return 1.0
-        avg = sum(c.volume for c in candles[-period-1:-1]) / period
-        return candles[-1].volume / avg if avg > 0 else 1.0
-
-    @staticmethod
-    def detect_regime(candles: List[Candle], ema_fast: List[float], ema_slow: List[float], adx_val: float) -> MarketRegime:
-        """Identifie le régime de marché courant."""
-        if len(ema_fast) < 2 or len(ema_slow) < 2:
-            return MarketRegime.RANGING
-        closes = [c.close for c in candles[-20:]]
-        volatility = statistics.stdev(closes) / (sum(closes)/len(closes)) * 100
-        if volatility > 4.0:
-            return MarketRegime.VOLATILE
-        if adx_val >= 25:
-            if ema_fast[-1] > ema_slow[-1]:
-                return MarketRegime.TRENDING_UP
-            return MarketRegime.TRENDING_DOWN
-        return MarketRegime.RANGING
-
-    @staticmethod
-    def detect_divergence(closes: List[float], rsi_series: List[float], lookback: int = 5) -> Optional[str]:
-        """Détecte une divergence RSI/prix (haussière ou baissière)."""
-        if len(closes) < lookback + 1 or len(rsi_series) < lookback + 1:
-            return None
-        price_trend = closes[-1] - closes[-lookback]
-        rsi_trend   = rsi_series[-1] - rsi_series[-lookback]
-        if price_trend < 0 and rsi_trend > 0:
-            return "BULLISH_DIVERGENCE"
-        if price_trend > 0 and rsi_trend < 0:
-            return "BEARISH_DIVERGENCE"
-        return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  MOTEUR DE SIGNAL
-# ─────────────────────────────────────────────────────────────────────────────
-class SignalEngine:
+def get_marches_actifs():
+    """Retourne les marchés actifs selon l'heure UTC actuelle.
+    
+    Heure Guyane = UTC-3
+    - 00h-09h Guyane (03h-12h UTC) → 8 marchés 00h-17h + 14 marchés NUIT + TAO = 23 marchés
+    - 09h-17h Guyane (12h-20h UTC) → 8 marchés 00h-17h + TAO = 9 marchés
+    - 17h-00h Guyane (20h-03h UTC) → PAUSE totale — aucun nouveau trade
     """
-    Calcule un score composite (0–30) à partir de 6 indicateurs.
-    Un score ≥ cfg.score_min déclenche un trade.
+    heure_utc = datetime.utcnow().hour
 
-    Indicateurs & pondération :
-    ┌─────────────────┬─────────────────────────────────────────┬────────┐
-    │ Indicateur      │ Condition                               │ Points │
-    ├─────────────────┼─────────────────────────────────────────┼────────┤
-    │ Tendance Macro  │ EMA200 direction 1h                     │ 0–7    │
-    │ ADX             │ Force de tendance                       │ 0–6    │
-    │ EMA Cross       │ EMA9 × EMA21 croisement                 │ 0–5    │
-    │ RSI             │ Zone survente/surachat                  │ 0–5    │
-    │ Bollinger       │ Prix proche bande + squeeze             │ 0–4    │
-    │ Volume          │ Confirmation par le volume              │ 0–3    │
-    └─────────────────┴─────────────────────────────────────────┴────────┘
-    """
+    # PAUSE totale : 20h-03h UTC = 17h-00h Guyane
+    if heure_utc >= 20 or heure_utc < 3:
+        return []
 
-    def __init__(self, cfg: BotConfig):
-        self.cfg = cfg
-        self.ind = Indicators()
+    # Session NUIT : 03h-12h UTC = 00h-09h Guyane
+    # 00h-17h + NUIT + TAO actifs
+    if 3 <= heure_utc < 12:
+        return MARCHES_24H + MARCHES_NUIT + MARCHES_JOUR
 
-    def compute(
-        self,
-        candles_15m: List[Candle],
-        candles_1h:  List[Candle],
-    ) -> Tuple[Signal, int, Dict, MarketRegime]:
-        """
-        Retourne (signal, score, details, regime).
-        """
-        closes_15m = [c.close for c in candles_15m]
-        closes_1h  = [c.close for c in candles_1h]
+    # Session JOUR : 12h-20h UTC = 09h-17h Guyane
+    # Uniquement 00h-17h + TAO
+    return MARCHES_24H + MARCHES_JOUR
 
-        # ── Indicateurs primaires (15m)
-        rsi_val  = self.ind.rsi(closes_15m)
-        adx_val, pdi, ndi = self.ind.adx(candles_15m)
-        bb_up, bb_mid, bb_lo = self.ind.bollinger_bands(closes_15m)
-        vol_ratio = self.ind.volume_ratio(candles_15m)
-        ema9  = self.ind.ema(closes_15m, 9)
-        ema21 = self.ind.ema(closes_15m, 21)
-        ema50 = self.ind.ema(closes_15m, 50)
+# Pour compatibilité avec le reste du code
+MARCHES = MARCHES_24H + MARCHES_NUIT + MARCHES_JOUR
 
-        # ── Indicateurs macro (1h)
-        ema200_1h = self.ind.ema(closes_1h, 200) if len(closes_1h) >= 200 else self.ind.ema(closes_1h, len(closes_1h)//2 or 1)
-        ema_fast_1h = self.ind.ema(closes_1h, 20)
-        ema_slow_1h = self.ind.ema(closes_1h, 50)
+def get_session_marche(symbole):
+    """Retourne la session horaire d'un marché en heure Guyane."""
+    if symbole in MARCHES_NUIT:
+        return "00h-09h Guyane"
+    elif symbole in MARCHES_JOUR:
+        return "09h-17h Guyane"
+    else:
+        return "00h-17h Guyane"
 
-        price = closes_15m[-1]
-        macro_bull = len(ema200_1h) > 0 and price > ema200_1h[-1]
-        macro_bear = len(ema200_1h) > 0 and price < ema200_1h[-1]
+# ═══════════════════════════════════════════════════════════════
+#  ÉTAT GLOBAL
+# ═══════════════════════════════════════════════════════════════
+trades_ouverts    = {}    # { symbole: True }
+prix_reference    = {}    # { symbole: prix_au_moment_du_scan }
+cooldown_marches  = {}    # { symbole: timestamp_fin_cooldown }
+trades_lock       = None  # initialisé dans boucle_principale()
 
-        # ── Régime de marché
-        regime = self.ind.detect_regime(candles_15m, ema9, ema21, adx_val)
+log.info("=" * 60)
+log.info("  BOT HUMAIN — VÉRONIQUE973 V4")
+log.info(f"  Capital : {CAPITAL_INITIAL}€ | Levier x{LEVIER}")
+log.info(f"  Marchés 00h-17h : {len(MARCHES_24H)} | Nuit 00h-09h : {len(MARCHES_NUIT)} | Jour 09h-17h : {len(MARCHES_JOUR)}")
+log.info(f"  Signal : mouvement ≥ {SEUIL_MOUVEMENT_PCT}% depuis le prix de référence")
+log.info(f"  Surveillance temps réel — peu importe la durée")
+log.info(f"  RSI 1h : seuil bas={RSI_SEUIL_BAS} | seuil haut={RSI_SEUIL_HAUT} | inversion auto")
+log.info(f"  Stop : {STOP_LOSS_PCT}% capital | plafonné {int(STOP_LOSS_MISE_MAX_PCT*100)}% mise")
+log.info(f"  Lock paliers : {LOCK_PALIERS_PCT}% du capital")
+log.info(f"  Cooldown : 12h après perte | 0 après gain")
+log.info(f"  Kill switch : {KILL_SWITCH_JOUR}€/jour | Ruine : {SEUIL_RUINE}€")
+log.info(f"  Horaires : 00h-09h=00h-17h+NUIT+TAO | 09h-17h=00h-17h+TAO | 17h-00h=PAUSE")
+log.info(f"  Telegram : {'ON' if TELEGRAM_TOKEN else 'OFF'}")
+log.info("=" * 60)
 
-        # ── Squeeze Bollinger
-        bb_width = (bb_up - bb_lo) / bb_mid if bb_mid else 0
-        bb_squeeze = bb_width < self.cfg.bb_squeeze_threshold
+# ═══════════════════════════════════════════════════════════════
+#  TELEGRAM
+# ═══════════════════════════════════════════════════════════════
+async def telegram(session, message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        await session.post(url, data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        }, timeout=aiohttp.ClientTimeout(total=10))
+    except Exception as e:
+        log.error(f"Erreur Telegram : {e}")
 
-        # ── RSI série pour divergence
-        rsi_series = []
-        for i in range(max(1, len(closes_15m)-20), len(closes_15m)):
-            rsi_series.append(self.ind.rsi(closes_15m[:i+1]))
-        divergence = self.ind.detect_divergence(closes_15m[-20:], rsi_series)
-
-        # ─── SCORE BUY ────────────────────────────────────────────────────
-        buy_score = 0
-        buy_details: Dict[str, int] = {}
-
-        # 1. Tendance macro (0–7)
-        if macro_bull:
-            s = 4
-            if len(ema_fast_1h) > 0 and len(ema_slow_1h) > 0 and ema_fast_1h[-1] > ema_slow_1h[-1]:
-                s += 3
-            buy_score += s
-            buy_details["macro"] = s
-        else:
-            buy_details["macro"] = 0
-
-        # 2. ADX (0–6)
-        if adx_val >= self.cfg.adx_min and pdi > ndi:
-            s = min(6, int((adx_val - self.cfg.adx_min) / 5) + 3)
-            buy_score += s
-            buy_details["adx"] = s
-        elif adx_val >= self.cfg.adx_min * 0.8 and pdi > ndi:
-            buy_score += 2
-            buy_details["adx"] = 2
-        else:
-            buy_details["adx"] = 0
-
-        # 3. EMA Cross (0–5)
-        if len(ema9) >= 2 and len(ema21) >= 2:
-            cross_up = ema9[-1] > ema21[-1] and ema9[-2] <= ema21[-2]
-            above    = ema9[-1] > ema21[-1]
-            trend_ok = len(ema50) > 0 and ema21[-1] > ema50[-1]
-            if cross_up:
-                buy_score += 5
-                buy_details["ema_cross"] = 5
-            elif above and trend_ok:
-                buy_score += 3
-                buy_details["ema_cross"] = 3
-            elif above:
-                buy_score += 1
-                buy_details["ema_cross"] = 1
-            else:
-                buy_details["ema_cross"] = 0
-        else:
-            buy_details["ema_cross"] = 0
-
-        # 4. RSI (0–5)
-        if self.cfg.rsi_extreme_low <= rsi_val <= self.cfg.rsi_oversold:
-            buy_score += 5
-            buy_details["rsi"] = 5
-        elif rsi_val <= self.cfg.rsi_oversold + 5:
-            buy_score += 3
-            buy_details["rsi"] = 3
-        elif rsi_val <= 50:
-            buy_score += 1
-            buy_details["rsi"] = 1
-        else:
-            buy_details["rsi"] = 0
-
-        # 4b. Bonus divergence haussière
-        if divergence == "BULLISH_DIVERGENCE":
-            buy_score += 2
-            buy_details["divergence"] = 2
-
-        # 5. Bollinger (0–4)
-        if price <= bb_lo:
-            s = 4 if not bb_squeeze else 2
-            buy_score += s
-            buy_details["bollinger"] = s
-        elif price <= bb_mid:
-            buy_score += 1
-            buy_details["bollinger"] = 1
-        else:
-            buy_details["bollinger"] = 0
-
-        # 6. Volume (0–3)
-        if vol_ratio >= self.cfg.volume_mult_min * 1.5:
-            buy_score += 3
-            buy_details["volume"] = 3
-        elif vol_ratio >= self.cfg.volume_mult_min:
-            buy_score += 2
-            buy_details["volume"] = 2
-        elif vol_ratio >= 1.0:
-            buy_score += 1
-            buy_details["volume"] = 1
-        else:
-            buy_details["volume"] = 0
-
-        # ─── SCORE SELL ───────────────────────────────────────────────────
-        sell_score = 0
-        sell_details: Dict[str, int] = {}
-
-        # 1. Tendance macro
-        if macro_bear:
-            s = 4
-            if len(ema_fast_1h) > 0 and len(ema_slow_1h) > 0 and ema_fast_1h[-1] < ema_slow_1h[-1]:
-                s += 3
-            sell_score += s
-            sell_details["macro"] = s
-        else:
-            sell_details["macro"] = 0
-
-        # 2. ADX
-        if adx_val >= self.cfg.adx_min and ndi > pdi:
-            s = min(6, int((adx_val - self.cfg.adx_min) / 5) + 3)
-            sell_score += s
-            sell_details["adx"] = s
-        elif adx_val >= self.cfg.adx_min * 0.8 and ndi > pdi:
-            sell_score += 2
-            sell_details["adx"] = 2
-        else:
-            sell_details["adx"] = 0
-
-        # 3. EMA Cross
-        if len(ema9) >= 2 and len(ema21) >= 2:
-            cross_dn = ema9[-1] < ema21[-1] and ema9[-2] >= ema21[-2]
-            below    = ema9[-1] < ema21[-1]
-            trend_ok = len(ema50) > 0 and ema21[-1] < ema50[-1]
-            if cross_dn:
-                sell_score += 5
-                sell_details["ema_cross"] = 5
-            elif below and trend_ok:
-                sell_score += 3
-                sell_details["ema_cross"] = 3
-            elif below:
-                sell_score += 1
-                sell_details["ema_cross"] = 1
-            else:
-                sell_details["ema_cross"] = 0
-        else:
-            sell_details["ema_cross"] = 0
-
-        # 4. RSI
-        if self.cfg.rsi_overbought <= rsi_val <= self.cfg.rsi_extreme_high:
-            sell_score += 5
-            sell_details["rsi"] = 5
-        elif rsi_val >= self.cfg.rsi_overbought - 5:
-            sell_score += 3
-            sell_details["rsi"] = 3
-        elif rsi_val >= 50:
-            sell_score += 1
-            sell_details["rsi"] = 1
-        else:
-            sell_details["rsi"] = 0
-
-        # 4b. Bonus divergence baissière
-        if divergence == "BEARISH_DIVERGENCE":
-            sell_score += 2
-            sell_details["divergence"] = 2
-
-        # 5. Bollinger
-        if price >= bb_up:
-            s = 4 if not bb_squeeze else 2
-            sell_score += s
-            sell_details["bollinger"] = s
-        elif price >= bb_mid:
-            sell_score += 1
-            sell_details["bollinger"] = 1
-        else:
-            sell_details["bollinger"] = 0
-
-        # 6. Volume
-        if vol_ratio >= self.cfg.volume_mult_min * 1.5:
-            sell_score += 3
-            sell_details["volume"] = 3
-        elif vol_ratio >= self.cfg.volume_mult_min:
-            sell_score += 2
-            sell_details["volume"] = 2
-        elif vol_ratio >= 1.0:
-            sell_score += 1
-            sell_details["volume"] = 1
-        else:
-            sell_details["volume"] = 0
-
-        # ─── FILTRE ANTI-FAKEOUT ─────────────────────────────────────────
-        # Si le marché est en range et l'ADX est faible → diviser le score par 2
-        if regime == MarketRegime.RANGING and adx_val < 18:
-            buy_score  = buy_score // 2
-            sell_score = sell_score // 2
-
-        # Si volatilité extrême → pénaliser
-        if regime == MarketRegime.VOLATILE:
-            buy_score  = int(buy_score * 0.7)
-            sell_score = int(sell_score * 0.7)
-
-        # ─── DÉCISION ────────────────────────────────────────────────────
-        details = {}
-        if buy_score >= self.cfg.score_min and buy_score > sell_score:
-            details = buy_details
-            details["total"] = buy_score
-            details["rsi_val"] = round(rsi_val, 1)
-            details["adx_val"] = round(adx_val, 1)
-            details["vol_ratio"] = round(vol_ratio, 2)
-            details["regime"] = regime.value
-            return Signal.BUY, buy_score, details, regime
-
-        if sell_score >= self.cfg.score_min and sell_score > buy_score:
-            details = sell_details
-            details["total"] = sell_score
-            details["rsi_val"] = round(rsi_val, 1)
-            details["adx_val"] = round(adx_val, 1)
-            details["vol_ratio"] = round(vol_ratio, 2)
-            details["regime"] = regime.value
-            return Signal.SELL, sell_score, details, regime
-
-        return Signal.NONE, max(buy_score, sell_score), {}, regime
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  GESTIONNAIRE DE RISQUE
-# ─────────────────────────────────────────────────────────────────────────────
-class RiskManager:
-    """Gère le capital, les drawdowns, le trailing stop et le kill switch."""
-
-    def __init__(self, cfg: BotConfig):
-        self.cfg = cfg
-        self.capital = cfg.initial_capital
-        self.daily_pnl = 0.0
-        self.peak_capital = cfg.initial_capital
-        self.trades_today = 0
-        self.killed = False
-        self.kill_reason = ""
-        self._last_reset = datetime.now(timezone.utc).date()
-
-    def reset_daily(self):
-        today = datetime.now(timezone.utc).date()
-        if today != self._last_reset:
-            log.info(f"[RISK] Réinitialisation journalière | PnL hier : {self.daily_pnl:+.2f}€")
-            self.daily_pnl = 0.0
-            self.trades_today = 0
-            self._last_reset = today
-            # Kill switch journalier reset (seul le drawdown général reste)
-            if self.killed and "journalier" in self.kill_reason:
-                self.killed = False
-                self.kill_reason = ""
-                log.info("[RISK] Kill switch journalier levé pour nouveau jour.")
-
-    def check_kill_switch(self) -> bool:
-        self.reset_daily()
-        # Kill switch journalier
-        if self.daily_pnl <= self.cfg.daily_kill_eur:
-            self.killed = True
-            self.kill_reason = f"perte journalière {self.daily_pnl:.2f}€ ≤ {self.cfg.daily_kill_eur}€"
-            return True
-        # Drawdown global
-        drawdown_pct = (self.peak_capital - self.capital) / self.peak_capital * 100
-        if drawdown_pct >= self.cfg.max_drawdown_pct:
-            self.killed = True
-            self.kill_reason = f"drawdown global {drawdown_pct:.1f}% ≥ {self.cfg.max_drawdown_pct}%"
-            return True
-        return False
-
-    def register_pnl(self, pnl: float):
-        self.capital    += pnl
-        self.daily_pnl  += pnl
-        self.peak_capital = max(self.peak_capital, self.capital)
-        self.trades_today += 1
-
-    def kelly_stake(self, win_rate: float, win_pct: float, loss_pct: float) -> float:
-        """Fraction Kelly conservatrice pour dimensionner la mise."""
-        if loss_pct == 0:
-            return self.cfg.stake_eur
-        b = win_pct / loss_pct
-        kelly = (b * win_rate - (1 - win_rate)) / b
-        kelly = max(0, kelly) * self.cfg.kelly_fraction
-        stake = self.capital * kelly
-        return max(10.0, min(stake, self.cfg.stake_eur))
-
-    def update_trailing_stop(self, trade: Trade, current_price: float) -> Optional[float]:
-        """Met à jour le trailing stop. Retourne le nouveau stop ou None."""
-        if trade.trailing_stop is None:
-            # Initialiser si on a atteint le seuil de déclenchement
-            if trade.side == Signal.BUY:
-                pct_gain = (current_price - trade.entry_price) / trade.entry_price * 100 * trade.leverage
-                if pct_gain >= self.cfg.trailing_start:
-                    stop = current_price * (1 - self.cfg.trailing_step / 100 / trade.leverage)
-                    trade.trailing_stop = stop
-                    trade.peak_price = current_price
-                    log.info(f"[TRAILING] {trade.market} Trailing stop activé @ {stop:.6f}")
-                    return stop
-            else:
-                pct_gain = (trade.entry_price - current_price) / trade.entry_price * 100 * trade.leverage
-                if pct_gain >= self.cfg.trailing_start:
-                    stop = current_price * (1 + self.cfg.trailing_step / 100 / trade.leverage)
-                    trade.trailing_stop = stop
-                    trade.peak_price = current_price
-                    log.info(f"[TRAILING] {trade.market} Trailing stop activé @ {stop:.6f}")
-                    return stop
-        else:
-            # Mise à jour du pic et déplacement du stop
-            if trade.side == Signal.BUY and current_price > (trade.peak_price or 0):
-                trade.peak_price = current_price
-                new_stop = current_price * (1 - self.cfg.trailing_step / 100 / trade.leverage)
-                if new_stop > trade.trailing_stop:
-                    trade.trailing_stop = new_stop
-                    return new_stop
-            elif trade.side == Signal.SELL and current_price < (trade.peak_price or float("inf")):
-                trade.peak_price = current_price
-                new_stop = current_price * (1 + self.cfg.trailing_step / 100 / trade.leverage)
-                if new_stop < trade.trailing_stop:
-                    trade.trailing_stop = new_stop
-                    return new_stop
-        return trade.trailing_stop
-
-    def should_exit(self, trade: Trade, current_price: float) -> Tuple[bool, str]:
-        """Vérifie si un trade doit être fermé."""
-        # Mise à jour trailing
-        self.update_trailing_stop(trade, current_price)
-
-        if trade.side == Signal.BUY:
-            if current_price >= trade.target_price():
-                return True, "TARGET"
-            if current_price <= trade.stoploss_price():
-                return True, "STOPLOSS"
-            if trade.trailing_stop and current_price <= trade.trailing_stop:
-                return True, "TRAILING_STOP"
-        else:
-            if current_price <= trade.target_price():
-                return True, "TARGET"
-            if current_price >= trade.stoploss_price():
-                return True, "STOPLOSS"
-            if trade.trailing_stop and current_price >= trade.trailing_stop:
-                return True, "TRAILING_STOP"
-        return False, ""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  CLIENT KRAKEN (source de prix)
-# ─────────────────────────────────────────────────────────────────────────────
-class KrakenClient:
-    """Récupère les bougies OHLCV via l'API REST Kraken."""
-
-    BASE_URL = "https://api.kraken.com/0/public"
-
-    # Mapping des symboles Kraken → Binance
-    SYMBOL_MAP = {
-        "XBT/USDT": "XBTUSDT",
-        "ETH/USDT": "ETHUSDT",
-        "SOL/USDT": "SOLUSDT",
-        "BNB/USDT": "BNBUSDT",
-        "XRP/USDT": "XRPUSDT",
-        "AVAX/USDT": "AVAXUSDT",
-        "LINK/USDT": "LINKUSDT",
-        "ADA/USDT": "ADAUSDT",
-        "DOT/USDT": "DOTUSDT",
-        "DOGE/USDT": "DOGEUSDT",
-        "MATIC/USDT": "MATICUSDT",
-        "ATOM/USDT": "ATOMUSDT",
-        "NEAR/USDT": "NEARUSDT",
-        "APT/USDT": "APTUSDT",
-        "OP/USDT": "OPUSDT",
-    }
-
-    def __init__(self, timeout: int = 10):
-        self.timeout = aiohttp.ClientTimeout(total=timeout)
-        self._session: Optional[aiohttp.ClientSession] = None
-
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=self.timeout)
-        return self._session
-
-    async def close(self):
-        if self._session and not self._session.closed:
-            await self._session.close()
-
-    def _kraken_pair(self, market: str) -> str:
-        return self.SYMBOL_MAP.get(market, market.replace("/", ""))
-
-    async def fetch_ohlcv(self, market: str, interval_min: int, count: int = 200) -> List[Candle]:
-        """
-        Récupère `count` bougies OHLCV pour `market` avec l'intervalle donné.
-        interval_min : 1, 5, 15, 30, 60, 240, 1440, 10080, 21600
-        """
-        pair = self._kraken_pair(market)
-        url  = f"{self.BASE_URL}/OHLC"
-        params = {"pair": pair, "interval": interval_min}
-
-        try:
-            session = await self._get_session()
-            async with session.get(url, params=params) as resp:
-                if resp.status != 200:
-                    log.warning(f"[KRAKEN] HTTP {resp.status} pour {market}")
-                    return []
-                data = await resp.json()
-
-            if data.get("error"):
-                log.warning(f"[KRAKEN] Erreur API {market}: {data['error']}")
-                return []
-
-            result_key = [k for k in data["result"] if k != "last"]
-            if not result_key:
-                return []
-
-            raw = data["result"][result_key[0]]
-            candles = [
-                Candle(
-                    timestamp=int(row[0]),
-                    open=float(row[1]),
-                    high=float(row[2]),
-                    low=float(row[3]),
-                    close=float(row[4]),
-                    volume=float(row[6]),
-                )
-                for row in raw
-            ]
-            return candles[-count:]
-
-        except asyncio.TimeoutError:
-            log.warning(f"[KRAKEN] Timeout pour {market}")
-            return []
-        except Exception as e:
-            log.error(f"[KRAKEN] Exception {market}: {e}")
-            return []
-
-    async def fetch_ticker(self, market: str) -> Optional[float]:
-        """Prix actuel du marché."""
-        pair = self._kraken_pair(market)
-        url  = f"{self.BASE_URL}/Ticker"
-        try:
-            session = await self._get_session()
-            async with session.get(url, params={"pair": pair}) as resp:
-                data = await resp.json()
+# ═══════════════════════════════════════════════════════════════
+#  DONNÉES MARCHÉ
+# ═══════════════════════════════════════════════════════════════
+async def get_klines(session, symbole, interval=15, limite=50):
+    kraken_symbol = KRAKEN_SYMBOLS.get(symbole, symbole)
+    url = "https://api.kraken.com/0/public/OHLC"
+    try:
+        async with session.get(
+            url,
+            params={"pair": kraken_symbol, "interval": interval},
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
+            data = await resp.json()
             if data.get("error"):
                 return None
-            result_key = list(data["result"].keys())[0]
-            return float(data["result"][result_key]["c"][0])
-        except Exception:
-            return None
+            result = data.get("result", {})
+            keys = [k for k in result.keys() if k != "last"]
+            if not keys:
+                return None
+            candles = result[keys[0]]
+            df = pd.DataFrame(candles, columns=[
+                'time','open','high','low','close','vwap','volume','count'
+            ])
+            df = df.astype({
+                'open': float, 'high': float, 'low': float,
+                'close': float, 'volume': float
+            })
+            return df.tail(limite).reset_index(drop=True)
+    except Exception as e:
+        log.error(f"Erreur klines {symbole} : {e}")
+        return None
 
+async def get_prix_actuel(session, symbole):
+    kraken_symbol = KRAKEN_SYMBOLS.get(symbole, symbole)
+    try:
+        async with session.get(
+            "https://api.kraken.com/0/public/Ticker",
+            params={"pair": kraken_symbol},
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+            if data.get("error") and data["error"]:
+                return None
+            result = data.get("result", {})
+            if not result:
+                return None
+            key = list(result.keys())[0]
+            return float(result[key]["c"][0])
+    except Exception as e:
+        log.error(f"Erreur prix {symbole} : {e}")
+        return None
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  STATISTIQUES & PERFORMANCE
-# ─────────────────────────────────────────────────────────────────────────────
-class PerformanceTracker:
-    """Suit et affiche les statistiques du bot en temps réel."""
+# ═══════════════════════════════════════════════════════════════
+#  INDICATEURS
+# ═══════════════════════════════════════════════════════════════
+def calc_atr(df, periode=14):
+    try:
+        val = AverageTrueRange(
+            high=df['high'], low=df['low'], close=df['close'], window=periode
+        ).average_true_range().iloc[-1]
+        return round(float(val), 8) if not pd.isna(val) else 0.0
+    except:
+        return 0.0
 
-    def __init__(self, cfg: BotConfig):
-        self.cfg = cfg
-        self.all_trades: List[Trade] = []
-        self.pnl_history: deque = deque(maxlen=500)
-        self.win_streak: int = 0
-        self.loss_streak: int = 0
-        self.max_win_streak: int = 0
-        self.max_loss_streak: int = 0
-        self.start_time = datetime.now(timezone.utc)
+def calc_volume_ratio(df):
+    """Ratio bougie fermée vs moyenne 24h."""
+    try:
+        volumes = df['volume'].tolist()
+        if len(volumes) < 10:
+            return 0.0
+        moyenne = sum(volumes[-25:-1]) / 24
+        recent  = volumes[-2]
+        return round(recent / moyenne, 2) if moyenne > 0 else 0.0
+    except:
+        return 0.0
 
-    def record(self, trade: Trade):
-        self.all_trades.append(trade)
-        self.pnl_history.append(trade.pnl_eur)
-        if trade.pnl_eur > 0:
-            self.win_streak  += 1
-            self.loss_streak  = 0
-            self.max_win_streak = max(self.max_win_streak, self.win_streak)
+def calc_rsi_1h(df, periode=14):
+    """Calcule le RSI sur les bougies 1h."""
+    try:
+        val = RSIIndicator(close=df['close'], window=periode).rsi().iloc[-1]
+        return round(float(val), 2) if not pd.isna(val) else 50.0
+    except:
+        return 50.0
+
+# ═══════════════════════════════════════════════════════════════
+#  DÉTECTION SIGNAL — SURVEILLANCE TEMPS RÉEL
+#  1. Prix de référence enregistré au démarrage
+#  2. Dès que variation ≥ 0.50% → signal
+#  3. Filtre volume > 0.25x
+# ═══════════════════════════════════════════════════════════════
+async def analyser_marche(session, symbole):
+    prix_actuel = await get_prix_actuel(session, symbole)
+    if prix_actuel is None:
+        return "NEUTRE", {}
+
+    if symbole not in prix_reference:
+        prix_reference[symbole] = prix_actuel
+        log.info(f"  {symbole} : prix référence enregistré @ {prix_actuel}")
+        return "NEUTRE", {}
+
+    prix_ref = prix_reference[symbole]
+    if prix_ref <= 0:
+        prix_reference[symbole] = prix_actuel
+        return "NEUTRE", {}
+
+    variation_pct = (prix_actuel - prix_ref) / prix_ref * 100
+
+    df_15m    = await get_klines(session, symbole, interval=15, limite=50)
+    df_1h     = await get_klines(session, symbole, interval=60, limite=50)
+    vol_ratio = 0.0
+    atr_val   = 0.0
+    rsi_1h    = 50.0
+    if df_15m is not None and len(df_15m) >= 15:
+        vol_ratio = calc_volume_ratio(df_15m)
+        atr_val   = calc_atr(df_15m)
+    if df_1h is not None and len(df_1h) >= 20:
+        rsi_1h = calc_rsi_1h(df_1h, RSI_PERIODE)
+
+    if vol_ratio < VOLUME_MINI:
+        log.info(f"  {symbole} : Vol {vol_ratio:.2f}x | Variation={variation_pct:+.2f}% → skip")
+        return "NEUTRE", {}
+
+    details = {
+        "atr":           atr_val,
+        "vol_ratio":     vol_ratio,
+        "rsi_1h":        rsi_1h,
+        "variation_pct": abs(variation_pct),
+        "prix_ref":      prix_ref,
+        "prix_actuel":   prix_actuel,
+    }
+
+    if variation_pct <= -SEUIL_MOUVEMENT_PCT:
+        if rsi_1h < RSI_SEUIL_BAS:
+            # Marché baissier → inverser ACHAT en VENTE
+            log.info(f"  {symbole} 🔄 ACHAT→VENTE | RSI={rsi_1h} < {RSI_SEUIL_BAS} | Vol={vol_ratio:.2f}x")
+            prix_reference[symbole] = prix_actuel
+            return "VENTE", details
         else:
-            self.loss_streak += 1
-            self.win_streak   = 0
-            self.max_loss_streak = max(self.max_loss_streak, self.loss_streak)
+            log.info(f"  {symbole} ✅ ACHAT | Chute={variation_pct:.2f}% | RSI={rsi_1h} | Vol={vol_ratio:.2f}x")
+            prix_reference[symbole] = prix_actuel
+            return "ACHAT", details
 
-    @property
-    def total_trades(self) -> int:
-        return len(self.all_trades)
+    if variation_pct >= SEUIL_MOUVEMENT_PCT:
+        if rsi_1h > RSI_SEUIL_HAUT:
+            # Marché haussier → inverser VENTE en ACHAT
+            log.info(f"  {symbole} 🔄 VENTE→ACHAT | RSI={rsi_1h} > {RSI_SEUIL_HAUT} | Vol={vol_ratio:.2f}x")
+            prix_reference[symbole] = prix_actuel
+            return "ACHAT", details
+        else:
+            log.info(f"  {symbole} ✅ VENTE | Montée={variation_pct:.2f}% | RSI={rsi_1h} | Vol={vol_ratio:.2f}x")
+            prix_reference[symbole] = prix_actuel
+            return "VENTE", details
 
-    @property
-    def winning_trades(self) -> int:
-        return sum(1 for t in self.all_trades if t.pnl_eur > 0)
+    log.info(f"  {symbole} : Variation={variation_pct:+.2f}% | RSI={rsi_1h} (seuil ±{SEUIL_MOUVEMENT_PCT}%)")
+    return "NEUTRE", {}
 
-    @property
-    def win_rate(self) -> float:
-        if not self.total_trades:
-            return 0.0
-        return self.winning_trades / self.total_trades * 100
+# ═══════════════════════════════════════════════════════════════
+#  GESTION MISE DYNAMIQUE
+# ═══════════════════════════════════════════════════════════════
+def calculer_mise(capital, etat, multiplicateur_session=1.0):
+    nb_trades     = etat.get("nb_trades", 0)
+    nb_wins       = etat.get("nb_wins", 0)
+    wins_consec   = etat.get("wins_consecutifs", 0)
+    pertes_consec = etat.get("pertes_consecutives", 0)
+    avg_win_pct   = etat.get("avg_win_pct", 0)
+    avg_loss_pct  = etat.get("avg_loss_pct", 0)
 
-    @property
-    def total_pnl(self) -> float:
-        return sum(t.pnl_eur for t in self.all_trades)
+    mise = capital * MISE_BASE_PCT
 
-    @property
-    def avg_win(self) -> float:
-        wins = [t.pnl_eur for t in self.all_trades if t.pnl_eur > 0]
-        return sum(wins) / len(wins) if wins else 0.0
+    if nb_trades >= MIN_TRADES_KELLY and avg_loss_pct > 0 and avg_win_pct > 0:
+        win_rate   = nb_wins / nb_trades
+        b          = avg_win_pct / avg_loss_pct
+        kelly_full = (win_rate * b - (1 - win_rate)) / b
+        kelly_frac = max(0, min(kelly_full * KELLY_FRACTION, KELLY_CAP))
+        mise       = capital * kelly_frac
 
-    @property
-    def avg_loss(self) -> float:
-        losses = [t.pnl_eur for t in self.all_trades if t.pnl_eur < 0]
-        return sum(losses) / len(losses) if losses else 0.0
+    if pertes_consec >= 2:
+        mise *= REDUCTION_PERTES
+        log.info(f"  ⚠️ Mise réduite 50% ({pertes_consec} pertes)")
+    elif wins_consec >= WINS_CONFIANCE:
+        mise *= BOOST_CONFIANCE
+        log.info(f"  💪 Mise boostée +20% ({wins_consec} wins)")
 
-    @property
-    def profit_factor(self) -> float:
-        gross_win  = sum(t.pnl_eur for t in self.all_trades if t.pnl_eur > 0)
-        gross_loss = abs(sum(t.pnl_eur for t in self.all_trades if t.pnl_eur < 0))
-        return gross_win / gross_loss if gross_loss else float("inf")
+    mise *= multiplicateur_session
+    mise  = max(mise, MISE_MIN)
+    mise  = min(mise, capital * MISE_MAX_PCT)
+    return round(mise, 2)
 
-    def sharpe_ratio(self) -> float:
-        if len(self.pnl_history) < 10:
-            return 0.0
-        pnls = list(self.pnl_history)
-        mean = sum(pnls) / len(pnls)
-        std  = statistics.stdev(pnls) if len(pnls) > 1 else 1
-        return (mean / std) * math.sqrt(252) if std else 0.0
+# ═══════════════════════════════════════════════════════════════
+#  EXÉCUTION D'UN TRADE
+# ═══════════════════════════════════════════════════════════════
+async def executer_trade(session, symbole, direction, capital, details, etat, etat_global):
+    prix_entree = await get_prix_actuel(session, symbole)
+    if prix_entree is None:
+        async with trades_lock:
+            trades_ouverts.pop(symbole, None)
+        return "ERREUR", 0, 0, {}
 
-    def print_dashboard(self, capital: float, daily_pnl: float, open_trades: int):
-        uptime = datetime.now(timezone.utc) - self.start_time
-        hours, rem = divmod(int(uptime.total_seconds()), 3600)
-        mins  = rem // 60
+    mise = calculer_mise(capital, etat)
 
-        bar = "═" * 65
-        print(f"\n{bar}")
-        print(f"  ⚡ QUANTUM EDGE — TABLEAU DE BORD")
-        print(f"  Uptime : {hours}h{mins:02d}m  |  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC")
-        print(bar)
-        print(f"  💰 Capital         : {capital:>10.2f} €  (départ: {self.cfg.initial_capital:.2f}€)")
-        print(f"  📈 PnL total       : {self.total_pnl:>+10.2f} €")
-        print(f"  📅 PnL journalier  : {daily_pnl:>+10.2f} €")
-        print(f"  🔓 Trades ouverts  : {open_trades}")
-        print(bar)
-        print(f"  📊 Trades total    : {self.total_trades}")
-        print(f"  ✅ Win rate        : {self.win_rate:>6.1f}%")
-        print(f"  💚 Gain moyen      : {self.avg_win:>+8.2f} €")
-        print(f"  🔴 Perte moyenne   : {self.avg_loss:>+8.2f} €")
-        print(f"  🏆 Profit Factor   : {self.profit_factor:>8.2f}")
-        print(f"  📐 Sharpe Ratio    : {self.sharpe_ratio():>8.2f}")
-        print(f"  🔥 Best streak     : {self.max_win_streak} wins  |  {self.max_loss_streak} losses max")
-        print(bar)
+    # Stop loss proportionnel au capital — 2% du capital
+    # Plafonné à 50% de la mise pour éviter un stop trop large
+    stop_loss_eur = round(capital * STOP_LOSS_PCT / 100, 2)
+    stop_loss_max_mise = round(mise * STOP_LOSS_MISE_MAX_PCT, 2)
+    if stop_loss_eur > stop_loss_max_mise:
+        stop_loss_eur = stop_loss_max_mise
+        log.info(f"  ⚠️ Stop plafonné à 50% mise : -{stop_loss_eur}€")
 
-    def print_trade_closed(self, trade: Trade, reason: str):
-        icon = "✅" if trade.pnl_eur > 0 else "❌"
-        duration = (trade.exit_time - trade.entry_time).seconds // 60 if trade.exit_time else 0
-        print(
-            f"\n  {icon} TRADE FERMÉ  {trade.market:<12} "
-            f"{trade.side.value:<4}  "
-            f"Entrée:{trade.entry_price:.6f}  "
-            f"Sortie:{trade.exit_price:.6f}  "
-            f"PnL:{trade.pnl_eur:>+7.2f}€  "
-            f"({reason})  "
-            f"Score:{trade.score}  "
-            f"Durée:{duration}min"
-        )
+    rsi_1h        = details.get("rsi_1h", 50.0)
+    session_label = get_session_marche(symbole)
 
+    # Stop loss initial
+    if direction == "ACHAT":
+        stop_initial   = round(prix_entree * (1 - stop_loss_eur / (mise * LEVIER)), 8)
+        objectif_final = round(prix_entree * (1 + stop_loss_eur / (mise * LEVIER) * 2), 8)
+    else:
+        stop_initial   = round(prix_entree * (1 + stop_loss_eur / (mise * LEVIER)), 8)
+        objectif_final = round(prix_entree * (1 - stop_loss_eur / (mise * LEVIER) * 2), 8)
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  BOT PRINCIPAL
-# ─────────────────────────────────────────────────────────────────────────────
-class QuantumEdgeBot:
-    """
-    Orchestrateur principal.
+    # Numéro de trade sous lock
+    async with trades_lock:
+        etat_global["nb_trades"] = etat_global.get("nb_trades", 0) + 1
+        numero_trade = etat_global["nb_trades"]
 
-    Cycle de vie :
-    1. Fetch candles 15m + 1h pour chaque marché
-    2. Calculer le signal composite
-    3. Ouvrir un trade si score ≥ score_min et slots disponibles
-    4. Gérer les trades ouverts (trailing, target, SL)
-    5. Appliquer le kill switch
-    6. Afficher le dashboard toutes les N itérations
-    """
+    log.info(f"\n  {'='*55}")
+    log.info(f"  TRADE #{numero_trade} [VÉRONIQUE973 V4] — {datetime.now().strftime('%H:%M:%S')}")
+    log.info(f"  {symbole} ({direction})")
+    log.info(f"  Variation : {details.get('variation_pct', 0):.2f}% | "
+             f"Ref={details.get('prix_ref')} → {details.get('prix_actuel')}")
+    log.info(f"  Vol={details.get('vol_ratio', 0):.2f}x | RSI 1h={rsi_1h} | Stop : -{stop_loss_eur}€")
+    log.info(f"  Prix entrée : {prix_entree} | Stop : {stop_initial}")
+    log.info(f"  Mise : {mise}€ × x{LEVIER} = {round(mise*LEVIER,2)}€")
+    log.info(f"  Trades ouverts : {len(trades_ouverts)}/{MAX_TRADES_SIMULTANES}\n")
 
-    def __init__(self, cfg: BotConfig):
-        self.cfg     = cfg
-        self.kraken  = KrakenClient(timeout=cfg.candle_fetch_timeout)
-        self.engine  = SignalEngine(cfg)
-        self.risk    = RiskManager(cfg)
-        self.perf    = PerformanceTracker(cfg)
-        self.open_trades: Dict[str, Trade] = {}   # market → Trade
-        self.paused_until: Dict[str, float] = {}  # market → timestamp
-        self._iter   = 0
-        self._win_history: deque = deque(maxlen=50)  # pour Kelly dynamique
+    await telegram(session,
+        f"📊 <b>TRADE #{numero_trade} — VÉRONIQUE973 V4</b>\n"
+        f"{'🟢 ACHAT' if direction == 'ACHAT' else '🔴 VENTE'} {symbole}\n"
+        f"⏰ {session_label}\n"
+        f"Variation : {details.get('variation_pct', 0):.2f}% depuis ref\n"
+        f"Volume : {details.get('vol_ratio', 0):.2f}x | RSI 1h : {rsi_1h}\n"
+        f"Prix : {prix_entree} | Stop : {stop_initial}\n"
+        f"Mise : {mise}€ × x{LEVIER} | Stop max : -{stop_loss_eur}€\n"
+        f"Trades : {len(trades_ouverts)}/{MAX_TRADES_SIMULTANES}\n"
+        f"🎯 Lock paliers : {LOCK_PALIERS_PCT[:4]}%..."
+    )
 
-    # ── Propriétés de commodité
-    @property
-    def _win_rate_recent(self) -> float:
-        if not self._win_history:
-            return 0.55  # prior conservateur
-        return sum(self._win_history) / len(self._win_history)
+    debut             = time.time()
+    dernier_log       = 0
+    prix_sortie       = prix_entree
+    pnl_max_atteint   = 0.0
+    lock_actuel       = 0.0    # gain garanti actuellement
+    resultat_final    = None
+    gain_final        = 0.0
 
-    # ── Ouverture d'un trade
-    def _open_trade(self, market: str, signal: Signal, price: float, score: int, regime: MarketRegime) -> Trade:
-        # Dimensionnement Kelly
-        stake = self.risk.kelly_stake(
-            win_rate = self._win_rate_recent,
-            win_pct  = self.cfg.target_pct / 100,
-            loss_pct = self.cfg.stoploss_pct / 100,
-        )
-        trade = Trade(
-            market      = market,
-            side        = signal,
-            entry_price = price,
-            stake       = stake,
-            leverage    = self.cfg.leverage,
-            entry_time  = datetime.now(timezone.utc),
-            score       = score,
-            regime      = regime,
-        )
-        self.open_trades[market] = trade
-        log.info(
-            f"[OPEN]  {market:<12} {signal.value:<4} "
-            f"@ {price:.6f}  "
-            f"mise={stake:.2f}€  "
-            f"score={score}/30  "
-            f"régime={regime.value}  "
-            f"target={trade.target_price():.6f}  "
-            f"SL={trade.stoploss_price():.6f}"
-        )
-        return trade
+    while True:
+        await asyncio.sleep(CHECK_INTERVAL)
+        prix_actuel = await get_prix_actuel(session, symbole)
+        if prix_actuel is None:
+            continue
 
-    # ── Fermeture d'un trade
-    def _close_trade(self, market: str, price: float, reason: str):
-        trade = self.open_trades.pop(market)
-        trade.exit_price = price
-        trade.exit_time  = datetime.now(timezone.utc)
-        trade.state      = TradeState.CLOSED
-        trade.pnl_eur    = trade.unrealized_pnl(price)
+        prix_sortie = prix_actuel
 
-        self.risk.register_pnl(trade.pnl_eur)
-        self.perf.record(trade)
-        self._win_history.append(1 if trade.pnl_eur > 0 else 0)
-        self.paused_until[market] = time.time() + self.cfg.pause_after_trade
+        # ── Calcul PnL
+        if direction == "ACHAT":
+            pnl = round((prix_actuel - prix_entree) / prix_entree * mise * LEVIER, 2)
+        else:
+            pnl = round((prix_entree - prix_actuel) / prix_entree * mise * LEVIER, 2)
 
-        self.perf.print_trade_closed(trade, reason)
+        if pnl > pnl_max_atteint:
+            pnl_max_atteint = pnl
 
-        if self.cfg.simulation_mode:
-            log.info(
-                f"[SIM]   Capital simulé : {self.risk.capital:.2f}€  "
-                f"| PnL journalier : {self.risk.daily_pnl:+.2f}€"
+        # ── Lock paliers — gain garanti progressif basé sur le capital
+        nouveau_lock = get_palier_lock(pnl_max_atteint, capital)
+        if nouveau_lock > lock_actuel:
+            lock_actuel = nouveau_lock
+            log.info(f"  🔒 LOCK {lock_actuel}€ GARANTI [{symbole}] "
+                     f"(PnL max={pnl_max_atteint:.2f}€)")
+            await telegram(session,
+                f"🔒 <b>{lock_actuel}€ garanti !</b>\n"
+                f"{symbole} | PnL max : +{pnl_max_atteint:.2f}€\n"
+                f"Gain verrouillé ✅"
             )
 
-    # ── Cycle principal pour un marché
-    async def _process_market(self, market: str):
-        # Vérifier pause post-trade
-        if market in self.paused_until and time.time() < self.paused_until[market]:
-            return
-
-        # Fetch candles
-        candles_15m = await self.kraken.fetch_ohlcv(market, self.cfg.tf_primary, self.cfg.candles_required)
-        candles_1h  = await self.kraken.fetch_ohlcv(market, self.cfg.tf_confirmation, self.cfg.candles_required)
-
-        if len(candles_15m) < 50 or len(candles_1h) < 50:
-            log.debug(f"[{market}] Données insuffisantes ({len(candles_15m)} bougie(s) 15m)")
-            return
-
-        price = candles_15m[-1].close
-
-        # ── Gestion des trades ouverts
-        if market in self.open_trades:
-            trade = self.open_trades[market]
-            should_exit, reason = self.risk.should_exit(trade, price)
-            if should_exit:
-                self._close_trade(market, price, reason)
-            return  # un seul trade par marché
-
-        # ── Slots disponibles ?
-        if len(self.open_trades) >= self.cfg.max_open_trades:
-            return
-
-        # ── Calcul du signal
-        signal, score, details, regime = self.engine.compute(candles_15m, candles_1h)
-
-        if signal != Signal.NONE:
-            log.info(
-                f"[SIGNAL] {market:<12} {signal.value:<4} "
-                f"score={score}/30  "
-                f"RSI={details.get('rsi_val')}  "
-                f"ADX={details.get('adx_val')}  "
-                f"Vol={details.get('vol_ratio')}x  "
-                f"régime={details.get('regime')}"
+        # ── Sortie lock : PnL redescend sous le dernier palier atteint
+        if lock_actuel > 0 and pnl < lock_actuel and pnl_max_atteint >= lock_actuel:
+            duree = int((time.time() - debut) / 60)
+            log.info(f"\n  🔒 SORTIE LOCK [{symbole}] +{lock_actuel}€ "
+                     f"(max={pnl_max_atteint:.2f}€) | {duree}min")
+            await telegram(session,
+                f"🔒 <b>SORTIE LOCK</b>\n"
+                f"{symbole} | {get_session_marche(symbole)}\n"
+                f"{direction}\n"
+                f"Gain : <b>+{lock_actuel}€</b>\n"
+                f"PnL max : +{pnl_max_atteint:.2f}€\n"
+                f"Durée : {duree} min"
             )
-            self._open_trade(market, signal, price, score, regime)
+            resultat_final = "GAGNE"
+            gain_final     = lock_actuel
+            break
 
-    # ── Boucle principale
-    async def run(self):
-        mode = "🔴 SIMULATION" if self.cfg.simulation_mode else "🟢 LIVE"
-        log.info(f"╔══ QUANTUM EDGE démarré — Mode : {mode} ══╗")
-        log.info(f"║  Marchés : {len(self.cfg.markets)}  |  Capital : {self.cfg.initial_capital}€  |  Levier : x{self.cfg.leverage}")
-        log.info(f"║  Score min : {self.cfg.score_min}/30  |  Target : +{self.cfg.target_pct}%  |  SL : -{self.cfg.stoploss_pct}%")
-        log.info(f"╚{'═'*50}╝\n")
+        # ── Stop loss initial — protection max -2% du capital
+        atteint_stop = (prix_actuel <= stop_initial if direction == "ACHAT"
+                        else prix_actuel >= stop_initial)
 
-        try:
-            while True:
-                self._iter += 1
-                self.risk.reset_daily()
+        duree = int((time.time() - debut) / 60)
 
-                # Kill switch
-                if self.risk.killed:
-                    log.warning(f"[KILL] Bot suspendu : {self.risk.kill_reason}")
+        if time.time() - dernier_log >= 60:
+            lock_flag = f" 🔒{lock_actuel}€" if lock_actuel > 0 else ""
+            log.info(f"  [{datetime.now().strftime('%H:%M:%S')}] {symbole} {prix_actuel} | "
+                     f"PnL {'+' if pnl>=0 else ''}{pnl:.2f}€{lock_flag} | {duree}min")
+            dernier_log = time.time()
+
+        trade_info = {
+            "prix_entree":   prix_entree,
+            "prix_sortie":   prix_sortie,
+            "stop_loss":     stop_initial,
+            "objectif":      objectif_final,
+            "duree_minutes": duree
+        }
+
+        if atteint_stop:
+            resultat_final = "GAGNE" if pnl > 0 else "PERDU"
+            log.info(f"\n  🛑 STOP [{symbole}] "
+                     f"{'+' if pnl>=0 else ''}{pnl:.2f}€ | {duree}min")
+            await telegram(session,
+                f"🛑 <b>STOP</b>\n"
+                f"{symbole} {direction}\n"
+                f"Résultat : {'+' if pnl>=0 else ''}{pnl:.2f}€\n"
+                f"Durée : {duree} min"
+            )
+            gain_final = pnl
+            break
+
+        if time.time() - debut >= TIMEOUT_TRADE:
+            resultat_final = "GAGNE" if pnl > 0 else "PERDU"
+            log.info(f"\n  ⏱ TIMEOUT [{symbole}] {'+' if pnl>=0 else ''}{pnl:.2f}€")
+            await telegram(session,
+                f"⏱ <b>TIMEOUT</b>\n{symbole} {'+' if pnl>=0 else ''}{pnl:.2f}€\nDurée : {duree} min"
+            )
+            gain_final = pnl
+            break
+
+    # Libérer le marché
+    # Cooldown 12h uniquement si trade perdu ou timeout négatif
+    async with trades_lock:
+        trades_ouverts.pop(symbole, None)
+        if resultat_final == "PERDU" or (resultat_final != "GAGNE" and gain_final < 0):
+            cooldown_marches[symbole] = time.time() + COOLDOWN_APRES_PERTE
+            log.info(f"  ❄️ Cooldown 12h [{symbole}] — marché en pause jusqu'à demain")
+        else:
+            cooldown_marches.pop(symbole, None)
+            log.info(f"  ✅ [{symbole}] libéré immédiatement — trade gagnant")
+
+    # Mettre à jour l'état global sous lock
+    async with trades_lock:
+        etat_global["capital"]   = round(etat_global["capital"] + gain_final, 2)
+        etat_global["cumul_net"] = round(etat_global["capital"] - CAPITAL_INITIAL, 2)
+        etat_global["pnl_jour"]  = round(etat_global.get("pnl_jour", 0) + gain_final, 2)
+
+        if resultat_final == "GAGNE":
+            etat_global["nb_wins"]             = etat_global.get("nb_wins", 0) + 1
+            etat_global["total_gagne"]         = round(etat_global.get("total_gagne", 0) + gain_final, 2)
+            etat_global["pertes_consecutives"] = 0
+            etat_global["wins_consecutifs"]    = etat_global.get("wins_consecutifs", 0) + 1
+            n        = etat_global["nb_wins"]
+            gain_pct = (gain_final / max(mise * LEVIER, 1)) * 100
+            etat_global["avg_win_pct"] = round(
+                (etat_global.get("avg_win_pct", 0) * (n - 1) + gain_pct) / n, 4
+            )
+        else:
+            etat_global["nb_losses"]           = etat_global.get("nb_losses", 0) + 1
+            etat_global["total_perdu"]         = round(etat_global.get("total_perdu", 0) + abs(gain_final), 2)
+            etat_global["pertes_consecutives"] = etat_global.get("pertes_consecutives", 0) + 1
+            etat_global["wins_consecutifs"]    = 0
+            n         = etat_global["nb_losses"]
+            perte_pct = (abs(gain_final) / max(mise * LEVIER, 1)) * 100
+            etat_global["avg_loss_pct"] = round(
+                (etat_global.get("avg_loss_pct", 0) * (n - 1) + perte_pct) / n, 4
+            )
+
+        etat_global.setdefault("historique", []).append({
+            'heure':     datetime.now().strftime('%Y-%m-%d %H:%M'),
+            'marche':    symbole,
+            'direction': direction,
+            'resultat':  resultat_final,
+            'gain':      round(gain_final, 2),
+            'mise':      round(mise, 2),
+            'capital':   etat_global["capital"]
+        })
+
+    enregistrer_trade({
+        'marche':        symbole,
+        'direction':     direction,
+        'resultat':      resultat_final,
+        'prix_entree':   trade_info['prix_entree'],
+        'prix_sortie':   trade_info['prix_sortie'],
+        'stop_loss':     trade_info['stop_loss'],
+        'objectif':      trade_info['objectif'],
+        'mise':          mise,
+        'gain':          round(gain_final, 2),
+        'capital_apres': etat_global['capital'],
+        'duree_minutes': trade_info['duree_minutes'],
+        'score':         None,
+        'adx':           None,
+        'atr':           None,
+        'rsi':           rsi_1h,
+    })
+    sauvegarder_etat(etat_global)
+    afficher_tableau_de_bord(etat_global)
+
+    # ── Rapport Telegram après chaque trade
+    nb_trades = etat_global.get("nb_trades", 0)
+    nb_wins   = etat_global.get("nb_wins", 0)
+    win_rate  = (nb_wins / nb_trades * 100) if nb_trades > 0 else 0
+    perf      = (etat_global["capital"] - CAPITAL_INITIAL) / CAPITAL_INITIAL * 100
+    await telegram(session,
+        f"📈 <b>RAPPORT VÉRONIQUE973</b>\n"
+        f"Capital : <b>{round(etat_global['capital'],2)}€</b> "
+        f"({'+' if perf>=0 else ''}{round(perf,2)}%)\n"
+        f"PnL jour : {'+' if etat_global.get('pnl_jour',0)>=0 else ''}"
+        f"{round(etat_global.get('pnl_jour',0),2)}€\n"
+        f"Trades : {nb_trades} | WR : {round(win_rate,1)}%\n"
+        f"Gagné : +{round(etat_global.get('total_gagne',0),2)}€ | "
+        f"Perdu : -{round(etat_global.get('total_perdu',0),2)}€\n"
+        f"<b>NET : {'+' if etat_global.get('cumul_net',0)>=0 else ''}"
+        f"{round(etat_global.get('cumul_net',0),2)}€</b>"
+    )
+
+    return resultat_final, gain_final, mise, trade_info
+
+# ═══════════════════════════════════════════════════════════════
+#  PROTECTIONS
+# ═══════════════════════════════════════════════════════════════
+def verifier_protections(etat, capital):
+    if capital < SEUIL_RUINE:
+        log.critical(f"🚨 SEUIL RUINE ! Capital {capital}€ → ARRÊT")
+        return "RUINE"
+    if etat.get("pnl_jour", 0.0) <= KILL_SWITCH_JOUR:
+        log.warning(f"⚠️ KILL SWITCH — PnL jour {etat.get('pnl_jour', 0)}€")
+        return "KILL_SWITCH"
+    cooldown_until = etat.get("cooldown_until", 0)
+    if time.time() < cooldown_until:
+        restant = int((cooldown_until - time.time()) / 60)
+        log.info(f"  ❄️ Cooldown — {restant} min restantes")
+        return "COOLDOWN"
+    if cooldown_until > 0 and time.time() >= cooldown_until:
+        etat["pertes_consecutives"] = 0
+        etat["cooldown_until"]      = 0
+        sauvegarder_etat(etat)
+    if etat.get("pertes_consecutives", 0) >= MAX_PERTES_CONSECUTIVES:
+        log.warning(f"  {MAX_PERTES_CONSECUTIVES} pertes → cooldown {COOLDOWN_PERTES//60} min")
+        etat["cooldown_until"]      = int(time.time()) + COOLDOWN_PERTES
+        etat["pertes_consecutives"] = 0
+        sauvegarder_etat(etat)
+        return "COOLDOWN"
+    return "OK"
+
+def reset_pnl_jour_si_nouveau_jour(etat):
+    aujourd_hui = datetime.now().strftime('%Y-%m-%d')
+    if etat.get("date_jour", "") != aujourd_hui:
+        etat["pnl_jour"]  = 0.0
+        etat["date_jour"] = aujourd_hui
+        log.info("  📅 Nouveau jour — PnL remis à 0")
+
+async def envoyer_rapport_quotidien(session, etat):
+    """
+    Envoie chaque jour à 21h Guyane (00h UTC) :
+    1. Graphique de la journée
+    2. Classement des marchés du jour avec gains et G/P
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import io
+
+    historique  = etat.get("historique", [])
+    aujourd_hui = datetime.now().strftime('%Y-%m-%d')
+    date_affich = datetime.now().strftime('%d/%m/%Y')
+
+    # ── Gains par marché aujourd'hui
+    gains_jour    = {}
+    wins_jour     = {}
+    pertes_jour   = {}
+
+    for h in historique:
+        if h.get("heure", "")[:10] == aujourd_hui:
+            marche   = h.get("marche", "?")
+            gain     = h.get("gain", 0)
+            resultat = h.get("resultat", "")
+            gains_jour[marche] = round(gains_jour.get(marche, 0) + gain, 2)
+            if resultat == "GAGNE":
+                wins_jour[marche]   = wins_jour.get(marche, 0) + 1
+            else:
+                pertes_jour[marche] = pertes_jour.get(marche, 0) + 1
+
+    # ── Graphique capital intraday
+    try:
+        capitaux_jour = []
+        heures_jour   = []
+        for h in historique:
+            if h.get("heure", "")[:10] == aujourd_hui:
+                heures_jour.append(h.get("heure", "")[11:16])
+                capitaux_jour.append(h.get("capital", etat["capital"]))
+
+        if len(capitaux_jour) >= 2:
+            fig, ax = plt.subplots(figsize=(10, 4))
+            fig.patch.set_facecolor('#1a1a2e')
+            ax.set_facecolor('#16213e')
+            ax.plot(range(len(capitaux_jour)), capitaux_jour,
+                    color='#e94560', linewidth=2.5,
+                    marker='o', markersize=5,
+                    markerfacecolor='white', markeredgecolor='#e94560')
+            ax.axhline(y=capitaux_jour[0], color='#ffffff',
+                       linewidth=1, linestyle='--', alpha=0.4)
+            ax.set_xticks(range(len(heures_jour)))
+            ax.set_xticklabels(heures_jour, color='#aaaaaa', fontsize=7, rotation=45)
+            ax.set_ylabel('Capital (€)', color='#aaaaaa', fontsize=9)
+            ax.tick_params(colors='#aaaaaa')
+            for spine in ax.spines.values():
+                spine.set_color('#333366')
+            ax.grid(True, alpha=0.1, color='#ffffff')
+            pnl_jour = round(etat.get("pnl_jour", 0), 2)
+            ax.set_title(
+                f'VERONIQUE973 V4 — Journee du {date_affich}\n'
+                f'PnL jour : {"+"+str(pnl_jour)+"€" if pnl_jour>=0 else str(pnl_jour)+"€"}'
+                f' | Capital : {etat["capital"]}€',
+                color='white', fontsize=11, fontweight='bold', pad=10)
+            plt.tight_layout(pad=1.5)
+
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=150,
+                        bbox_inches='tight', facecolor='#1a1a2e')
+            buf.seek(0)
+            plt.close()
+
+            if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+                url_photo = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+                form_data = aiohttp.FormData()
+                form_data.add_field('chat_id', TELEGRAM_CHAT_ID)
+                form_data.add_field('caption', f'Journee du {date_affich}')
+                form_data.add_field('photo', buf, filename='journee.png',
+                                    content_type='image/png')
+                await session.post(url_photo, data=form_data,
+                                   timeout=aiohttp.ClientTimeout(total=30))
+                log.info(f"  Graphique quotidien envoyé sur Telegram")
+
+    except Exception as e:
+        log.error(f"Erreur graphique quotidien : {e}")
+
+    # ── Rapport texte quotidien
+    if not gains_jour:
+        return
+
+    classement    = sorted(gains_jour.items(), key=lambda x: x[1], reverse=True)
+    total_jour    = round(sum(gains_jour.values()), 2)
+    nb_trades     = etat.get("nb_trades", 0)
+    nb_wins       = etat.get("nb_wins", 0)
+    win_rate      = (nb_wins / nb_trades * 100) if nb_trades > 0 else 0
+    perf          = (etat["capital"] - CAPITAL_INITIAL) / CAPITAL_INITIAL * 100
+
+    lignes = []
+    for marche, gain in classement:
+        emoji   = "✅" if gain >= 0 else "❌"
+        s_gain       = f"{'+' if gain>=0 else ''}{gain}€"
+        s_wl         = f"{wins_jour.get(marche,0)}G/{pertes_jour.get(marche,0)}P"
+        session_label = get_session_marche(marche)
+        lignes.append(f"{emoji} <code>{marche:<12} {s_gain:<10} {s_wl:<8} {session_label}</code>")
+
+    message = (
+        f"📊 <b>RAPPORT QUOTIDIEN VERONIQUE973</b>\n"
+        f"Journee du {date_affich}\n"
+        f"<code>{'─'*44}</code>\n"
+        f"<code>{'MARCHÉ':<12} {'GAINS':>8} {'G/P':<8} SESSION</code>\n"
+        f"<code>{'─'*44}</code>\n"
+        f"{chr(10).join(lignes)}\n"
+        f"<code>{'─'*44}</code>\n"
+        f"<b>Total jour : {'+' if total_jour>=0 else ''}{total_jour}€</b>\n"
+        f"Capital : {round(etat['capital'],2)}€ "
+        f"({'+' if perf>=0 else ''}{round(perf,2)}%)\n"
+        f"Trades : {nb_trades} | WR : {round(win_rate,1)}%"
+    )
+
+    log.info(f"  Envoi rapport quotidien Telegram")
+    await telegram(session, message)
+
+async def envoyer_rapport_hebdomadaire(session, etat):
+    """
+    Envoie chaque dimanche à 21h Guyane (00h UTC lundi) :
+    1. Le graphique de progression du capital sur 7 jours
+    2. Le classement des marchés semaine + total depuis début avec G/P
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import io
+    from datetime import timedelta
+
+    historique = etat.get("historique", [])
+    if not historique:
+        return
+
+    maintenant     = datetime.now()
+    il_y_a_7_jours = (maintenant - timedelta(days=7)).strftime('%Y-%m-%d')
+    date_debut     = (maintenant - timedelta(days=7)).strftime('%d/%m')
+    date_fin       = maintenant.strftime('%d/%m/%Y')
+
+    # ── Gains par marché sur 7 jours
+    gains_par_marche = {}
+    for h in historique:
+        if h.get("heure", "") >= il_y_a_7_jours:
+            marche = h.get("marche", "?")
+            gain   = h.get("gain", 0)
+            gains_par_marche[marche] = round(
+                gains_par_marche.get(marche, 0) + gain, 2
+            )
+
+    # ── Capital par jour sur 7 jours
+    capital_par_jour = {}
+    for h in historique:
+        if h.get("heure", "") >= il_y_a_7_jours:
+            jour = h.get("heure", "")[:10]
+            capital_par_jour[jour] = h.get("capital", etat["capital"])
+
+    jours_tries  = sorted(capital_par_jour.keys())
+    capitaux     = [capital_par_jour[j] for j in jours_tries]
+    labels_jours = [j[5:] for j in jours_tries]  # MM-DD
+
+    # ── Générer le graphique
+    try:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7),
+                                        gridspec_kw={'height_ratios': [3, 1]})
+        fig.patch.set_facecolor('#1a1a2e')
+
+        # Courbe capital
+        ax1.set_facecolor('#16213e')
+        if len(capitaux) >= 2:
+            ax1.plot(range(len(jours_tries)), capitaux,
+                     color='#e94560', linewidth=2.5,
+                     marker='o', markersize=7,
+                     markerfacecolor='white', markeredgecolor='#e94560',
+                     markeredgewidth=2)
+            ax1.fill_between(range(len(jours_tries)), capitaux, CAPITAL_INITIAL,
+                              where=[c >= CAPITAL_INITIAL for c in capitaux],
+                              color='#e94560', alpha=0.15)
+            ax1.fill_between(range(len(jours_tries)), capitaux, CAPITAL_INITIAL,
+                              where=[c < CAPITAL_INITIAL for c in capitaux],
+                              color='#ff4444', alpha=0.25)
+
+        ax1.axhline(y=CAPITAL_INITIAL, color='#ffffff',
+                    linewidth=1, linestyle='--', alpha=0.4)
+
+        for i, (jour, cap) in enumerate(zip(jours_tries, capitaux)):
+            couleur = '#00ff88' if cap >= CAPITAL_INITIAL else '#ff4444'
+            ax1.annotate(f'{cap}€', xy=(i, cap),
+                         xytext=(0, 12), textcoords='offset points',
+                         ha='center', fontsize=8, color=couleur, fontweight='bold')
+
+        ax1.set_xticks(range(len(jours_tries)))
+        ax1.set_xticklabels(labels_jours, color='#aaaaaa', fontsize=9)
+        ax1.set_ylabel('Capital (€)', color='#aaaaaa', fontsize=10)
+        ax1.tick_params(colors='#aaaaaa')
+        for spine in ax1.spines.values():
+            spine.set_color('#333366')
+        ax1.grid(True, alpha=0.1, color='#ffffff')
+
+        net  = etat["capital"] - CAPITAL_INITIAL
+        perf = (net / CAPITAL_INITIAL) * 100
+        ax1.set_title(
+            f'VERONIQUE973 V4 — Progression du capital\n'
+            f'NET : {"+"+str(round(net,2))+"€" if net>=0 else str(round(net,2))+"€"}'
+            f' ({"+"+str(round(perf,2))+"%" if perf>=0 else str(round(perf,2))+"%"})'
+            f' | Capital : {etat["capital"]}€',
+            color='white', fontsize=11, fontweight='bold', pad=12)
+
+        # Barres PnL journalier
+        ax2.set_facecolor('#16213e')
+        pnl_valeurs = []
+        for i, jour in enumerate(jours_tries):
+            if i == 0:
+                pnl_valeurs.append(capitaux[0] - CAPITAL_INITIAL)
+            else:
+                pnl_valeurs.append(round(capitaux[i] - capitaux[i-1], 2))
+
+        couleurs = ['#00ff88' if p >= 0 else '#ff4444' for p in pnl_valeurs]
+        bars = ax2.bar(range(len(jours_tries)), pnl_valeurs,
+                        color=couleurs, alpha=0.8, width=0.6)
+        ax2.axhline(y=0, color='#ffffff', linewidth=0.8, alpha=0.4)
+        ax2.set_xticks(range(len(jours_tries)))
+        ax2.set_xticklabels(labels_jours, color='#aaaaaa', fontsize=9)
+        ax2.set_ylabel('PnL jour (€)', color='#aaaaaa', fontsize=9)
+        ax2.tick_params(colors='#aaaaaa')
+        for spine in ax2.spines.values():
+            spine.set_color('#333366')
+        ax2.grid(True, alpha=0.1, color='#ffffff', axis='y')
+
+        for bar, val in zip(bars, pnl_valeurs):
+            if val != 0:
+                couleur = '#00ff88' if val >= 0 else '#ff4444'
+                ax2.text(bar.get_x() + bar.get_width()/2,
+                         bar.get_height() + (0.2 if val >= 0 else -1.2),
+                         f'{"+"+str(val)+"€" if val >= 0 else str(val)+"€"}',
+                         ha='center', fontsize=8,
+                         color=couleur, fontweight='bold')
+
+        plt.tight_layout(pad=2.0)
+
+        # Sauvegarder en mémoire et envoyer via Telegram
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=150,
+                    bbox_inches='tight', facecolor='#1a1a2e')
+        buf.seek(0)
+        plt.close()
+
+        # Envoyer l'image via Telegram sendPhoto
+        if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+            url_photo = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+            form_data = aiohttp.FormData()
+            form_data.add_field('chat_id', TELEGRAM_CHAT_ID)
+            form_data.add_field('caption', f'Progression semaine du {date_debut} au {date_fin}')
+            form_data.add_field('photo', buf, filename='progression.png',
+                                content_type='image/png')
+            await session.post(url_photo, data=form_data,
+                               timeout=aiohttp.ClientTimeout(total=30))
+            log.info(f"  Graphique hebdomadaire envoyé sur Telegram")
+
+    except Exception as e:
+        log.error(f"Erreur graphique hebdomadaire : {e}")
+
+    # ── Rapport texte — semaine + total depuis début
+    if not gains_par_marche:
+        return
+
+    # Calcul total depuis le début pour chaque marché
+    gains_total     = {}
+    wins_total      = {}
+    pertes_total    = {}
+    wins_semaine    = {}
+    pertes_semaine  = {}
+
+    for h in etat.get("historique", []):
+        marche    = h.get("marche", "?")
+        gain      = h.get("gain", 0)
+        resultat  = h.get("resultat", "")
+        semaine   = h.get("heure", "") >= il_y_a_7_jours
+
+        # Total depuis début
+        gains_total[marche]  = round(gains_total.get(marche, 0) + gain, 2)
+        if resultat == "GAGNE":
+            wins_total[marche]   = wins_total.get(marche, 0) + 1
+        else:
+            pertes_total[marche] = pertes_total.get(marche, 0) + 1
+
+        # Semaine uniquement
+        if semaine:
+            if resultat == "GAGNE":
+                wins_semaine[marche]   = wins_semaine.get(marche, 0) + 1
+            else:
+                pertes_semaine[marche] = pertes_semaine.get(marche, 0) + 1
+
+    # Trier par gain semaine décroissant
+    classement    = sorted(gains_par_marche.items(), key=lambda x: x[1], reverse=True)
+    total_semaine = round(sum(gains_par_marche.values()), 2)
+    total_global  = round(sum(gains_total.values()), 2)
+
+    lignes = []
+    for marche, gain_sem in classement:
+        emoji   = "✅" if gain_sem >= 0 else "❌"
+        s_gain  = f"{'+' if gain_sem>=0 else ''}{gain_sem}€"
+        s_wl    = f"{wins_semaine.get(marche,0)}G/{pertes_semaine.get(marche,0)}P"
+        t_gain  = gains_total.get(marche, 0)
+        t_s     = f"{'+' if t_gain>=0 else ''}{t_gain}€"
+        t_wl    = f"{wins_total.get(marche,0)}G/{pertes_total.get(marche,0)}P"
+        lignes.append(
+            f"{emoji} <code>{marche:<10} {s_gain:<10} {s_wl:<8} | {t_s:<10} {t_wl}</code>"
+        )
+
+    message = (
+        f"<b>RAPPORT HEBDOMADAIRE VERONIQUE973</b>\n"
+        f"Semaine du {date_debut} au {date_fin}\n"
+        f"<code>{'─'*44}</code>\n"
+        f"<code>{'MARCHÉ':<10} {'SEMAINE':>8} {'G/P':>6}  | {'TOTAL':>8} {'G/P'}</code>\n"
+        f"<code>{'─'*44}</code>\n"
+        f"{chr(10).join(lignes)}\n"
+        f"<code>{'─'*44}</code>\n"
+        f"<b>Semaine : {'+' if total_semaine>=0 else ''}{total_semaine}€ | "
+        f"Total : {'+' if total_global>=0 else ''}{total_global}€</b>"
+    )
+
+    log.info(f"  Envoi rapport hebdomadaire texte Telegram")
+    await telegram(session, message)
+
+# ═══════════════════════════════════════════════════════════════
+#  TABLEAU DE BORD
+# ═══════════════════════════════════════════════════════════════
+def afficher_tableau_de_bord(etat):
+    nb_trades = etat.get("nb_trades", 0)
+    nb_wins   = etat.get("nb_wins", 0)
+    win_rate  = (nb_wins / nb_trades * 100) if nb_trades > 0 else 0
+    perf      = (etat["capital"] - CAPITAL_INITIAL) / CAPITAL_INITIAL * 100
+    log.info(f"\n  {'='*55}")
+    log.info(f"  BOT HUMAIN — VÉRONIQUE973 V4")
+    log.info(f"  {'='*55}")
+    log.info(f"  Capital    : {round(etat['capital'],2)}€ ({'+' if perf>=0 else ''}{round(perf,2)}%)")
+    log.info(f"  PnL jour   : {'+' if etat.get('pnl_jour',0)>=0 else ''}{round(etat.get('pnl_jour',0),2)}€")
+    log.info(f"  Trades     : {nb_trades} | Wins : {nb_wins} ({win_rate:.1f}%)")
+    log.info(f"  Ouverts    : {len(trades_ouverts)}/{MAX_TRADES_SIMULTANES}")
+    log.info(f"  Pertes c.  : {etat.get('pertes_consecutives',0)}/{MAX_PERTES_CONSECUTIVES}")
+    log.info(f"  Wins c.    : {etat.get('wins_consecutifs',0)}")
+    log.info(f"  Gagné      : +{round(etat.get('total_gagne',0),2)}€")
+    log.info(f"  Perdu      : -{round(etat.get('total_perdu',0),2)}€")
+    log.info(f"  NET        : {'+' if etat.get('cumul_net',0)>=0 else ''}{round(etat.get('cumul_net',0),2)}€")
+    if etat.get("historique"):
+        log.info("  Derniers trades :")
+        for h in etat["historique"][-5:]:
+            icone = "✅" if h["resultat"] == "GAGNE" else "❌"
+            log.info(f"    {icone} {h['heure']} | {h['marche']} | "
+                     f"{'+' if h['gain']>=0 else ''}{h['gain']}€")
+    log.info(f"  {'='*55}")
+
+# ═══════════════════════════════════════════════════════════════
+#  BOUCLE PRINCIPALE
+# ═══════════════════════════════════════════════════════════════
+async def boucle_principale():
+    global trades_lock
+    trades_lock = asyncio.Lock()
+
+    init_database()
+    etat = charger_etat()
+
+    for champ, valeur in [
+        ("pnl_jour", 0.0), ("date_jour", ""), ("wins_consecutifs", 0),
+        ("cooldown_until", 0), ("nb_skips", 0)
+    ]:
+        if champ not in etat:
+            etat[champ] = valeur
+
+    afficher_tableau_de_bord(etat)
+
+    connector = aiohttp.TCPConnector(limit=50)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        await telegram(session,
+            f"🚀 <b>BOT HUMAIN VÉRONIQUE973 V4 DÉMARRÉ</b>\n"
+            f"Capital : {round(etat['capital'],2)}€\n"
+            f"Signal : mouvement ≥ {SEUIL_MOUVEMENT_PCT}% depuis prix référence\n"
+            f"Lock paliers | Stop max -{STOP_LOSS_PCT}% du capital\n"
+            f"Kill switch : {KILL_SWITCH_JOUR}€/jour\n"
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+
+        while True:
+            try:
+                reset_pnl_jour_si_nouveau_jour(etat)
+
+                maintenant_utc = datetime.utcnow()
+
+                # ── Rapport quotidien chaque jour à 00h UTC = 21h Guyane
+                if (maintenant_utc.hour == 0 and
+                    maintenant_utc.minute < 1 and
+                    etat.get("dernier_rapport_quotidien", "") != maintenant_utc.strftime('%Y-%m-%d')):
+                    await envoyer_rapport_quotidien(session, etat)
+                    etat["dernier_rapport_quotidien"] = maintenant_utc.strftime('%Y-%m-%d')
+                    sauvegarder_etat(etat)
+
+                # ── Rapport hebdomadaire chaque dimanche à 21h Guyane = 00h UTC lundi
+                if (maintenant_utc.weekday() == 0 and  # lundi UTC = dimanche 21h Guyane
+                    maintenant_utc.hour == 0 and
+                    maintenant_utc.minute < 1 and
+                    etat.get("derniere_semaine", "") != maintenant_utc.strftime('%Y-%W')):
+                    await envoyer_rapport_hebdomadaire(session, etat)
+                    etat["derniere_semaine"] = maintenant_utc.strftime('%Y-%W')
+                    sauvegarder_etat(etat)
+
+                statut = verifier_protections(etat, etat["capital"])
+                if statut == "RUINE":
+                    await telegram(session,
+                        f"🚨 <b>SEUIL RUINE !</b>\nCapital : {etat['capital']}€\nBot arrêté !")
+                    break
+                if statut in ("KILL_SWITCH", "COOLDOWN"):
                     await asyncio.sleep(60)
+                    etat = charger_etat()
                     continue
 
-                if self.risk.check_kill_switch():
-                    log.warning(f"[KILL] Kill switch déclenché : {self.risk.kill_reason}")
-                    # Fermer tous les trades ouverts au prix actuel
-                    for market in list(self.open_trades.keys()):
-                        price = await self.kraken.fetch_ticker(market)
-                        if price:
-                            self._close_trade(market, price, "KILL_SWITCH")
+                async with trades_lock:
+                    slots_libres        = MAX_TRADES_SIMULTANES - len(trades_ouverts)
+                    marches_actifs      = get_marches_actifs()
+                    marches_disponibles = [
+                        m for m in marches_actifs
+                        if m not in trades_ouverts
+                        and time.time() >= cooldown_marches.get(m, 0)
+                    ]
+
+                if slots_libres <= 0:
+                    log.info(f"  {MAX_TRADES_SIMULTANES}/{MAX_TRADES_SIMULTANES} trades — attente...")
+                    await asyncio.sleep(PAUSE_SCAN)
                     continue
 
-                # Traiter tous les marchés en parallèle (limité à 5 simultanés)
-                sem = asyncio.Semaphore(5)
-                async def _safe_process(m: str):
-                    async with sem:
-                        try:
-                            await self._process_market(m)
-                        except Exception as e:
-                            log.error(f"[ERROR] {m}: {e}")
+                log.info(f"\n[{datetime.now().strftime('%H:%M:%S')}] Scan "
+                         f"| Slots : {slots_libres}/{MAX_TRADES_SIMULTANES}")
 
-                await asyncio.gather(*[_safe_process(m) for m in self.cfg.markets])
+                signaux = {}
+                for marche in marches_disponibles:
+                    direction, details = await analyser_marche(session, marche)
+                    if direction != "NEUTRE":
+                        signaux[marche] = {"direction": direction, "details": details}
+                    await asyncio.sleep(0.3)
 
-                # Dashboard toutes les 20 itérations
-                if self._iter % 20 == 0:
-                    self.perf.print_dashboard(
-                        capital     = self.risk.capital,
-                        daily_pnl   = self.risk.daily_pnl,
-                        open_trades = len(self.open_trades),
+                if not signaux:
+                    log.info("  => Aucun signal.")
+                    etat["nb_skips"] = etat.get("nb_skips", 0) + 1
+                    sauvegarder_etat(etat)
+                    await asyncio.sleep(PAUSE_SCAN)
+                    continue
+
+                # Trier par variation la plus forte
+                meilleurs = sorted(
+                    signaux.items(),
+                    key=lambda x: x[1]["details"].get("variation_pct", 0),
+                    reverse=True
+                )[:slots_libres]
+
+                for symbole, sig in meilleurs:
+                    async with trades_lock:
+                        if symbole in trades_ouverts:
+                            continue
+                        if len(trades_ouverts) >= MAX_TRADES_SIMULTANES:
+                            break
+                        trades_ouverts[symbole] = True
+
+                    log.info(f"  ✅ {symbole} ({sig['direction']}) "
+                             f"Variation={sig['details'].get('variation_pct', 0):.2f}%")
+
+                    asyncio.create_task(
+                        executer_trade(
+                            session, symbole, sig["direction"],
+                            etat["capital"],
+                            sig["details"], etat, etat
+                        )
                     )
 
-                # Log des trades ouverts
-                if self.open_trades and self._iter % 4 == 0:
-                    for market, trade in self.open_trades.items():
-                        price = await self.kraken.fetch_ticker(market)
-                        if price:
-                            upnl = trade.unrealized_pnl(price)
-                            log.info(
-                                f"[OPEN]  {market:<12} {trade.side.value}  "
-                                f"prix={price:.6f}  "
-                                f"PnL non-réalisé={upnl:+.2f}€  "
-                                f"trailing={trade.trailing_stop:.6f if trade.trailing_stop else 'inactif'}"
-                            )
+                await asyncio.sleep(PAUSE_SCAN)
 
-                await asyncio.sleep(self.cfg.loop_interval)
-
-        except KeyboardInterrupt:
-            log.info("\n[BOT] Arrêt demandé par l'utilisateur.")
-            # Fermer proprement les trades ouverts
-            for market in list(self.open_trades.keys()):
-                price = await self.kraken.fetch_ticker(market)
-                if price:
-                    self._close_trade(market, price, "SHUTDOWN")
-            self.perf.print_dashboard(
-                capital     = self.risk.capital,
-                daily_pnl   = self.risk.daily_pnl,
-                open_trades = 0,
-            )
-        finally:
-            await self.kraken.close()
-            log.info("[BOT] Connexions fermées. À bientôt. 👋")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  POINT D'ENTRÉE
-# ─────────────────────────────────────────────────────────────────────────────
-cfg = BotConfig()
+            except KeyboardInterrupt:
+                log.info("Bot arrêté.")
+                break
+            except Exception as e:
+                log.error(f"Erreur inattendue : {e}")
+                await asyncio.sleep(60)
 
 if __name__ == "__main__":
-    # ── Lecture des variables d'environnement (Railway / .env)
-    cfg.simulation_mode  = os.environ.get("SIMULATION_MODE", "true").lower() == "true"
-    cfg.initial_capital  = float(os.environ.get("INITIAL_CAPITAL", "200"))
-    cfg.stake_eur        = float(os.environ.get("STAKE_EUR", "50"))
-    cfg.leverage         = int(os.environ.get("LEVERAGE", "3"))
-    cfg.daily_kill_eur   = float(os.environ.get("DAILY_KILL_EUR", "-3"))
-    cfg.score_min        = int(os.environ.get("SCORE_MIN", "14"))
-    cfg.max_open_trades  = int(os.environ.get("MAX_OPEN_TRADES", "3"))
-
-    bot = QuantumEdgeBot(cfg)
-    asyncio.run(bot.run())
+    asyncio.run(boucle_principale())
