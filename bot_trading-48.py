@@ -3,7 +3,7 @@
 ║         BOT HUMAIN — OLIDE973 V4                            ║
 ║  Mean Reversion 0.50% | Surveillance prix temps réel            ║
 ║  Lock Profits Paliers | 20 trades simultanés                    ║
-║  Capital 1000€ | Architecture async aiohttp                     ║
+║  Capital 1000€ | Architecture async aiohttp                      ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -12,7 +12,7 @@ import aiohttp
 import os
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import pandas as pd
 from ta.volatility import AverageTrueRange
 from ta.momentum import RSIIndicator
@@ -35,7 +35,7 @@ MISE_MIN                = 10.0
 MISE_MAX_PCT            = 0.25
 CHECK_INTERVAL          = 10         # secondes entre chaque check prix
 PAUSE_SCAN              = 30         # secondes entre chaque scan de nouveaux marchés
-TIMEOUT_TRADE           = 4 * 3600   # 4h max par trade
+TIMEOUT_TRADE           = 10 * 3600  # 10h max par trade
 MAX_TRADES_SIMULTANES   = 20
 
 # ── Détection signal mean reversion — surveillance temps réel
@@ -49,12 +49,11 @@ RSI_SEUIL_BAS           = 45     # RSI < 45 → marché baissier → inverser AC
 RSI_SEUIL_HAUT          = 55     # RSI > 55 → marché haussier → inverser VENTE en ACHAT
 RSI_PERIODE             = 14     # période RSI standard
 
-# ── Cooldown après perte uniquement
-COOLDOWN_APRES_PERTE    = 43200  # 12h après stop loss ou timeout négatif
+# ── Protections
+KILL_SWITCH_JOUR        = -20.0
+SEUIL_RUINE             = 600.0
 
 # ── Lock profits par paliers proportionnels au capital
-# Les paliers s'adaptent automatiquement selon le capital actuel
-# Exprimés en % du capital
 LOCK_PALIERS_PCT = [0.15, 0.20, 0.30, 0.60, 1.00, 1.60, 2.40, 3.60, 5.00, 7.00, 10.00, 15.00, 20.00, 30.00, 40.00]
 
 def get_palier_lock(pnl_max, capital):
@@ -69,50 +68,69 @@ def get_palier_lock(pnl_max, capital):
 # ── Gestion mise dynamique
 WINS_CONFIANCE          = 3
 BOOST_CONFIANCE         = 1.20
-REDUCTION_PERTES        = 0.50
 MIN_TRADES_KELLY        = 30
 KELLY_FRACTION          = 0.25
 KELLY_CAP               = 0.20
 
-# ── Protections
-KILL_SWITCH_JOUR        = -50.0
-SEUIL_RUINE             = 600.0
-MAX_PERTES_CONSECUTIVES = 2
-COOLDOWN_PERTES         = 1800   # 30 min
-
 TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
+# ── Horaires de trading (heure Guyane = UTC-3)
+# Tous les marchés actifs de 00h à 16h Guyane (03h-19h UTC)
+# Pause totale : 16h-00h Guyane = 19h-03h UTC
+
 MARCHES = [
+    "ATOMUSDT", "NEARUSDT", "TRXUSDT",
+    "UNIUSDT",  "ARBUSDT",  "FTMUSDT",
+    "SUIUSDT",  "XMRUSDT",
     "ETHUSDT",  "XRPUSDT",  "SOLUSDT",  "ADAUSDT",
-    "LINKUSDT", "ATOMUSDT", "AVAXUSDT", "NEARUSDT",
-    "DOTUSDT",  "DOGEUSDT", "LTCUSDT",  "ALGOUSDT",
-    "TRXUSDT",  "UNIUSDT",  "FILUSDT",  "AAVEUSDT",
-    "POLUSDT",  "APEUSDT",  "ARBUSDT",  "FTMUSDT"
+    "LINKUSDT", "AVAXUSDT", "DOTUSDT",  "DOGEUSDT",
+    "LTCUSDT",  "ALGOUSDT", "FILUSDT",  "AAVEUSDT",
+    "POLUSDT",  "APEUSDT",  "TAOUSDT",
 ]
 
 KRAKEN_SYMBOLS = {
+    "ATOMUSDT":  "ATOMUSD",
+    "NEARUSDT":  "NEARUSD",
+    "TRXUSDT":   "TRXUSD",
+    "UNIUSDT":   "UNIUSD",
+    "ARBUSDT":   "ARBUSD",
+    "FTMUSDT":   "FTMUSD",
+    "SUIUSDT":   "SUIUSD",
+    "XMRUSDT":   "XMRUSD",
     "ETHUSDT":   "XETHZUSD",
     "XRPUSDT":   "XXRPZUSD",
     "SOLUSDT":   "SOLUSD",
     "ADAUSDT":   "ADAUSD",
     "LINKUSDT":  "LINKUSD",
-    "ATOMUSDT":  "ATOMUSD",
     "AVAXUSDT":  "AVAXUSD",
-    "NEARUSDT":  "NEARUSD",
     "DOTUSDT":   "DOTUSD",
     "DOGEUSDT":  "XDGUSD",
     "LTCUSDT":   "XLTCZUSD",
     "ALGOUSDT":  "ALGOUSD",
-    "TRXUSDT":   "TRXUSD",
-    "UNIUSDT":   "UNIUSD",
     "FILUSDT":   "FILUSD",
     "AAVEUSDT":  "AAVEUSD",
-    "POLUSDT":   "POLUSD",    # MATIC rebrandé POL sur Kraken
+    "POLUSDT":   "POLUSD",
     "APEUSDT":   "APEUSD",
-    "ARBUSDT":   "ARBUSD",    # Arbitrum — très liquide
-    "FTMUSDT":   "FTMUSD",    # Fantom — bonne liquidité
+    "TAOUSDT":   "TAOUSD",
 }
+
+def get_marches_actifs():
+    """Retourne les marchés actifs selon l'heure UTC actuelle.
+
+    Heure Guyane = UTC-3
+    - 00h-16h Guyane (03h-19h UTC) → tous les 23 marchés actifs
+    - 16h-00h Guyane (19h-03h UTC) → PAUSE totale
+    """
+    heure_utc = datetime.now(timezone.utc).replace(tzinfo=None).hour
+    # PAUSE : 19h-03h UTC = 16h-00h Guyane
+    if heure_utc >= 19 or heure_utc < 3:
+        return []
+    return MARCHES
+
+def get_session_marche(symbole):
+    """Retourne la session horaire d'un marché en heure Guyane."""
+    return "00h-16h Guyane"
 
 # ═══════════════════════════════════════════════════════════════
 #  ÉTAT GLOBAL
@@ -125,14 +143,15 @@ trades_lock       = None  # initialisé dans boucle_principale()
 log.info("=" * 60)
 log.info("  BOT HUMAIN — OLIDE973 V4")
 log.info(f"  Capital : {CAPITAL_INITIAL}€ | Levier x{LEVIER}")
-log.info(f"  Marchés : {len(MARCHES)} cryptos | Max {MAX_TRADES_SIMULTANES} trades")
+log.info(f"  Marchés actifs : {len(MARCHES)} cryptos | 00h-16h Guyane")
 log.info(f"  Signal : mouvement ≥ {SEUIL_MOUVEMENT_PCT}% depuis le prix de référence")
 log.info(f"  Surveillance temps réel — peu importe la durée")
 log.info(f"  RSI 1h : seuil bas={RSI_SEUIL_BAS} | seuil haut={RSI_SEUIL_HAUT} | inversion auto")
 log.info(f"  Stop : {STOP_LOSS_PCT}% capital | plafonné {int(STOP_LOSS_MISE_MAX_PCT*100)}% mise")
 log.info(f"  Lock paliers : {LOCK_PALIERS_PCT}% du capital")
-log.info(f"  Cooldown : 12h après perte | 0 après gain")
+log.info(f"  Cooldown : pause jusqu'à minuit après perte | 0 après gain")
 log.info(f"  Kill switch : {KILL_SWITCH_JOUR}€/jour | Ruine : {SEUIL_RUINE}€")
+log.info(f"  Horaires : 00h-16h Guyane (03h-19h UTC) tous marchés | 16h-00h=PAUSE")
 log.info(f"  Telegram : {'ON' if TELEGRAM_TOKEN else 'OFF'}")
 log.info("=" * 60)
 
@@ -311,11 +330,10 @@ async def analyser_marche(session, symbole):
 # ═══════════════════════════════════════════════════════════════
 #  GESTION MISE DYNAMIQUE
 # ═══════════════════════════════════════════════════════════════
-def calculer_mise(capital, etat, multiplicateur_session=1.0):
+def calculer_mise(capital, etat):
     nb_trades     = etat.get("nb_trades", 0)
     nb_wins       = etat.get("nb_wins", 0)
     wins_consec   = etat.get("wins_consecutifs", 0)
-    pertes_consec = etat.get("pertes_consecutives", 0)
     avg_win_pct   = etat.get("avg_win_pct", 0)
     avg_loss_pct  = etat.get("avg_loss_pct", 0)
 
@@ -328,14 +346,10 @@ def calculer_mise(capital, etat, multiplicateur_session=1.0):
         kelly_frac = max(0, min(kelly_full * KELLY_FRACTION, KELLY_CAP))
         mise       = capital * kelly_frac
 
-    if pertes_consec >= 2:
-        mise *= REDUCTION_PERTES
-        log.info(f"  ⚠️ Mise réduite 50% ({pertes_consec} pertes)")
-    elif wins_consec >= WINS_CONFIANCE:
+    if wins_consec >= WINS_CONFIANCE:
         mise *= BOOST_CONFIANCE
         log.info(f"  💪 Mise boostée +20% ({wins_consec} wins)")
 
-    mise *= multiplicateur_session
     mise  = max(mise, MISE_MIN)
     mise  = min(mise, capital * MISE_MAX_PCT)
     return round(mise, 2)
@@ -360,7 +374,8 @@ async def executer_trade(session, symbole, direction, capital, details, etat, et
         stop_loss_eur = stop_loss_max_mise
         log.info(f"  ⚠️ Stop plafonné à 50% mise : -{stop_loss_eur}€")
 
-    rsi_1h = details.get("rsi_1h", 50.0)
+    rsi_1h        = details.get("rsi_1h", 50.0)
+    session_label = get_session_marche(symbole)
 
     # Stop loss initial
     if direction == "ACHAT":
@@ -388,6 +403,7 @@ async def executer_trade(session, symbole, direction, capital, details, etat, et
     await telegram(session,
         f"📊 <b>TRADE #{numero_trade} — OLIDE973 V4</b>\n"
         f"{'🟢 ACHAT' if direction == 'ACHAT' else '🔴 VENTE'} {symbole}\n"
+        f"⏰ {session_label}\n"
         f"Variation : {details.get('variation_pct', 0):.2f}% depuis ref\n"
         f"Volume : {details.get('vol_ratio', 0):.2f}x | RSI 1h : {rsi_1h}\n"
         f"Prix : {prix_entree} | Stop : {stop_initial}\n"
@@ -440,7 +456,8 @@ async def executer_trade(session, symbole, direction, capital, details, etat, et
                      f"(max={pnl_max_atteint:.2f}€) | {duree}min")
             await telegram(session,
                 f"🔒 <b>SORTIE LOCK</b>\n"
-                f"{symbole} {direction}\n"
+                f"{symbole} | {get_session_marche(symbole)}\n"
+                f"{direction}\n"
                 f"Gain : <b>+{lock_actuel}€</b>\n"
                 f"PnL max : +{pnl_max_atteint:.2f}€\n"
                 f"Durée : {duree} min"
@@ -492,12 +509,16 @@ async def executer_trade(session, symbole, direction, capital, details, etat, et
             break
 
     # Libérer le marché
-    # Cooldown 12h uniquement si trade perdu ou timeout négatif
+    # Si trade perdu → pause jusqu'à minuit (remise à zéro PnL jour)
     async with trades_lock:
         trades_ouverts.pop(symbole, None)
         if resultat_final == "PERDU" or (resultat_final != "GAGNE" and gain_final < 0):
-            cooldown_marches[symbole] = time.time() + COOLDOWN_APRES_PERTE
-            log.info(f"  ❄️ Cooldown 12h [{symbole}] — marché en pause jusqu'à demain")
+            # Calculer le timestamp de minuit aujourd'hui
+            maintenant    = datetime.now()
+            minuit        = maintenant.replace(hour=0, minute=0, second=0, microsecond=0)
+            minuit_demain = minuit + timedelta(days=1)
+            cooldown_marches[symbole] = minuit_demain.timestamp()
+            log.info(f"  ❄️ [{symbole}] pause jusqu'à minuit — reprendra à 00h00")
         else:
             cooldown_marches.pop(symbole, None)
             log.info(f"  ✅ [{symbole}] libéré immédiatement — trade gagnant")
@@ -589,21 +610,6 @@ def verifier_protections(etat, capital):
     if etat.get("pnl_jour", 0.0) <= KILL_SWITCH_JOUR:
         log.warning(f"⚠️ KILL SWITCH — PnL jour {etat.get('pnl_jour', 0)}€")
         return "KILL_SWITCH"
-    cooldown_until = etat.get("cooldown_until", 0)
-    if time.time() < cooldown_until:
-        restant = int((cooldown_until - time.time()) / 60)
-        log.info(f"  ❄️ Cooldown — {restant} min restantes")
-        return "COOLDOWN"
-    if cooldown_until > 0 and time.time() >= cooldown_until:
-        etat["pertes_consecutives"] = 0
-        etat["cooldown_until"]      = 0
-        sauvegarder_etat(etat)
-    if etat.get("pertes_consecutives", 0) >= MAX_PERTES_CONSECUTIVES:
-        log.warning(f"  {MAX_PERTES_CONSECUTIVES} pertes → cooldown {COOLDOWN_PERTES//60} min")
-        etat["cooldown_until"]      = int(time.time()) + COOLDOWN_PERTES
-        etat["pertes_consecutives"] = 0
-        sauvegarder_etat(etat)
-        return "COOLDOWN"
     return "OK"
 
 def reset_pnl_jour_si_nouveau_jour(etat):
@@ -613,17 +619,137 @@ def reset_pnl_jour_si_nouveau_jour(etat):
         etat["date_jour"] = aujourd_hui
         log.info("  📅 Nouveau jour — PnL remis à 0")
 
-async def envoyer_rapport_hebdomadaire(session, etat):
+async def envoyer_rapport_quotidien(session, etat):
     """
-    Envoie chaque lundi matin :
-    1. Le graphique de progression du capital (image PNG)
-    2. Le classement des marchés par gain (texte)
+    Envoie chaque jour à 19h Guyane (22h UTC) :
+    1. Graphique de la journée
+    2. Classement des marchés du jour avec gains et G/P
     """
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     import io
-    from datetime import timedelta
+
+    historique  = etat.get("historique", [])
+    aujourd_hui = datetime.now().strftime('%Y-%m-%d')
+    date_affich = datetime.now().strftime('%d/%m/%Y')
+
+    # ── Gains par marché aujourd'hui
+    gains_jour    = {}
+    wins_jour     = {}
+    pertes_jour   = {}
+
+    for h in historique:
+        if h.get("heure", "")[:10] == aujourd_hui:
+            marche   = h.get("marche", "?")
+            gain     = h.get("gain", 0)
+            resultat = h.get("resultat", "")
+            gains_jour[marche] = round(gains_jour.get(marche, 0) + gain, 2)
+            if resultat == "GAGNE":
+                wins_jour[marche]   = wins_jour.get(marche, 0) + 1
+            else:
+                pertes_jour[marche] = pertes_jour.get(marche, 0) + 1
+
+    # ── Graphique capital intraday
+    try:
+        capitaux_jour = []
+        heures_jour   = []
+        for h in historique:
+            if h.get("heure", "")[:10] == aujourd_hui:
+                heures_jour.append(h.get("heure", "")[11:16])
+                capitaux_jour.append(h.get("capital", etat["capital"]))
+
+        if len(capitaux_jour) >= 2:
+            fig, ax = plt.subplots(figsize=(10, 4))
+            fig.patch.set_facecolor('#1a1a2e')
+            ax.set_facecolor('#16213e')
+            ax.plot(range(len(capitaux_jour)), capitaux_jour,
+                    color='#e94560', linewidth=2.5,
+                    marker='o', markersize=5,
+                    markerfacecolor='white', markeredgecolor='#e94560')
+            ax.axhline(y=capitaux_jour[0], color='#ffffff',
+                       linewidth=1, linestyle='--', alpha=0.4)
+            ax.set_xticks(range(len(heures_jour)))
+            ax.set_xticklabels(heures_jour, color='#aaaaaa', fontsize=7, rotation=45)
+            ax.set_ylabel('Capital (€)', color='#aaaaaa', fontsize=9)
+            ax.tick_params(colors='#aaaaaa')
+            for spine in ax.spines.values():
+                spine.set_color('#333366')
+            ax.grid(True, alpha=0.1, color='#ffffff')
+            pnl_jour = round(etat.get("pnl_jour", 0), 2)
+            ax.set_title(
+                f'OLIDE973 V4 — Journee du {date_affich}\n'
+                f'PnL jour : {"+"+str(pnl_jour)+"€" if pnl_jour>=0 else str(pnl_jour)+"€"}'
+                f' | Capital : {etat["capital"]}€',
+                color='white', fontsize=11, fontweight='bold', pad=10)
+            plt.tight_layout(pad=1.5)
+
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', dpi=150,
+                        bbox_inches='tight', facecolor='#1a1a2e')
+            buf.seek(0)
+            plt.close()
+
+            if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+                url_photo = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+                form_data = aiohttp.FormData()
+                form_data.add_field('chat_id', TELEGRAM_CHAT_ID)
+                form_data.add_field('caption', f'Journee du {date_affich}')
+                form_data.add_field('photo', buf, filename='journee.png',
+                                    content_type='image/png')
+                await session.post(url_photo, data=form_data,
+                                   timeout=aiohttp.ClientTimeout(total=30))
+                log.info(f"  Graphique quotidien envoyé sur Telegram")
+
+    except Exception as e:
+        log.error(f"Erreur graphique quotidien : {e}")
+
+    # ── Rapport texte quotidien
+    if not gains_jour:
+        return
+
+    classement    = sorted(gains_jour.items(), key=lambda x: x[1], reverse=True)
+    total_jour    = round(sum(gains_jour.values()), 2)
+    nb_trades     = etat.get("nb_trades", 0)
+    nb_wins       = etat.get("nb_wins", 0)
+    win_rate      = (nb_wins / nb_trades * 100) if nb_trades > 0 else 0
+    perf          = (etat["capital"] - CAPITAL_INITIAL) / CAPITAL_INITIAL * 100
+
+    lignes = []
+    for marche, gain in classement:
+        emoji   = "✅" if gain >= 0 else "❌"
+        s_gain       = f"{'+' if gain>=0 else ''}{gain}€"
+        s_wl         = f"{wins_jour.get(marche,0)}G/{pertes_jour.get(marche,0)}P"
+        session_label = get_session_marche(marche)
+        lignes.append(f"{emoji} <code>{marche:<12} {s_gain:<10} {s_wl:<8} {session_label}</code>")
+
+    message = (
+        f"📊 <b>RAPPORT QUOTIDIEN OLIDE973</b>\n"
+        f"Journee du {date_affich}\n"
+        f"<code>{'─'*44}</code>\n"
+        f"<code>{'MARCHÉ':<12} {'GAINS':>8} {'G/P':<8} SESSION</code>\n"
+        f"<code>{'─'*44}</code>\n"
+        f"{chr(10).join(lignes)}\n"
+        f"<code>{'─'*44}</code>\n"
+        f"<b>Total jour : {'+' if total_jour>=0 else ''}{total_jour}€</b>\n"
+        f"Capital : {round(etat['capital'],2)}€ "
+        f"({'+' if perf>=0 else ''}{round(perf,2)}%)\n"
+        f"Trades : {nb_trades} | WR : {round(win_rate,1)}%"
+    )
+
+    log.info(f"  Envoi rapport quotidien Telegram")
+    await telegram(session, message)
+
+async def envoyer_rapport_hebdomadaire(session, etat):
+    """
+    Envoie chaque dimanche à 19h Guyane (22h UTC) :
+    1. Le graphique de progression du capital sur 7 jours
+    2. Le classement des marchés semaine + total depuis début avec G/P
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import io
 
     historique = etat.get("historique", [])
     if not historique:
@@ -834,7 +960,7 @@ def afficher_tableau_de_bord(etat):
     log.info(f"  PnL jour   : {'+' if etat.get('pnl_jour',0)>=0 else ''}{round(etat.get('pnl_jour',0),2)}€")
     log.info(f"  Trades     : {nb_trades} | Wins : {nb_wins} ({win_rate:.1f}%)")
     log.info(f"  Ouverts    : {len(trades_ouverts)}/{MAX_TRADES_SIMULTANES}")
-    log.info(f"  Pertes c.  : {etat.get('pertes_consecutives',0)}/{MAX_PERTES_CONSECUTIVES}")
+    log.info(f"  Pertes c.  : {etat.get('pertes_consecutives',0)}")
     log.info(f"  Wins c.    : {etat.get('wins_consecutifs',0)}")
     log.info(f"  Gagné      : +{round(etat.get('total_gagne',0),2)}€")
     log.info(f"  Perdu      : -{round(etat.get('total_perdu',0),2)}€")
@@ -859,7 +985,7 @@ async def boucle_principale():
 
     for champ, valeur in [
         ("pnl_jour", 0.0), ("date_jour", ""), ("wins_consecutifs", 0),
-        ("cooldown_until", 0), ("nb_skips", 0)
+        ("nb_skips", 0)
     ]:
         if champ not in etat:
             etat[champ] = valeur
@@ -881,14 +1007,23 @@ async def boucle_principale():
             try:
                 reset_pnl_jour_si_nouveau_jour(etat)
 
-                # ── Rapport hebdomadaire chaque lundi à 8h UTC
-                maintenant = datetime.now(timezone.utc).replace(tzinfo=None)
-                if (maintenant.weekday() == 0 and  # lundi
-                    maintenant.hour == 8 and
-                    maintenant.minute < 1 and
-                    etat.get("derniere_semaine", "") != maintenant.strftime('%Y-%W')):
+                maintenant_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+
+                # ── Rapport quotidien chaque jour à 19h Guyane = 22h UTC
+                if (maintenant_utc.hour == 22 and
+                    maintenant_utc.minute < 1 and
+                    etat.get("dernier_rapport_quotidien", "") != maintenant_utc.strftime('%Y-%m-%d')):
+                    await envoyer_rapport_quotidien(session, etat)
+                    etat["dernier_rapport_quotidien"] = maintenant_utc.strftime('%Y-%m-%d')
+                    sauvegarder_etat(etat)
+
+                # ── Rapport hebdomadaire chaque dimanche à 19h Guyane = 22h UTC
+                if (maintenant_utc.weekday() == 6 and  # dimanche UTC = dimanche 19h Guyane
+                    maintenant_utc.hour == 22 and
+                    maintenant_utc.minute < 1 and
+                    etat.get("derniere_semaine", "") != maintenant_utc.strftime('%Y-%W')):
                     await envoyer_rapport_hebdomadaire(session, etat)
-                    etat["derniere_semaine"] = maintenant.strftime('%Y-%W')
+                    etat["derniere_semaine"] = maintenant_utc.strftime('%Y-%W')
                     sauvegarder_etat(etat)
 
                 statut = verifier_protections(etat, etat["capital"])
@@ -896,15 +1031,16 @@ async def boucle_principale():
                     await telegram(session,
                         f"🚨 <b>SEUIL RUINE !</b>\nCapital : {etat['capital']}€\nBot arrêté !")
                     break
-                if statut in ("KILL_SWITCH", "COOLDOWN"):
+                if statut == "KILL_SWITCH":
                     await asyncio.sleep(60)
                     etat = charger_etat()
                     continue
 
                 async with trades_lock:
                     slots_libres        = MAX_TRADES_SIMULTANES - len(trades_ouverts)
+                    marches_actifs      = get_marches_actifs()
                     marches_disponibles = [
-                        m for m in MARCHES
+                        m for m in marches_actifs
                         if m not in trades_ouverts
                         and time.time() >= cooldown_marches.get(m, 0)
                     ]
