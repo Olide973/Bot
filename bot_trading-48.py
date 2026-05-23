@@ -76,8 +76,10 @@ TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
 # ── Horaires de trading (heure Guyane = UTC-3)
-# Tous les marchés actifs de 00h à 16h Guyane (03h-19h UTC)
-# Pause totale : 16h-00h Guyane = 19h-03h UTC
+# Session 1 : 00h-04h50 Guyane (03h-07h50 UTC) — session asiatique
+# Pause     : 04h50-09h Guyane (07h50-12h UTC)
+# Session 2 : 09h-16h Guyane (12h-19h UTC) — session Londres/New York
+# Pause     : 16h-00h Guyane (19h-03h UTC)
 
 MARCHES = [
     "ATOMUSDT", "NEARUSDT", "TRXUSDT",
@@ -119,18 +121,34 @@ def get_marches_actifs():
     """Retourne les marchés actifs selon l'heure UTC actuelle.
 
     Heure Guyane = UTC-3
-    - 00h-16h Guyane (03h-19h UTC) → tous les 23 marchés actifs
-    - 16h-00h Guyane (19h-03h UTC) → PAUSE totale
+    - 00h-04h50 Guyane (03h-07h50 UTC) → session asiatique
+    - 04h50-09h Guyane (07h50-12h UTC) → PAUSE
+    - 09h-16h Guyane (12h-19h UTC) → session Londres/New York
+    - 16h-00h Guyane (19h-03h UTC) → PAUSE
     """
-    heure_utc = datetime.now(timezone.utc).replace(tzinfo=None).hour
-    # PAUSE : 19h-03h UTC = 16h-00h Guyane
-    if heure_utc >= 19 or heure_utc < 3:
-        return []
-    return MARCHES
+    heure_utc  = datetime.now(timezone.utc).replace(tzinfo=None).hour
+    minute_utc = datetime.now(timezone.utc).replace(tzinfo=None).minute
+
+    # Session asiatique : 03h-07h50 UTC = 00h-04h50 Guyane
+    if 3 <= heure_utc < 7:
+        return MARCHES
+    if heure_utc == 7 and minute_utc < 50:
+        return MARCHES
+
+    # Session Londres/New York : 12h-19h UTC = 09h-16h Guyane
+    if 12 <= heure_utc < 19:
+        return MARCHES
+
+    # PAUSE dans tous les autres cas
+    return []
 
 def get_session_marche(symbole):
     """Retourne la session horaire d'un marché en heure Guyane."""
-    return "00h-16h Guyane"
+    heure_utc  = datetime.now(timezone.utc).replace(tzinfo=None).hour
+    minute_utc = datetime.now(timezone.utc).replace(tzinfo=None).minute
+    if (3 <= heure_utc < 7) or (heure_utc == 7 and minute_utc < 50):
+        return "00h-04h50 Guyane"
+    return "09h-16h Guyane"
 
 # ═══════════════════════════════════════════════════════════════
 #  ÉTAT GLOBAL
@@ -143,7 +161,7 @@ trades_lock       = None  # initialisé dans boucle_principale()
 log.info("=" * 60)
 log.info("  BOT HUMAIN — OLIDE973 V4")
 log.info(f"  Capital : {CAPITAL_INITIAL}€ | Levier x{LEVIER}")
-log.info(f"  Marchés actifs : {len(MARCHES)} cryptos | 00h-16h Guyane")
+log.info(f"  Marchés actifs : {len(MARCHES)} cryptos | 00h-04h50 et 09h-16h Guyane")
 log.info(f"  Signal : mouvement ≥ {SEUIL_MOUVEMENT_PCT}% depuis le prix de référence")
 log.info(f"  Surveillance temps réel — peu importe la durée")
 log.info(f"  RSI 1h : seuil bas={RSI_SEUIL_BAS} | seuil haut={RSI_SEUIL_HAUT} | inversion auto")
@@ -151,7 +169,7 @@ log.info(f"  Stop : {STOP_LOSS_PCT}% capital | plafonné {int(STOP_LOSS_MISE_MAX
 log.info(f"  Lock paliers : {LOCK_PALIERS_PCT}% du capital")
 log.info(f"  Cooldown : pause jusqu'à minuit après perte | 0 après gain")
 log.info(f"  Kill switch : {KILL_SWITCH_JOUR}€/jour | Ruine : {SEUIL_RUINE}€")
-log.info(f"  Horaires : 00h-16h Guyane (03h-19h UTC) tous marchés | 16h-00h=PAUSE")
+log.info(f"  Horaires : 00h-04h50 Guyane | PAUSE | 09h-16h Guyane | PAUSE")
 log.info(f"  Telegram : {'ON' if TELEGRAM_TOKEN else 'OFF'}")
 log.info("=" * 60)
 
