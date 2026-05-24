@@ -76,10 +76,7 @@ TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
 # ── Horaires de trading (heure Guyane = UTC-3)
-# Session 1 : 00h-04h50 Guyane (03h-07h50 UTC) — session asiatique
-# Pause     : 04h50-09h Guyane (07h50-12h UTC)
-# Session 2 : 09h-16h Guyane (12h-19h UTC) — session Londres/New York
-# Pause     : 16h-00h Guyane (19h-03h UTC)
+# Trading 24h/24 7j/7 — compteurs remis à 0 à minuit heure Guyane (UTC-3)
 
 MARCHES = [
     "ATOMUSDT", "NEARUSDT", "TRXUSDT",
@@ -118,37 +115,12 @@ KRAKEN_SYMBOLS = {
 }
 
 def get_marches_actifs():
-    """Retourne les marchés actifs selon l'heure UTC actuelle.
-
-    Heure Guyane = UTC-3
-    - 00h-04h50 Guyane (03h-07h50 UTC) → session asiatique
-    - 04h50-09h Guyane (07h50-12h UTC) → PAUSE
-    - 09h-16h Guyane (12h-19h UTC) → session Londres/New York
-    - 16h-00h Guyane (19h-03h UTC) → PAUSE
-    """
-    heure_utc  = datetime.now(timezone.utc).replace(tzinfo=None).hour
-    minute_utc = datetime.now(timezone.utc).replace(tzinfo=None).minute
-
-    # Session asiatique : 03h-07h50 UTC = 00h-04h50 Guyane
-    if 3 <= heure_utc < 7:
-        return MARCHES
-    if heure_utc == 7 and minute_utc < 50:
-        return MARCHES
-
-    # Session Londres/New York : 12h-19h UTC = 09h-16h Guyane
-    if 12 <= heure_utc < 19:
-        return MARCHES
-
-    # PAUSE dans tous les autres cas
-    return []
+    """Retourne tous les marchés — bot actif 24h/24 7j/7."""
+    return MARCHES
 
 def get_session_marche(symbole):
-    """Retourne la session horaire d'un marché en heure Guyane."""
-    heure_utc  = datetime.now(timezone.utc).replace(tzinfo=None).hour
-    minute_utc = datetime.now(timezone.utc).replace(tzinfo=None).minute
-    if (3 <= heure_utc < 7) or (heure_utc == 7 and minute_utc < 50):
-        return "00h-04h50 Guyane"
-    return "09h-16h Guyane"
+    """Session unique — trading continu."""
+    return "24h/24"
 
 # ═══════════════════════════════════════════════════════════════
 #  ÉTAT GLOBAL
@@ -161,7 +133,7 @@ trades_lock       = None  # initialisé dans boucle_principale()
 log.info("=" * 60)
 log.info("  BOT HUMAIN — OLIDE973 V4")
 log.info(f"  Capital : {CAPITAL_INITIAL}€ | Levier x{LEVIER}")
-log.info(f"  Marchés actifs : {len(MARCHES)} cryptos | 00h-04h50 et 09h-16h Guyane")
+log.info(f"  Marchés actifs : {len(MARCHES)} cryptos | 24h/24 7j/7")
 log.info(f"  Signal : mouvement ≥ {SEUIL_MOUVEMENT_PCT}% depuis le prix de référence")
 log.info(f"  Surveillance temps réel — peu importe la durée")
 log.info(f"  RSI 1h : seuil bas={RSI_SEUIL_BAS} | seuil haut={RSI_SEUIL_HAUT} | inversion auto")
@@ -169,7 +141,7 @@ log.info(f"  Stop : {STOP_LOSS_PCT}% capital | plafonné {int(STOP_LOSS_MISE_MAX
 log.info(f"  Lock paliers : {LOCK_PALIERS_PCT}% du capital")
 log.info(f"  Cooldown : pause jusqu'à minuit après perte | 0 après gain")
 log.info(f"  Kill switch : {KILL_SWITCH_JOUR}€/jour | Ruine : {SEUIL_RUINE}€")
-log.info(f"  Horaires : 00h-04h50 Guyane | PAUSE | 09h-16h Guyane | PAUSE")
+log.info(f"  Horaires : 24h/24 7j/7 | Compteurs remis à 0 à minuit Guyane")
 log.info(f"  Telegram : {'ON' if TELEGRAM_TOKEN else 'OFF'}")
 log.info("=" * 60)
 
@@ -531,12 +503,14 @@ async def executer_trade(session, symbole, direction, capital, details, etat, et
     async with trades_lock:
         trades_ouverts.pop(symbole, None)
         if resultat_final == "PERDU" or (resultat_final != "GAGNE" and gain_final < 0):
-            # Calculer le timestamp de minuit aujourd'hui
-            maintenant    = datetime.now()
-            minuit        = maintenant.replace(hour=0, minute=0, second=0, microsecond=0)
-            minuit_demain = minuit + timedelta(days=1)
-            cooldown_marches[symbole] = minuit_demain.timestamp()
-            log.info(f"  ❄️ [{symbole}] pause jusqu'à minuit — reprendra à 00h00")
+            # Minuit heure Guyane = 03h00 UTC
+            maintenant_guyane = datetime.now(timezone.utc) + timedelta(hours=-3)
+            minuit_guyane     = maintenant_guyane.replace(hour=0, minute=0, second=0, microsecond=0)
+            minuit_demain     = minuit_guyane + timedelta(days=1)
+            # Reconvertir en UTC pour timestamp
+            minuit_utc        = minuit_demain + timedelta(hours=3)
+            cooldown_marches[symbole] = minuit_utc.timestamp()
+            log.info(f"  ❄️ [{symbole}] pause jusqu'à minuit Guyane — reprendra à 00h00")
         else:
             cooldown_marches.pop(symbole, None)
             log.info(f"  ✅ [{symbole}] libéré immédiatement — trade gagnant")
@@ -631,11 +605,15 @@ def verifier_protections(etat, capital):
     return "OK"
 
 def reset_pnl_jour_si_nouveau_jour(etat):
-    aujourd_hui = datetime.now().strftime('%Y-%m-%d')
+    # Minuit heure Guyane = UTC-3
+    tz_guyane   = timedelta(hours=-3)
+    aujourd_hui = (datetime.now(timezone.utc) + tz_guyane).strftime('%Y-%m-%d')
     if etat.get("date_jour", "") != aujourd_hui:
-        etat["pnl_jour"]  = 0.0
-        etat["date_jour"] = aujourd_hui
-        log.info("  📅 Nouveau jour — PnL remis à 0")
+        etat["pnl_jour"]             = 0.0
+        etat["pertes_consecutives"]  = 0
+        etat["wins_consecutifs"]     = 0
+        etat["date_jour"]            = aujourd_hui
+        log.info("  📅 Nouveau jour Guyane — compteurs remis à 0")
 
 async def envoyer_rapport_quotidien(session, etat):
     """
