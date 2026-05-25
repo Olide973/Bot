@@ -41,7 +41,7 @@ MAX_TRADES_SIMULTANES   = 20
 # ── Détection signal mean reversion — surveillance temps réel
 SEUIL_MOUVEMENT_PCT     = 0.50   # dès que le prix bouge de 0.50% → signal
 VOLUME_MINI             = 0.25   # volume min vs moyenne 24h
-STOP_LOSS_EUR           = 15.0   # stop loss fixe à -15€ par trade
+STOP_LOSS_EUR           = 5.0    # stop loss fixe à -5€ par trade
 
 # ── Filtre RSI 1h
 RSI_SEUIL_BAS           = 45     # RSI < 45 → marché baissier → inverser ACHAT en VENTE
