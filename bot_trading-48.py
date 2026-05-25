@@ -41,8 +41,7 @@ MAX_TRADES_SIMULTANES   = 20
 # ── Détection signal mean reversion — surveillance temps réel
 SEUIL_MOUVEMENT_PCT     = 0.50   # dès que le prix bouge de 0.50% → signal
 VOLUME_MINI             = 0.25   # volume min vs moyenne 24h
-STOP_LOSS_PCT           = 2.0    # perte maximum = 2% du capital (comme les paliers)
-STOP_LOSS_MISE_MAX_PCT  = 0.50   # stop plafonné à 50% de la mise
+STOP_LOSS_EUR           = 15.0   # stop loss fixe à -15€ par trade
 
 # ── Filtre RSI 1h
 RSI_SEUIL_BAS           = 45     # RSI < 45 → marché baissier → inverser ACHAT en VENTE
@@ -137,7 +136,7 @@ log.info(f"  Marchés actifs : {len(MARCHES)} cryptos | 24h/24 7j/7")
 log.info(f"  Signal : mouvement ≥ {SEUIL_MOUVEMENT_PCT}% depuis le prix de référence")
 log.info(f"  Surveillance temps réel — peu importe la durée")
 log.info(f"  RSI 1h : seuil bas={RSI_SEUIL_BAS} | seuil haut={RSI_SEUIL_HAUT} | inversion auto")
-log.info(f"  Stop : {STOP_LOSS_PCT}% capital | plafonné {int(STOP_LOSS_MISE_MAX_PCT*100)}% mise")
+log.info(f"  Stop : fixe -{STOP_LOSS_EUR}€ par trade")
 log.info(f"  Lock paliers : {LOCK_PALIERS_PCT}% du capital")
 log.info(f"  Cooldown : pause jusqu'à minuit après perte | 0 après gain")
 log.info(f"  Kill switch : {KILL_SWITCH_JOUR}€/jour | Ruine : {SEUIL_RUINE}€")
@@ -356,13 +355,8 @@ async def executer_trade(session, symbole, direction, capital, details, etat, et
 
     mise = calculer_mise(capital, etat)
 
-    # Stop loss proportionnel au capital — 2% du capital
-    # Plafonné à 50% de la mise pour éviter un stop trop large
-    stop_loss_eur = round(capital * STOP_LOSS_PCT / 100, 2)
-    stop_loss_max_mise = round(mise * STOP_LOSS_MISE_MAX_PCT, 2)
-    if stop_loss_eur > stop_loss_max_mise:
-        stop_loss_eur = stop_loss_max_mise
-        log.info(f"  ⚠️ Stop plafonné à 50% mise : -{stop_loss_eur}€")
+    # Stop loss fixe à -15€ par trade
+    stop_loss_eur = STOP_LOSS_EUR
 
     rsi_1h        = details.get("rsi_1h", 50.0)
     session_label = get_session_marche(symbole)
@@ -994,7 +988,7 @@ async def boucle_principale():
             f"🚀 <b>BOT HUMAIN OLIDE973 V4 DÉMARRÉ</b>\n"
             f"Capital : {round(etat['capital'],2)}€\n"
             f"Signal : mouvement ≥ {SEUIL_MOUVEMENT_PCT}% depuis prix référence\n"
-            f"Lock paliers | Stop max -{STOP_LOSS_PCT}% du capital\n"
+            f"Lock paliers | Stop fixe -{STOP_LOSS_EUR}€ par trade\n"
             f"Kill switch : {KILL_SWITCH_JOUR}€/jour\n"
             f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
