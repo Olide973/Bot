@@ -33,7 +33,7 @@ LEVIER                  = 10
 MISE_BASE_PCT           = 0.10
 MISE_MIN                = 10.0
 MISE_MAX_PCT            = 0.25
-CHECK_INTERVAL          = 15         # secondes entre chaque check prix
+CHECK_INTERVAL          = 3          # secondes entre chaque check prix
 PAUSE_SCAN              = 30         # secondes entre chaque scan de nouveaux marchés
 MAX_TRADES_SIMULTANES   = 20         # 20 marchés max = 1 par marché
 
