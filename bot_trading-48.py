@@ -189,6 +189,7 @@ prix_reference    = {}    # { symbole: prix_au_moment_du_scan }
 cooldown_marches  = {}    # { symbole: timestamp_fin_cooldown }
 trades_lock       = None  # initialisé dans boucle_principale()
 PRIX_LIVE         = {}    # { symbole: dernier prix reçu via WebSocket OKX }
+PRIX_LIVE_TS      = {}    # { symbole: timestamp (time.time()) du dernier tick reçu — pour détecter un cache périmé
 WS_CONNEXION_ACTIVE = None  # référence à la connexion WebSocket en cours (pour forcer une resynchro)
 
 log.info("=" * 60)
@@ -277,14 +278,26 @@ async def get_prix_rest(session, symbole):
         log.error(f"Erreur prix REST {symbole} : {e}")
         return None
 
+SEUIL_FRAICHEUR_PRIX_SEC = 2.0  # au-delà, le cache WS est considéré périmé → vérification REST
+
 async def get_prix_actuel(session, symbole):
     """Prix temps réel : lit le cache alimenté par le WebSocket OKX.
-    Si aucun tick n'a encore été reçu pour ce marché (juste après démarrage
-    ou pendant une reconnexion), on retombe sur un appel REST ponctuel."""
+    Double contrôle de fraîcheur : si le dernier tick reçu pour ce marché date
+    de plus de SEUIL_FRAICHEUR_PRIX_SEC, on ne lui fait plus confiance (marché
+    peu liquide où OKX ne pousse pas de tick pendant plusieurs secondes) et on
+    va chercher un prix frais via REST — pour éviter de piloter un stop loss
+    sur une valeur périmée qui a pu bouger fortement entre-temps.
+    Si aucun tick n'a encore été reçu du tout (démarrage, reconnexion), on
+    retombe aussi sur REST."""
     prix_ws = PRIX_LIVE.get(symbole)
-    if prix_ws is not None:
+    ts_ws   = PRIX_LIVE_TS.get(symbole)
+    if prix_ws is not None and ts_ws is not None and (time.time() - ts_ws) <= SEUIL_FRAICHEUR_PRIX_SEC:
         return prix_ws
-    return await get_prix_rest(session, symbole)
+    prix_rest = await get_prix_rest(session, symbole)
+    if prix_rest is not None:
+        return prix_rest
+    # REST a échoué mais on a quand même un prix WS (même périmé) → mieux que rien
+    return prix_ws
 
 async def _ws_keepalive(ws):
     """Envoie un 'ping' applicatif toutes les 20s — requis par OKX pour garder
@@ -338,7 +351,8 @@ async def websocket_prix(session):
                             ticks   = data.get("data", [])
                             if symbole and ticks:
                                 try:
-                                    PRIX_LIVE[symbole] = float(ticks[0]["last"])
+                                    PRIX_LIVE[symbole]    = float(ticks[0]["last"])
+                                    PRIX_LIVE_TS[symbole] = time.time()
                                 except (KeyError, ValueError, TypeError):
                                     pass
                     elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
