@@ -2,7 +2,7 @@
 ╔══════════════════════════════════════════════════════════════════╗
 ║         BOT REIVAX284 — V4 — OKX (Swap Perpétuels x10)          ║
 ║  Mean Reversion 0.50% | Surveillance prix temps réel            ║
-║  Lock Profits Paliers | 10 marchés | 24h/24                     ║
+║  Lock Profits Paliers | 23 marchés (3 groupes horaires) | 24h/24 ║
 ║  Capital 500€ | Architecture async aiohttp | SIMULATION          ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
@@ -36,7 +36,7 @@ MISE_MIN                = 10.0
 MISE_MAX_PCT            = 0.25
 CHECK_INTERVAL          = 1          # secondes — lecture du cache WebSocket (quasi instantané, plus de coût REST)
 PAUSE_SCAN              = 30         # secondes entre chaque scan de nouveaux marchés
-MAX_TRADES_SIMULTANES   = 10         # 10 marchés max = 1 par marché
+MAX_TRADES_SIMULTANES   = 10         # cap fixe de trades parallèles (23 marchés dispo au total selon l'heure)
 
 # ── Détection signal mean reversion — surveillance temps réel
 SEUIL_MOUVEMENT_PCT     = 0.50   # dès que le prix bouge de 0.50% → signal
@@ -84,26 +84,58 @@ OKX_API_SECRET      = os.environ.get('OKX_API_SECRET', '')
 OKX_API_PASSPHRASE  = os.environ.get('OKX_API_PASSPHRASE', '')
 MODE_SIMULATION     = True   # passera à False le jour du live — aucun ordre réel tant que True
 
-# ── 10 marchés — trading 24h/24, 7j/7
-MARCHES = [
-    "NEARUSDT", "SOLUSDT",  "BNBUSDT",
-    "XRPUSDT",  "AVAXUSDT", "LINKUSDT",
-    "ADAUSDT",  "DOTUSDT",  "DOGEUSDT",
-    "ATOMUSDT",
+# ── 23 marchés en 3 groupes horaires (heure Guyane, UTC-3)
+#    Groupe 24H  : toujours actif
+#    Groupe NUIT : 00h-09h Guyane
+#    Groupe JOUR : 09h-20h Guyane
+#    Notes de substitution vs la liste d'origine :
+#    - FTM a été rebrandé en Sonic (S) — OKX a délisté le swap FTMUSDT le 07/01/2025
+#    - XMR a été délisté d'OKX en janvier 2024 (pression réglementaire MiCA/AMLR) → remplacé par BNB
+MARCHES_24H = [
+    "ATOMUSDT", "NEARUSDT", "BNBUSDT", "TRXUSDT",
+    "UNIUSDT",  "ARBUSDT",  "SONICUSDT", "SUIUSDT",
 ]
+MARCHES_NUIT = [
+    "ETHUSDT",  "XRPUSDT",  "SOLUSDT",  "ADAUSDT",
+    "LINKUSDT", "AVAXUSDT", "DOTUSDT",  "DOGEUSDT",
+    "LTCUSDT",  "ALGOUSDT", "FILUSDT",  "AAVEUSDT",
+    "POLUSDT",  "APEUSDT",
+]
+MARCHES_JOUR = ["TAOUSDT"]
+
+# ── Liste complète (union des 3 groupes) — utilisée pour l'abonnement WebSocket
+#    et la vérification des leviers : tous les marchés reçoivent des prix en continu,
+#    seul get_marches_actifs() filtre lesquels peuvent ouvrir un nouveau trade
+MARCHES = MARCHES_24H + MARCHES_NUIT + MARCHES_JOUR
 
 # ── Correspondance vers les instruments Swap Perpétuels OKX (x10 dispo dessus)
 OKX_SYMBOLS = {
-    "NEARUSDT":  "NEAR-USDT-SWAP",
-    "SOLUSDT":   "SOL-USDT-SWAP",
-    "BNBUSDT":   "BNB-USDT-SWAP",
-    "XRPUSDT":   "XRP-USDT-SWAP",
-    "AVAXUSDT":  "AVAX-USDT-SWAP",
-    "LINKUSDT":  "LINK-USDT-SWAP",
-    "ADAUSDT":   "ADA-USDT-SWAP",
-    "DOTUSDT":   "DOT-USDT-SWAP",
-    "DOGEUSDT":  "DOGE-USDT-SWAP",
-    "ATOMUSDT":  "ATOM-USDT-SWAP",
+    # Groupe 24H
+    "ATOMUSDT":   "ATOM-USDT-SWAP",
+    "NEARUSDT":   "NEAR-USDT-SWAP",
+    "BNBUSDT":    "BNB-USDT-SWAP",
+    "TRXUSDT":    "TRX-USDT-SWAP",
+    "UNIUSDT":    "UNI-USDT-SWAP",
+    "ARBUSDT":    "ARB-USDT-SWAP",
+    "SONICUSDT":  "S-USDT-SWAP",
+    "SUIUSDT":    "SUI-USDT-SWAP",
+    # Groupe NUIT
+    "ETHUSDT":    "ETH-USDT-SWAP",
+    "XRPUSDT":    "XRP-USDT-SWAP",
+    "SOLUSDT":    "SOL-USDT-SWAP",
+    "ADAUSDT":    "ADA-USDT-SWAP",
+    "LINKUSDT":   "LINK-USDT-SWAP",
+    "AVAXUSDT":   "AVAX-USDT-SWAP",
+    "DOTUSDT":    "DOT-USDT-SWAP",
+    "DOGEUSDT":   "DOGE-USDT-SWAP",
+    "LTCUSDT":    "LTC-USDT-SWAP",
+    "ALGOUSDT":   "ALGO-USDT-SWAP",
+    "FILUSDT":    "FIL-USDT-SWAP",
+    "AAVEUSDT":   "AAVE-USDT-SWAP",
+    "POLUSDT":    "POL-USDT-SWAP",
+    "APEUSDT":    "APE-USDT-SWAP",
+    # Groupe JOUR
+    "TAOUSDT":    "TAO-USDT-SWAP",
 }
 
 # ── Table inverse : instId OKX → symbole interne (pour router les ticks WebSocket)
@@ -116,8 +148,19 @@ BAR_MAP = {
 }
 
 def get_marches_actifs():
-    """Retourne tous les marchés — trading 24h/24, 7j/7."""
-    return MARCHES
+    """Retourne les marchés actifs selon l'heure Guyane (UTC-3) :
+    - Groupe 24H  (8 marchés)  : toujours actif
+    - Groupe NUIT (14 marchés) : actif 00h-09h Guyane
+    - Groupe JOUR (1 marché)   : actif 09h-20h Guyane
+    De 20h à minuit Guyane, seul le groupe 24H reste actif."""
+    heure_guyane = (datetime.utcnow() - timedelta(hours=3)).hour
+    actifs = list(MARCHES_24H)
+    if 0 <= heure_guyane < 9:
+        actifs += MARCHES_NUIT
+    if 9 <= heure_guyane < 20:
+        actifs += MARCHES_JOUR
+    return actifs
+
 
 # ═══════════════════════════════════════════════════════════════
 #  ÉTAT GLOBAL
@@ -237,7 +280,7 @@ async def _ws_keepalive(ws):
 async def websocket_prix(session):
     """Connexion WebSocket temps réel OKX (canal public 'tickers').
     Remplace le polling REST pour la détection de signal : PRIX_LIVE est mis
-    à jour en continu, dès qu'OKX pousse un tick, pour les 10 marchés suivis.
+    à jour en continu, dès qu'OKX pousse un tick, pour les 23 marchés suivis.
     Se reconnecte automatiquement en cas de coupure."""
     url = "wss://ws.okx.com:8443/ws/v5/public"
     args = [{"channel": "tickers", "instId": OKX_SYMBOLS[m]} for m in MARCHES]
@@ -248,7 +291,7 @@ async def websocket_prix(session):
             async with session.ws_connect(url, heartbeat=25) as ws:
                 await ws.send_json({"op": "subscribe", "args": args})
                 keepalive_task = asyncio.create_task(_ws_keepalive(ws))
-                log.info("  🔌 WebSocket OKX connecté — abonnement tickers (10 marchés)")
+                log.info(f"  🔌 WebSocket OKX connecté — abonnement tickers ({len(MARCHES)} marchés)")
 
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
@@ -282,6 +325,44 @@ async def websocket_prix(session):
 
         log.warning("  🔌 WebSocket OKX déconnecté — reconnexion dans 5s")
         await asyncio.sleep(5)
+
+async def verifier_leviers_okx(session):
+    """Interroge l'endpoint PUBLIC OKX (aucune clé requise) pour vérifier le levier
+    max réellement disponible sur chacun des 23 marchés suivis. Le site/l'app OKX
+    n'affichent pas toujours ce chiffre clairement — l'API le donne de façon fiable."""
+    url = "https://www.okx.com/api/v5/public/instruments"
+    problemes = []
+    for symbole, inst_id in OKX_SYMBOLS.items():
+        try:
+            async with session.get(
+                url,
+                params={"instType": "SWAP", "instId": inst_id},
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                data = await resp.json()
+                if data.get("code") != "0" or not data.get("data"):
+                    log.warning(f"  ⚠️ Levier {symbole} : impossible à vérifier (réponse OKX vide)")
+                    problemes.append(f"{symbole} : non vérifiable")
+                    continue
+                lever_max = float(data["data"][0].get("lever", 0) or 0)
+                if lever_max < LEVIER:
+                    log.warning(f"  ⚠️ {symbole} : levier max OKX = x{lever_max:.0f} < x{LEVIER} configuré !")
+                    problemes.append(f"{symbole} : max x{lever_max:.0f}")
+                else:
+                    log.info(f"  ✅ {symbole} : levier max OKX = x{lever_max:.0f} (x{LEVIER} disponible)")
+        except Exception as e:
+            log.error(f"Erreur vérification levier {symbole} : {e}")
+            problemes.append(f"{symbole} : erreur")
+        await asyncio.sleep(0.2)
+
+    if problemes:
+        await telegram(session,
+            f"🐉⚠️ <b>ALERTE LEVIER</b>\n"
+            f"Certains marchés ne supportent pas x{LEVIER} sur OKX :\n"
+            f"{chr(10).join(problemes)}\n"
+            f"Vérifie la config avant le passage en live."
+        )
+    return problemes
 
 # ═══════════════════════════════════════════════════════════════
 #  INDICATEURS
@@ -1051,6 +1132,9 @@ async def boucle_principale():
 
     connector = aiohttp.TCPConnector(limit=50)
     async with aiohttp.ClientSession(connector=connector) as session:
+        log.info("  🔍 Vérification des leviers réels disponibles sur OKX...")
+        await verifier_leviers_okx(session)
+
         # Lance le flux WebSocket temps réel en tâche de fond (reconnexion auto en cas de coupure)
         asyncio.create_task(websocket_prix(session))
         log.info("  ⏳ Attente des premiers ticks WebSocket (3s)...")
@@ -1059,7 +1143,7 @@ async def boucle_principale():
         await telegram(session,
             f"🐉🚀 <b>BOT REIVAX284 V4 OKX DÉMARRÉ (SIMULATION)</b>\n"
             f"Capital : {round(etat['capital'],2)}€\n"
-            f"10 marchés Swap Perpétuels x{LEVIER} | 24h/24 — 7j/7\n"
+            f"{len(MARCHES)} marchés Swap Perpétuels x{LEVIER} (3 groupes horaires Guyane) | 24h/24 — 7j/7\n"
             f"Prix temps réel : WebSocket OKX\n"
             f"Frais réels : -{FRAIS_TAKER_PCT}% taker (ouv+ferm)\n"
             f"Signal : mouvement ≥ {SEUIL_MOUVEMENT_PCT}%\n"
