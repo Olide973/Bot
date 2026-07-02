@@ -86,6 +86,14 @@ OKX_API_SECRET      = os.environ.get('OKX_API_SECRET', '')
 OKX_API_PASSPHRASE  = os.environ.get('OKX_API_PASSPHRASE', '')
 MODE_SIMULATION     = True   # passera à False le jour du live — aucun ordre réel tant que True
 
+# ── Reset complet piloté depuis Railway (Variables → RESET_TOUT = 1, puis Deploy)
+#    Remet à zéro : capital, PnL jour, kill switch, compteurs, historique.
+#    Ne touche PAS à l'historique brut en base (table 'trades') — juste l'état
+#    opérationnel du bot. Remettre à 0 (ou supprimer la variable) + redeploy
+#    pour revenir en fonctionnement normal sans redéclencher un reset à chaque
+#    redémarrage.
+RESET_TOUT = os.environ.get('RESET_TOUT', '0').strip().lower() in ('1', 'true', 'oui', 'yes')
+
 # ── 23 marchés en 3 groupes horaires (heure Guyane, UTC-3)
 #    Groupe 24H  : toujours actif
 #    Groupe NUIT : 00h-09h Guyane
@@ -403,15 +411,38 @@ async def decouvrir_et_filtrer_marches_xperp_x10(session):
         log.warning("  ⚠️ Découverte X-Perps impossible (réponse OKX invalide) — liste d'origine conservée")
         return
 
-    # Bases avec X-Perp valide : existe ET levier max >= LEVIER — on garde
-    # l'instrument complet (pas que le levier) pour récupérer son vrai instId
-    xperps = {}
+    # Filet de sécurité supplémentaire : tickers TradFi confirmés (lancement
+    # officiel OKX du 9 juin 2026 : Magnificent 7 + SPY/QQQ + 4 matières
+    # premières = 13 marchés), au cas où instCategory ne suffirait pas côté
+    # OKX. Complète, ne remplace pas, le filtre instCategory ci-dessus.
+    TRADFI_DENYLIST = {
+        "AAPL", "AMZN", "GOOGL", "GOOG", "META", "MSFT", "NVDA", "TSLA",  # Magnificent 7
+        "SPY", "QQQ",                                                     # indices
+        "GC", "SI", "CL", "BZ",                                          # or, argent, WTI, Brent
+        "CRCL",                                                          # Circle Internet Group (action NYSE, pas l'USDC)
+        "EWY", "EWJ", "EWZ", "EWG", "DIA", "IWM",                        # ETF pays/indices additionnels par précaution
+    }
+
+    # Bases avec X-Perp CRYPTO valide : existe, catégorie crypto (pas actions/
+    # matières premières/ETF/indices) ET levier max >= LEVIER.
+    #
+    # OKX propose aussi des X-Perps sur des actions (AAPL, GOOGL...), matières
+    # premières (CL=pétrole WTI, BZ=Brent...) et ETF (EWY=Corée du Sud...) —
+    # champ instCategory pour les distinguer (vide/absent = crypto, valeur du
+    # style "Stocks"/"Commodities"/"ETF" sinon). On exclut tout ce qui est tagué.
+    xperps_crypto = {}   # base → instrument, TOUTES les cryptos avec X-Perp (quel que soit le levier)
     for d in data.get("data", []):
         if d.get("ruleType") != "xperp":
             continue
+        if d.get("instCategory"):
+            continue  # tag non vide = actif non-crypto (actions, commodities, ETF...)
         base = d.get("instId", "").split("-")[0]
-        if not base:
+        if not base or base in TRADFI_DENYLIST:
             continue
+        xperps_crypto[base] = d
+
+    xperps = {}   # sous-ensemble : crypto ET levier max >= LEVIER
+    for base, d in xperps_crypto.items():
         try:
             lever_max = float(d.get("lever", 0))
         except (TypeError, ValueError):
@@ -443,6 +474,16 @@ async def decouvrir_et_filtrer_marches_xperp_x10(session):
     MARCHES_JOUR = filtrer_et_mettre_a_jour(MARCHES_JOUR)
     retires = [m for m in avant if m not in (MARCHES_24H + MARCHES_NUIT + MARCHES_JOUR)]
 
+    # Détail de la raison du retrait : X-Perp absent, ou présent mais levier < x{LEVIER}
+    retires_detail = []
+    for m in retires:
+        base = base_actuelle(m)
+        if base in xperps_crypto:
+            lever_reel = xperps_crypto[base].get("lever", "?")
+            retires_detail.append(f"{m} (X-Perp existe mais levier max=x{lever_reel})")
+        else:
+            retires_detail.append(f"{m} (aucun X-Perp crypto trouvé)")
+
     # 2) Découvrir les bases éligibles qu'on ne suit pas encore
     bases_connues    = {base_actuelle(m) for m in (MARCHES_24H + MARCHES_NUIT + MARCHES_JOUR)}
     nouvelles_bases  = sorted(b for b in xperps if b not in bases_connues)
@@ -460,7 +501,7 @@ async def decouvrir_et_filtrer_marches_xperp_x10(session):
     MARCHES = MARCHES_24H + MARCHES_NUIT + MARCHES_JOUR
 
     if retires:
-        log.warning(f"  🚫 Marchés retirés (X-Perp x{LEVIER} indisponible) : {', '.join(retires)}")
+        log.warning(f"  🚫 Marchés retirés : {' | '.join(retires_detail)}")
     if ajoutes:
         log.info(f"  ➕ Nouveaux marchés découverts (X-Perp x{LEVIER} confirmé) : {', '.join(ajoutes)}")
     if ignorees_par_cap:
@@ -473,6 +514,7 @@ async def decouvrir_et_filtrer_marches_xperp_x10(session):
         f"➕ Ajoutés ({len(ajoutes)}) : {', '.join(ajoutes) if ajoutes else 'aucun'}\n\n"
         f"🚫 Retirés ({len(retires)}) : {', '.join(retires) if retires else 'aucun'}"
         + (f"\n\n⏭️ {len(ignorees_par_cap)} ignoré(s) par le cap ({NOUVEAUX_MARCHES_MAX} max/scan)" if ignorees_par_cap else "")
+        + f"\n\n📋 Liste complète actuelle ({len(MARCHES)}) :\n{', '.join(sorted(MARCHES))}"
     )
 
     # Si la liste de marchés a changé, force une reconnexion WebSocket pour que
@@ -878,9 +920,10 @@ def reset_pnl_jour_si_nouveau_jour(etat):
     maintenant_guyane = datetime.utcnow() - timedelta(hours=3)
     aujourd_hui = maintenant_guyane.strftime('%Y-%m-%d')
     if etat.get("date_jour", "") != aujourd_hui:
-        etat["pnl_jour"]  = 0.0
-        etat["date_jour"] = aujourd_hui
-        log.info("  📅 Nouveau jour — PnL remis à 0")
+        etat["pnl_jour"]         = 0.0
+        etat["wins_consecutifs"] = 0
+        etat["date_jour"]        = aujourd_hui
+        log.info("  📅 Nouveau jour — PnL et wins consécutifs remis à 0")
 
 # ═══════════════════════════════════════════════════════════════
 #  RAPPORT QUOTIDIEN
@@ -1260,6 +1303,11 @@ async def boucle_principale():
     init_database()
     etat = charger_etat()
 
+    if RESET_TOUT:
+        log.warning("  🔄 RESET_TOUT activé sur Railway — remise à zéro complète de l'état du bot")
+        etat = {}
+        sauvegarder_etat(etat)
+
     # Initialiser les champs manquants
     for champ, valeur in [
         ("capital", CAPITAL_INITIAL),
@@ -1293,7 +1341,8 @@ async def boucle_principale():
         await asyncio.sleep(3)
 
         await telegram(session,
-            f"🐉🚀 <b>BOT REIVAX284 V4 OKX DÉMARRÉ (SIMULATION)</b>\n"
+            (f"🐉🔄 <b>RESET COMPLET EFFECTUÉ</b>\nCapital, PnL, compteurs et historique remis à zéro.\n\n" if RESET_TOUT else "")
+            + f"🐉🚀 <b>BOT REIVAX284 V4 OKX DÉMARRÉ (SIMULATION)</b>\n"
             f"Capital : {round(etat['capital'],2)}€\n"
             f"{len(MARCHES)} marchés X-Perps x{LEVIER} (3 groupes horaires Guyane) | 24h/24 — 7j/7\n"
             f"Prix temps réel : WebSocket OKX (instId X-Perp réels)\n"
