@@ -411,34 +411,52 @@ async def decouvrir_et_filtrer_marches_xperp_x10(session):
         log.warning("  ⚠️ Découverte X-Perps impossible (réponse OKX invalide) — liste d'origine conservée")
         return
 
-    # Filet de sécurité supplémentaire : tickers TradFi confirmés (lancement
-    # officiel OKX du 9 juin 2026 : Magnificent 7 + SPY/QQQ + 4 matières
-    # premières = 13 marchés). C'est la protection PRINCIPALE désormais.
+    # Test structurel fiable pour distinguer crypto vs actions/commodities/ETF :
+    # une vraie crypto a presque toujours une paire USDT ou USDC au comptant
+    # sur OKX (270+ cryptos listées) ; une action (INTC, MSTR, MU, MRVL...) ou
+    # une matière première n'en a jamais. Contrairement au champ instCategory
+    # (peu fiable — un bug précédent avait tout exclu, cryptos comprises), ce
+    # test s'auto-met à jour à mesure qu'OKX ajoute de nouvelles actions,
+    # sans liste à maintenir à la main.
+    bases_crypto_confirmees = None  # None = vérification indisponible, filtre désactivé cette fois
+    try:
+        async with session.get(
+            url_instruments,
+            params={"instType": "SPOT"},
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
+            spot_data = await resp.json()
+        if spot_data.get("code") == "0" and spot_data.get("data"):
+            bases_crypto_confirmees = set()
+            for d in spot_data["data"]:
+                inst_id = d.get("instId", "")
+                if inst_id.endswith("-USDT") or inst_id.endswith("-USDC"):
+                    bases_crypto_confirmees.add(inst_id.split("-")[0])
+    except Exception as e:
+        log.error(f"Erreur vérification SPOT crypto : {e} — filtre crypto désactivé cette fois")
+
+    # Filet de sécurité manuel supplémentaire (tickers TradFi confirmés) — en
+    # renfort du test structurel ci-dessus, pas en remplacement.
     TRADFI_DENYLIST = {
         "AAPL", "AMZN", "GOOGL", "GOOG", "META", "MSFT", "NVDA", "TSLA",  # Magnificent 7
         "SPY", "QQQ",                                                     # indices
         "GC", "SI", "CL", "BZ",                                          # or, argent, WTI, Brent
         "CRCL",                                                          # Circle Internet Group (action NYSE, pas l'USDC)
         "EWY", "EWJ", "EWZ", "EWG", "DIA", "IWM",                        # ETF pays/indices additionnels par précaution
+        "INTC", "MSTR", "MU", "MRVL",                                    # Intel, Strategy, Micron, Marvell (actions tech)
     }
-    # Valeurs CONNUES et CONFIRMÉES du champ instCategory pour du non-crypto.
-    # On exclut seulement sur correspondance explicite — pas sur "champ non
-    # vide", car les cryptos ont aussi une catégorie renseignée côté OKX
-    # (leçon d'un bug précédent qui avait exclu TOUT, cryptos comprises).
-    CATEGORIES_NON_CRYPTO = {"stocks", "commodities", "commodity", "etf", "indices", "index", "equity", "equities"}
 
-    # Bases avec X-Perp CRYPTO valide : existe, pas taguée non-crypto, et pas
-    # dans la liste de blocage manuelle, ET levier max >= LEVIER.
+    # Bases avec X-Perp CRYPTO valide : existe, confirmée crypto par le test
+    # structurel (paire SPOT USDT/USDC), pas dans la liste de blocage manuelle.
     xperps_crypto = {}   # base → instrument, TOUTES les cryptos avec X-Perp (quel que soit le levier)
     for d in data.get("data", []):
         if d.get("ruleType") != "xperp":
             continue
-        categorie = str(d.get("instCategory", "")).strip().lower()
-        if categorie in CATEGORIES_NON_CRYPTO:
-            continue
         base = d.get("instId", "").split("-")[0]
         if not base or base in TRADFI_DENYLIST:
             continue
+        if bases_crypto_confirmees is not None and base not in bases_crypto_confirmees:
+            continue  # pas de paire crypto au comptant → probablement une action/commodity/ETF
         xperps_crypto[base] = d
 
     xperps = {}   # sous-ensemble : crypto ET levier max >= LEVIER
