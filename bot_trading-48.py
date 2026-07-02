@@ -368,8 +368,6 @@ async def websocket_prix(session):
         log.warning("  🔌 WebSocket OKX déconnecté — reconnexion dans 5s")
         await asyncio.sleep(5)
 
-MARCHES_TOTAL_MAX = 20  # garde-fou : nombre total de marchés actifs, pas juste par scan
-
 async def get_funding_rate(session, inst_id):
     """Taux de financement actuel d'un instrument (public, sans clé API).
     Fonctionne pour les X-Perps comme pour les Swaps Perpétuels classiques."""
@@ -406,11 +404,8 @@ async def decouvrir_et_filtrer_marches_xperp_x10(session, etat):
        et met à jour leur instId vers le X-Perp actuel (peut changer dans le temps).
     2) Découvre les bases qui ont un X-Perp x{LEVIER} mais qu'on ne suit pas
        encore, et les ajoute directement au groupe 24H.
-    3) Plafonne le nombre TOTAL de marchés actifs à MARCHES_TOTAL_MAX — pas
-       seulement les ajouts du jour. Si la liste actuelle dépasse déjà ce
-       total, aucun nouveau marché n'est ajouté tant qu'elle n'est pas
-       redescendue en dessous (via des retraits naturels), pour ne pas couper
-       brutalement un marché sur lequel un trade est peut-être ouvert.
+    3) Aucun plafond total — tous les marchés crypto x{LEVIER} découverts
+       sont conservés.
     4) Sauvegarde la liste résultante dans 'etat' (persistée en base) pour
        qu'elle survive aux redémarrages Railway — sinon la découverte
        repartirait de la liste statique d'origine à chaque redéploiement,
@@ -545,14 +540,10 @@ async def decouvrir_et_filtrer_marches_xperp_x10(session, etat):
         else:
             retires_detail.append(f"{m} (aucun X-Perp crypto trouvé)")
 
-    # 2) Découvrir les bases éligibles qu'on ne suit pas encore — dans la
-    #    limite du nombre TOTAL de marchés autorisé (MARCHES_TOTAL_MAX)
-    total_actuel     = len(MARCHES_24H) + len(MARCHES_NUIT) + len(MARCHES_JOUR)
-    places_dispo     = max(0, MARCHES_TOTAL_MAX - total_actuel)
+    # 2) Découvrir toutes les bases éligibles qu'on ne suit pas encore — plus
+    #    de plafond total, tous les marchés crypto x{LEVIER} découverts sont conservés
     bases_connues    = {base_actuelle(m) for m in (MARCHES_24H + MARCHES_NUIT + MARCHES_JOUR)}
     nouvelles_bases  = sorted(b for b in xperps if b not in bases_connues)
-    ignorees_par_cap = nouvelles_bases[places_dispo:]
-    nouvelles_bases  = nouvelles_bases[:places_dispo]
 
     ajoutes = []
     for base in nouvelles_bases:
@@ -561,24 +552,12 @@ async def decouvrir_et_filtrer_marches_xperp_x10(session, etat):
         MARCHES_24H.append(symbole)
         ajoutes.append(symbole)
 
-    # Recadrage immédiat : si le total dépasse encore MARCHES_TOTAL_MAX (ex:
-    # la liste était déjà au-dessus du cap avant même ce scan), on retire les
-    # marchés ajoutés le plus récemment en premier — les plus anciens/établis
-    # sont conservés en priorité.
-    retires_cap = []
-    excedent = (len(MARCHES_24H) + len(MARCHES_NUIT) + len(MARCHES_JOUR)) - MARCHES_TOTAL_MAX
-    if excedent > 0:
-        retires_cap = MARCHES_24H[-excedent:]
-        MARCHES_24H = MARCHES_24H[:-excedent]
-        retires_detail += [f"{m} (retiré pour respecter le cap total de {MARCHES_TOTAL_MAX})" for m in retires_cap]
-        retires += retires_cap
-
     OKX_SYMBOLS_INVERSE = {v: k for k, v in OKX_SYMBOLS.items()}
     MARCHES = MARCHES_24H + MARCHES_NUIT + MARCHES_JOUR
 
     # Persistance en base — sans ça, la découverte repartirait de la liste
-    # statique d'origine à chaque redémarrage Railway, et le tirage
-    # alphabétique du cap donnerait un résultat différent à chaque fois.
+    # statique d'origine à chaque redémarrage Railway au lieu de continuer
+    # d'où elle en était.
     etat["marches_24h"]   = MARCHES_24H
     etat["marches_nuit"]  = MARCHES_NUIT
     etat["marches_jour"]  = MARCHES_JOUR
@@ -589,8 +568,6 @@ async def decouvrir_et_filtrer_marches_xperp_x10(session, etat):
         log.warning(f"  🚫 Marchés retirés : {' | '.join(retires_detail)}")
     if ajoutes:
         log.info(f"  ➕ Nouveaux marchés découverts (X-Perp x{LEVIER} confirmé) : {', '.join(ajoutes)}")
-    if ignorees_par_cap:
-        log.info(f"  ⏭️ {len(ignorees_par_cap)} marché(s) supplémentaire(s) ignoré(s) (cap total à {MARCHES_TOTAL_MAX} marchés) : {', '.join(ignorees_par_cap)}")
     log.info(f"  Marchés actifs après découverte : {len(MARCHES)} (dont {len(ajoutes)} nouveaux, {len(retires)} retirés)")
 
     await telegram(session,
@@ -598,7 +575,6 @@ async def decouvrir_et_filtrer_marches_xperp_x10(session, etat):
         f"Total marchés actifs : <b>{len(MARCHES)}</b>\n\n"
         f"➕ Ajoutés ({len(ajoutes)}) : {', '.join(ajoutes) if ajoutes else 'aucun'}\n\n"
         f"🚫 Retirés ({len(retires)}) : {', '.join(retires) if retires else 'aucun'}"
-        + (f"\n\n⏭️ {len(ignorees_par_cap)} ignoré(s) (cap total {MARCHES_TOTAL_MAX} marchés)" if ignorees_par_cap else "")
         + f"\n\n📋 Liste complète actuelle ({len(MARCHES)}) :\n{', '.join(sorted(MARCHES))}"
     )
 
