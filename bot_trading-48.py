@@ -413,8 +413,7 @@ async def decouvrir_et_filtrer_marches_xperp_x10(session):
 
     # Filet de sécurité supplémentaire : tickers TradFi confirmés (lancement
     # officiel OKX du 9 juin 2026 : Magnificent 7 + SPY/QQQ + 4 matières
-    # premières = 13 marchés), au cas où instCategory ne suffirait pas côté
-    # OKX. Complète, ne remplace pas, le filtre instCategory ci-dessus.
+    # premières = 13 marchés). C'est la protection PRINCIPALE désormais.
     TRADFI_DENYLIST = {
         "AAPL", "AMZN", "GOOGL", "GOOG", "META", "MSFT", "NVDA", "TSLA",  # Magnificent 7
         "SPY", "QQQ",                                                     # indices
@@ -422,20 +421,21 @@ async def decouvrir_et_filtrer_marches_xperp_x10(session):
         "CRCL",                                                          # Circle Internet Group (action NYSE, pas l'USDC)
         "EWY", "EWJ", "EWZ", "EWG", "DIA", "IWM",                        # ETF pays/indices additionnels par précaution
     }
+    # Valeurs CONNUES et CONFIRMÉES du champ instCategory pour du non-crypto.
+    # On exclut seulement sur correspondance explicite — pas sur "champ non
+    # vide", car les cryptos ont aussi une catégorie renseignée côté OKX
+    # (leçon d'un bug précédent qui avait exclu TOUT, cryptos comprises).
+    CATEGORIES_NON_CRYPTO = {"stocks", "commodities", "commodity", "etf", "indices", "index", "equity", "equities"}
 
-    # Bases avec X-Perp CRYPTO valide : existe, catégorie crypto (pas actions/
-    # matières premières/ETF/indices) ET levier max >= LEVIER.
-    #
-    # OKX propose aussi des X-Perps sur des actions (AAPL, GOOGL...), matières
-    # premières (CL=pétrole WTI, BZ=Brent...) et ETF (EWY=Corée du Sud...) —
-    # champ instCategory pour les distinguer (vide/absent = crypto, valeur du
-    # style "Stocks"/"Commodities"/"ETF" sinon). On exclut tout ce qui est tagué.
+    # Bases avec X-Perp CRYPTO valide : existe, pas taguée non-crypto, et pas
+    # dans la liste de blocage manuelle, ET levier max >= LEVIER.
     xperps_crypto = {}   # base → instrument, TOUTES les cryptos avec X-Perp (quel que soit le levier)
     for d in data.get("data", []):
         if d.get("ruleType") != "xperp":
             continue
-        if d.get("instCategory"):
-            continue  # tag non vide = actif non-crypto (actions, commodities, ETF...)
+        categorie = str(d.get("instCategory", "")).strip().lower()
+        if categorie in CATEGORIES_NON_CRYPTO:
+            continue
         base = d.get("instId", "").split("-")[0]
         if not base or base in TRADFI_DENYLIST:
             continue
@@ -449,6 +449,23 @@ async def decouvrir_et_filtrer_marches_xperp_x10(session):
             continue
         if lever_max >= LEVIER:
             xperps[base] = d
+
+    # ── Garde-fou critique : si la découverte trouve anormalement peu de
+    #    marchés crypto éligibles (bug de filtrage, réponse OKX incomplète...),
+    #    on N'APPLIQUE AUCUN changement plutôt que de risquer de vider la liste
+    #    active. Seuil arbitraire mais sûr : on avait déjà confirmé au moins
+    #    10 marchés crypto x10 sur OKX, donc bien en dessous = anomalie.
+    SEUIL_MIN_MARCHES_SURS = 5
+    if len(xperps) < SEUIL_MIN_MARCHES_SURS:
+        log.error(f"  ❌ ANOMALIE : seulement {len(xperps)} marché(s) crypto x{LEVIER} trouvé(s) "
+                  f"(seuil de sécurité : {SEUIL_MIN_MARCHES_SURS}) — liste actuelle conservée intégralement")
+        await telegram(session,
+            f"🐉❌ <b>ANOMALIE DÉCOUVERTE X-PERP</b>\n"
+            f"Seulement {len(xperps)} marché(s) crypto trouvé(s), en dessous du seuil de sécurité.\n"
+            f"Aucun changement appliqué — liste actuelle conservée.\n"
+            f"Vérifie les logs Railway."
+        )
+        return
 
     def base_actuelle(symbole):
         """Ticker de base déduit de l'instId actuellement connu (X-Perp d'un
