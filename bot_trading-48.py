@@ -364,6 +364,59 @@ async def verifier_leviers_okx(session):
         )
     return problemes
 
+async def verifier_xperps_okx(session):
+    """Interroge l'API PUBLIQUE OKX (instType=FUTURES, ruleType=xperp) pour lister
+    automatiquement les contrats X-Perps réellement disponibles, et croise avec
+    les 23 marchés du bot. Les X-Perps sont le produit à levier accessible sur le
+    compte France/EEA (plafonné à x10) — différent des Swaps Perpétuels classiques
+    utilisés pour les prix en simulation. Purement informatif, envoyé une fois au
+    démarrage pour préparer le passage en live sans avoir à chercher marché par
+    marché dans l'app."""
+    url = "https://www.okx.com/api/v5/public/instruments"
+    try:
+        async with session.get(
+            url,
+            params={"instType": "FUTURES"},
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
+            data = await resp.json()
+    except Exception as e:
+        log.error(f"Erreur vérification X-Perps : {e}")
+        return
+
+    if data.get("code") != "0":
+        log.warning(f"  ⚠️ Vérification X-Perps impossible (code={data.get('code')})")
+        return
+
+    xperps = {}
+    for d in data.get("data", []):
+        if d.get("ruleType") == "xperp":
+            base = d.get("instId", "").split("-")[0]
+            if base:
+                xperps[base] = d
+
+    disponibles = []
+    absents = []
+    for symbole, okx_symbol in OKX_SYMBOLS.items():
+        base = okx_symbol.split("-")[0]
+        if base in xperps:
+            lever = xperps[base].get("lever", "?")
+            disponibles.append(f"{symbole} (x{lever})")
+        else:
+            absents.append(symbole)
+
+    log.info(f"  X-Perps disponibles ({len(disponibles)}/{len(OKX_SYMBOLS)}) : "
+             f"{', '.join(disponibles) if disponibles else 'aucun'}")
+    if absents:
+        log.info(f"  X-Perps absents ({len(absents)}) : {', '.join(absents)}")
+
+    await telegram(session,
+        f"🐉📋 <b>X-PERPS DISPONIBLES (compte France/EEA)</b>\n"
+        f"{len(disponibles)}/{len(OKX_SYMBOLS)} marchés du bot ont un X-Perp :\n"
+        f"{chr(10).join(disponibles) if disponibles else 'Aucun'}\n\n"
+        f"Absents : {', '.join(absents) if absents else 'aucun'}"
+    )
+
 # ═══════════════════════════════════════════════════════════════
 #  INDICATEURS
 # ═══════════════════════════════════════════════════════════════
@@ -1134,6 +1187,9 @@ async def boucle_principale():
     async with aiohttp.ClientSession(connector=connector) as session:
         log.info("  🔍 Vérification des leviers réels disponibles sur OKX...")
         await verifier_leviers_okx(session)
+
+        log.info("  🔍 Vérification des X-Perps disponibles (compte France/EEA)...")
+        await verifier_xperps_okx(session)
 
         # Lance le flux WebSocket temps réel en tâche de fond (reconnexion auto en cas de coupure)
         asyncio.create_task(websocket_prix(session))
