@@ -57,6 +57,8 @@ def init_database():
                 objectif DOUBLE PRECISION,
                 mise DOUBLE PRECISION,
                 gain DOUBLE PRECISION,
+                frais DOUBLE PRECISION,
+                funding DOUBLE PRECISION,
                 capital_apres DOUBLE PRECISION,
                 duree_minutes INTEGER,
                 score DOUBLE PRECISION,
@@ -66,6 +68,10 @@ def init_database():
                 cree_le TIMESTAMP DEFAULT NOW()
             );
         """)
+        # Migration : ajoute les colonnes ajoutées après la création initiale
+        # de la table 'trades' (déploiements précédents)
+        conn.run("ALTER TABLE trades ADD COLUMN IF NOT EXISTS frais DOUBLE PRECISION;")
+        conn.run("ALTER TABLE trades ADD COLUMN IF NOT EXISTS funding DOUBLE PRECISION;")
         conn.close()
         log.info("  Base de données initialisée (etat_bot, trades)")
     except Exception as e:
@@ -113,11 +119,11 @@ def enregistrer_trade(trade):
         conn.run("""
             INSERT INTO trades (
                 marche, direction, resultat, prix_entree, prix_sortie,
-                stop_loss, objectif, mise, gain, capital_apres,
+                stop_loss, objectif, mise, gain, frais, funding, capital_apres,
                 duree_minutes, score, adx, atr, rsi
             ) VALUES (
                 :marche, :direction, :resultat, :prix_entree, :prix_sortie,
-                :stop_loss, :objectif, :mise, :gain, :capital_apres,
+                :stop_loss, :objectif, :mise, :gain, :frais, :funding, :capital_apres,
                 :duree_minutes, :score, :adx, :atr, :rsi
             );
         """,
@@ -130,6 +136,8 @@ def enregistrer_trade(trade):
             objectif=trade.get("objectif"),
             mise=trade.get("mise"),
             gain=trade.get("gain"),
+            frais=trade.get("frais"),
+            funding=trade.get("funding"),
             capital_apres=trade.get("capital_apres"),
             duree_minutes=trade.get("duree_minutes"),
             score=trade.get("score"),
