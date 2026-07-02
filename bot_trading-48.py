@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║         BOT REIVAX284 — V4 — OKX (Swap Perpétuels x10)          ║
+║         BOT REIVAX284 — V4 — OKX X-Perps x10                    ║
 ║  Mean Reversion 0.50% | Surveillance prix temps réel            ║
 ║  Lock Profits Paliers | 23 marchés (3 groupes horaires) | 24h/24 ║
 ║  Capital 500€ | Architecture async aiohttp | SIMULATION          ║
@@ -43,10 +43,12 @@ SEUIL_MOUVEMENT_PCT     = 0.50   # dès que le prix bouge de 0.50% → signal
 VOLUME_MINI             = 0.25   # volume min vs moyenne 24h
 STOP_LOSS_FIXE          = 2.0    # stop fixe = -2€ par trade (avant frais), ni plus ni moins
 
-# ── Frais réels OKX — Swap Perpétuels, palier standard (non-VIP)
-#    Maker 0.02% / Taker 0.05% du notionnel. Le bot réagit à un signal et sort
-#    au marché à l'ouverture ET à la fermeture → taker des deux côtés.
+# ── Frais réels OKX — identiques pour Swap Perpétuels ET X-Perps, palier standard
+#    Maker 0.02% / Taker 0.05% du notionnel (confirmé pour les deux produits).
 FRAIS_TAKER_PCT          = 0.05   # % du notionnel, par exécution (ouverture OU fermeture)
+
+# ── Funding (financement) — X-Perps réglés toutes les 8h : 00h, 08h, 16h UTC
+FUNDING_HEURES_UTC       = {0, 8, 16}
 
 # ── Filtre RSI 1h
 RSI_SEUIL_BAS           = 45     # RSI < 45 → marché baissier → inverser ACHAT en VENTE
@@ -108,7 +110,12 @@ MARCHES_JOUR = ["TAOUSDT"]
 #    seul get_marches_actifs() filtre lesquels peuvent ouvrir un nouveau trade
 MARCHES = MARCHES_24H + MARCHES_NUIT + MARCHES_JOUR
 
-# ── Correspondance vers les instruments Swap Perpétuels OKX (x10 dispo dessus)
+# ── Valeurs INITIALES (placeholders) — écrasées au tout premier démarrage par
+#    decouvrir_et_filtrer_marches_xperp_x10() avec le VRAI instId du X-Perp
+#    (ex: BTC-USD-YYMMDD). Ces valeurs "-USDT-SWAP" ne servent qu'à identifier
+#    le ticker de base avant la première découverte, et comme repli si jamais
+#    l'API X-Perp est indisponible au démarrage (le bot tourne alors sur les
+#    Swaps Perpétuels classiques plutôt que de ne pas démarrer du tout).
 OKX_SYMBOLS = {
     # Groupe 24H
     "ATOMUSDT":   "ATOM-USDT-SWAP",
@@ -173,7 +180,7 @@ PRIX_LIVE         = {}    # { symbole: dernier prix reçu via WebSocket OKX }
 WS_CONNEXION_ACTIVE = None  # référence à la connexion WebSocket en cours (pour forcer une resynchro)
 
 log.info("=" * 60)
-log.info("  BOT REIVAX284 — V4 — OKX (Swap Perpétuels x10)")
+log.info("  BOT REIVAX284 — V4 — OKX X-Perps x10")
 log.info(f"  Capital : {CAPITAL_INITIAL}€ | Levier x{LEVIER}")
 log.info(f"  Marchés : {len(MARCHES)} cryptos | 24h/24 — 7j/7")
 log.info(f"  Signal : mouvement ≥ {SEUIL_MOUVEMENT_PCT}% depuis le prix de référence")
@@ -334,62 +341,50 @@ async def websocket_prix(session):
         log.warning("  🔌 WebSocket OKX déconnecté — reconnexion dans 5s")
         await asyncio.sleep(5)
 
-async def verifier_leviers_okx(session):
-    """Interroge l'endpoint PUBLIC OKX (aucune clé requise) pour vérifier le levier
-    max réellement disponible sur chacun des 23 marchés suivis. Le site/l'app OKX
-    n'affichent pas toujours ce chiffre clairement — l'API le donne de façon fiable."""
-    url = "https://www.okx.com/api/v5/public/instruments"
-    problemes = []
-    for symbole, inst_id in OKX_SYMBOLS.items():
-        try:
-            async with session.get(
-                url,
-                params={"instType": "SWAP", "instId": inst_id},
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                data = await resp.json()
-                if data.get("code") != "0" or not data.get("data"):
-                    log.warning(f"  ⚠️ Levier {symbole} : impossible à vérifier (réponse OKX vide)")
-                    problemes.append(f"{symbole} : non vérifiable")
-                    continue
-                lever_max = float(data["data"][0].get("lever", 0) or 0)
-                if lever_max < LEVIER:
-                    log.warning(f"  ⚠️ {symbole} : levier max OKX = x{lever_max:.0f} < x{LEVIER} configuré !")
-                    problemes.append(f"{symbole} : max x{lever_max:.0f}")
-                else:
-                    log.info(f"  ✅ {symbole} : levier max OKX = x{lever_max:.0f} (x{LEVIER} disponible)")
-        except Exception as e:
-            log.error(f"Erreur vérification levier {symbole} : {e}")
-            problemes.append(f"{symbole} : erreur")
-        await asyncio.sleep(0.2)
-
-    if problemes:
-        await telegram(session,
-            f"🐉⚠️ <b>ALERTE LEVIER</b>\n"
-            f"Certains marchés ne supportent pas x{LEVIER} sur OKX :\n"
-            f"{chr(10).join(problemes)}\n"
-            f"Vérifie la config avant le passage en live."
-        )
-    return problemes
-
 NOUVEAUX_MARCHES_MAX = 20  # garde-fou : évite une explosion du nombre de marchés scannés/appels API
+
+async def get_funding_rate(session, inst_id):
+    """Taux de financement actuel d'un instrument (public, sans clé API).
+    Fonctionne pour les X-Perps comme pour les Swaps Perpétuels classiques."""
+    try:
+        async with session.get(
+            "https://www.okx.com/api/v5/public/funding-rate",
+            params={"instId": inst_id},
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+            if data.get("code") != "0":
+                return None
+            result = data.get("data", [])
+            if not result:
+                return None
+            return float(result[0]["fundingRate"])
+    except Exception as e:
+        log.error(f"Erreur funding rate {inst_id} : {e}")
+        return None
 
 async def decouvrir_et_filtrer_marches_xperp_x10(session):
     """Construit la liste des marchés à partir de TOUS les X-Perps OKX supportant
     réellement le levier x{LEVIER} (API publique, instType=FUTURES, ruleType=xperp)
     — pas seulement les marchés déjà codés en dur dans le bot.
 
+    IMPORTANT : à partir d'ici, OKX_SYMBOLS pointe vers le VRAI instId du X-Perp
+    (ex: BTC-USD-YYMMDD), pas vers un Swap Perpétuel classique. C'est ce même
+    instId qui alimente ensuite les prix, les chandelles, le WebSocket et le
+    funding en simulation — pour coller au plus près du produit réellement
+    tradable en live sur le compte France/EEA.
+
     Étapes :
-    1) Retire les marchés déjà connus qui n'ont plus de X-Perp x{LEVIER} valide.
-    2) Découvre les bases qui ont un X-Perp x{LEVIER} mais qu'on ne suit pas encore,
-       vérifie qu'un Swap Perpétuel USDT correspondant existe (c'est la source de
-       prix utilisée en simulation, différente du X-Perp), et les ajoute au groupe
-       24H si oui.
+    1) Retire les marchés déjà connus qui n'ont plus de X-Perp x{LEVIER} valide,
+       et met à jour leur instId vers le X-Perp actuel (peut changer dans le temps).
+    2) Découvre les bases qui ont un X-Perp x{LEVIER} mais qu'on ne suit pas
+       encore, et les ajoute directement au groupe 24H.
     3) Plafonne les ajouts à NOUVEAUX_MARCHES_MAX pour ne pas saturer l'API OKX
        ni le nombre de scans par cycle.
 
-    Si l'appel API échoue, la liste d'origine des 23 marchés est conservée
-    intégralement par sécurité — aucun retrait ni ajout à l'aveugle."""
+    Si l'appel API échoue, la liste et les instId d'origine sont conservés
+    intégralement par sécurité (repli sur le dernier état connu, pas de perte
+    de marché à l'aveugle)."""
     global MARCHES_24H, MARCHES_NUIT, MARCHES_JOUR, MARCHES, OKX_SYMBOLS, OKX_SYMBOLS_INVERSE
 
     url_instruments = "https://www.okx.com/api/v5/public/instruments"
@@ -408,8 +403,9 @@ async def decouvrir_et_filtrer_marches_xperp_x10(session):
         log.warning("  ⚠️ Découverte X-Perps impossible (réponse OKX invalide) — liste d'origine conservée")
         return
 
-    # Bases avec X-Perp valide : existe ET levier max >= LEVIER
-    bases_eligibles = {}
+    # Bases avec X-Perp valide : existe ET levier max >= LEVIER — on garde
+    # l'instrument complet (pas que le levier) pour récupérer son vrai instId
+    xperps = {}
     for d in data.get("data", []):
         if d.get("ruleType") != "xperp":
             continue
@@ -421,48 +417,44 @@ async def decouvrir_et_filtrer_marches_xperp_x10(session):
         except (TypeError, ValueError):
             continue
         if lever_max >= LEVIER:
-            bases_eligibles[base] = lever_max
+            xperps[base] = d
 
-    # 1) Retirer les marchés déjà connus qui ne remplissent plus les critères
-    def eligible(symbole):
-        base = OKX_SYMBOLS.get(symbole, "").split("-")[0]
-        return base in bases_eligibles
+    def base_actuelle(symbole):
+        """Ticker de base déduit de l'instId actuellement connu (X-Perp d'un
+        run précédent, ou Swap placeholder au tout premier démarrage)."""
+        okx_symbol = OKX_SYMBOLS.get(symbole, "")
+        return okx_symbol.split("-")[0] if okx_symbol else ""
 
+    # 1) Retirer les marchés obsolètes + rebasculer les survivants sur leur
+    #    instId X-Perp réel et à jour (le contrat peut changer dans le temps)
     avant = MARCHES_24H + MARCHES_NUIT + MARCHES_JOUR
-    MARCHES_24H  = [m for m in MARCHES_24H  if eligible(m)]
-    MARCHES_NUIT = [m for m in MARCHES_NUIT if eligible(m)]
-    MARCHES_JOUR = [m for m in MARCHES_JOUR if eligible(m)]
+
+    def filtrer_et_mettre_a_jour(groupe):
+        conserves = []
+        for symbole in groupe:
+            base = base_actuelle(symbole)
+            if base in xperps:
+                OKX_SYMBOLS[symbole] = xperps[base]["instId"]
+                conserves.append(symbole)
+        return conserves
+
+    MARCHES_24H  = filtrer_et_mettre_a_jour(MARCHES_24H)
+    MARCHES_NUIT = filtrer_et_mettre_a_jour(MARCHES_NUIT)
+    MARCHES_JOUR = filtrer_et_mettre_a_jour(MARCHES_JOUR)
     retires = [m for m in avant if m not in (MARCHES_24H + MARCHES_NUIT + MARCHES_JOUR)]
 
     # 2) Découvrir les bases éligibles qu'on ne suit pas encore
-    bases_connues     = {okx_symbol.split("-")[0] for okx_symbol in OKX_SYMBOLS.values()}
-    nouvelles_bases    = sorted(b for b in bases_eligibles if b not in bases_connues)
-    ignorees_par_cap   = nouvelles_bases[NOUVEAUX_MARCHES_MAX:]
-    nouvelles_bases    = nouvelles_bases[:NOUVEAUX_MARCHES_MAX]
+    bases_connues    = {base_actuelle(m) for m in (MARCHES_24H + MARCHES_NUIT + MARCHES_JOUR)}
+    nouvelles_bases  = sorted(b for b in xperps if b not in bases_connues)
+    ignorees_par_cap = nouvelles_bases[NOUVEAUX_MARCHES_MAX:]
+    nouvelles_bases  = nouvelles_bases[:NOUVEAUX_MARCHES_MAX]
 
     ajoutes = []
     for base in nouvelles_bases:
-        symbole      = f"{base}USDT"
-        instId_swap  = f"{base}-USDT-SWAP"
-        # Le X-Perp n'est utile qu'en live sur le compte France — en simulation,
-        # les prix viennent du Swap Perpétuel USDT. On vérifie donc qu'il existe
-        # bien avant d'ajouter ce marché, sinon impossible de le simuler.
-        try:
-            async with session.get(
-                url_instruments,
-                params={"instType": "SWAP", "instId": instId_swap},
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                swap_data = await resp.json()
-        except Exception:
-            continue
-        if swap_data.get("code") != "0" or not swap_data.get("data"):
-            continue  # Pas de Swap USDT correspondant → marché ignoré
-
-        OKX_SYMBOLS[symbole] = instId_swap
+        symbole = f"{base}USD"  # X-Perps sont cotés en USD, pas en USDT
+        OKX_SYMBOLS[symbole] = xperps[base]["instId"]
         MARCHES_24H.append(symbole)
         ajoutes.append(symbole)
-        await asyncio.sleep(0.15)  # ménage l'API pendant la phase de découverte
 
     OKX_SYMBOLS_INVERSE = {v: k for k, v in OKX_SYMBOLS.items()}
     MARCHES = MARCHES_24H + MARCHES_NUIT + MARCHES_JOUR
@@ -470,7 +462,7 @@ async def decouvrir_et_filtrer_marches_xperp_x10(session):
     if retires:
         log.warning(f"  🚫 Marchés retirés (X-Perp x{LEVIER} indisponible) : {', '.join(retires)}")
     if ajoutes:
-        log.info(f"  ➕ Nouveaux marchés découverts (X-Perp x{LEVIER} + Swap USDT confirmés) : {', '.join(ajoutes)}")
+        log.info(f"  ➕ Nouveaux marchés découverts (X-Perp x{LEVIER} confirmé) : {', '.join(ajoutes)}")
     if ignorees_par_cap:
         log.info(f"  ⏭️ {len(ignorees_par_cap)} marché(s) supplémentaire(s) ignoré(s) (cap à {NOUVEAUX_MARCHES_MAX}/scan) : {', '.join(ignorees_par_cap)}")
     log.info(f"  Marchés actifs après découverte : {len(MARCHES)} (dont {len(ajoutes)} nouveaux, {len(retires)} retirés)")
@@ -484,8 +476,8 @@ async def decouvrir_et_filtrer_marches_xperp_x10(session):
     )
 
     # Si la liste de marchés a changé, force une reconnexion WebSocket pour que
-    # les nouveaux marchés reçoivent des prix temps réel immédiatement — sinon
-    # ils resteraient sur le fallback REST jusqu'à la prochaine coupure naturelle.
+    # les nouveaux marchés/instId reçoivent des prix temps réel immédiatement —
+    # sinon ils resteraient sur le fallback REST jusqu'à la prochaine coupure.
     if (ajoutes or retires) and WS_CONNEXION_ACTIVE is not None and not WS_CONNEXION_ACTIVE.closed:
         log.info("  🔌 Resynchronisation WebSocket forcée (liste de marchés modifiée)")
         try:
@@ -685,6 +677,14 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
     pnl             = 0.0
     duree           = 0
 
+    # ── Funding (financement) — réglé toutes les 8h (00h/08h/16h UTC) sur les
+    #    X-Perps comme sur les Swaps Perpétuels classiques. C'est un paiement
+    #    entre positions longues et courtes, pas un frais prélevé par OKX, mais
+    #    il impacte directement le gain net si le trade reste ouvert à cheval
+    #    sur un de ces horaires.
+    dernier_funding_applique = None  # (date, heure UTC) du dernier funding déjà compté
+    funding_cumule            = 0.0
+
     # ── Boucle de surveillance — sans timeout
     while True:
         await asyncio.sleep(CHECK_INTERVAL)
@@ -703,6 +703,24 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
 
         if pnl > pnl_max_atteint:
             pnl_max_atteint = pnl
+
+        # Funding : vérifie si on vient de franchir un horaire de règlement
+        # (00h/08h/16h UTC) pendant que la position est ouverte
+        maintenant_utc_check = datetime.utcnow()
+        if maintenant_utc_check.hour in FUNDING_HEURES_UTC and maintenant_utc_check.minute == 0:
+            cle_funding = (maintenant_utc_check.date(), maintenant_utc_check.hour)
+            if cle_funding != dernier_funding_applique:
+                dernier_funding_applique = cle_funding
+                taux_funding = await get_funding_rate(session, OKX_SYMBOLS[symbole])
+                if taux_funding is not None:
+                    notionnel_actuel = mise * LEVIER
+                    paiement = round(notionnel_actuel * taux_funding, 4)
+                    # Taux positif → les longs paient les shorts (et inversement)
+                    impact = -paiement if direction == "ACHAT" else paiement
+                    funding_cumule += impact
+                    log.info(f"  💰 Funding [{symbole}] taux={taux_funding*100:.4f}% | "
+                             f"Impact={'+' if impact>=0 else ''}{round(impact,4)}€ | "
+                             f"Cumulé={'+' if funding_cumule>=0 else ''}{round(funding_cumule,4)}€")
 
         # Lock paliers
         nouveau_lock = get_palier_lock(pnl_max_atteint, capital)
@@ -754,13 +772,15 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
             gain_final = pnl
             break
 
-    # ── Déduction des frais réels OKX (ouverture + fermeture) sur le gain brut
+    # ── Déduction des frais réels OKX + funding cumulé sur le gain brut
     #    Le résultat GAGNE/PERDU est déterminé sur le gain NET, pas le brut :
-    #    un petit gain brut peut devenir négatif une fois les frais déduits.
-    gain_brut      = gain_final
-    gain_final     = round(gain_final - frais_total_prevu, 2)
-    resultat_final = "GAGNE" if gain_final > 0 else "PERDU"
-    log.info(f"  💸 Frais OKX déduits : -{frais_total_prevu}€ | Gain brut {'+' if gain_brut>=0 else ''}{gain_brut}€ → Net {'+' if gain_final>=0 else ''}{gain_final}€ ({resultat_final})")
+    #    un petit gain brut peut devenir négatif une fois frais et funding déduits.
+    gain_brut       = gain_final
+    funding_cumule  = round(funding_cumule, 2)
+    gain_final      = round(gain_final - frais_total_prevu + funding_cumule, 2)
+    resultat_final  = "GAGNE" if gain_final > 0 else "PERDU"
+    log.info(f"  💸 Frais -{frais_total_prevu}€ | Funding {'+' if funding_cumule>=0 else ''}{funding_cumule}€ | "
+             f"Gain brut {'+' if gain_brut>=0 else ''}{gain_brut}€ → Net {'+' if gain_final>=0 else ''}{gain_final}€ ({resultat_final})")
 
     # ── Libérer le marché + mise à jour état global dans un seul lock
     async with trades_lock:
@@ -793,6 +813,7 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
             'resultat':      resultat_final,
             'gain':          round(gain_final, 2),
             'frais':         frais_total_prevu,
+            'funding':       funding_cumule,
             'mise':          round(mise, 2),
             'capital':       etat_global["capital"],
             'duree_minutes': duree,
@@ -811,6 +832,7 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
         'mise':          mise,
         'gain':          round(gain_final, 2),
         'frais':         frais_total_prevu,
+        'funding':       funding_cumule,
         'capital_apres': etat_global['capital'],
         'duree_minutes': duree,
         'score':         None,
@@ -1262,9 +1284,6 @@ async def boucle_principale():
 
     connector = aiohttp.TCPConnector(limit=50)
     async with aiohttp.ClientSession(connector=connector) as session:
-        log.info("  🔍 Vérification des leviers réels disponibles sur OKX...")
-        await verifier_leviers_okx(session)
-
         log.info("  🔧 Découverte et filtrage des marchés X-Perp x10 (OKX complet)...")
         await decouvrir_et_filtrer_marches_xperp_x10(session)
 
@@ -1276,9 +1295,9 @@ async def boucle_principale():
         await telegram(session,
             f"🐉🚀 <b>BOT REIVAX284 V4 OKX DÉMARRÉ (SIMULATION)</b>\n"
             f"Capital : {round(etat['capital'],2)}€\n"
-            f"{len(MARCHES)} marchés Swap Perpétuels x{LEVIER} (3 groupes horaires Guyane) | 24h/24 — 7j/7\n"
-            f"Prix temps réel : WebSocket OKX\n"
-            f"Frais réels : -{FRAIS_TAKER_PCT}% taker (ouv+ferm)\n"
+            f"{len(MARCHES)} marchés X-Perps x{LEVIER} (3 groupes horaires Guyane) | 24h/24 — 7j/7\n"
+            f"Prix temps réel : WebSocket OKX (instId X-Perp réels)\n"
+            f"Frais : -{FRAIS_TAKER_PCT}% taker (ouv+ferm) | Funding simulé (00h/08h/16h UTC)\n"
             f"Signal : mouvement ≥ {SEUIL_MOUVEMENT_PCT}%\n"
             f"Kill switch : {KILL_SWITCH_JOUR}€/jour\n"
             f"{(datetime.utcnow() - timedelta(hours=3)).strftime('%Y-%m-%d %H:%M:%S')}"
