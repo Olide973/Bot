@@ -390,7 +390,7 @@ async def get_funding_rate(session, inst_id):
         log.error(f"Erreur funding rate {inst_id} : {e}")
         return None
 
-async def decouvrir_et_filtrer_marches_xperp_x10(session):
+async def decouvrir_et_filtrer_marches_xperp_x10(session, etat):
     """Construit la liste des marchés à partir de TOUS les X-Perps OKX supportant
     réellement le levier x{LEVIER} (API publique, instType=FUTURES, ruleType=xperp)
     — pas seulement les marchés déjà codés en dur dans le bot.
@@ -411,6 +411,10 @@ async def decouvrir_et_filtrer_marches_xperp_x10(session):
        total, aucun nouveau marché n'est ajouté tant qu'elle n'est pas
        redescendue en dessous (via des retraits naturels), pour ne pas couper
        brutalement un marché sur lequel un trade est peut-être ouvert.
+    4) Sauvegarde la liste résultante dans 'etat' (persistée en base) pour
+       qu'elle survive aux redémarrages Railway — sinon la découverte
+       repartirait de la liste statique d'origine à chaque redéploiement,
+       et le tirage alphabétique du cap changerait à chaque fois.
 
     Si l'appel API échoue, la liste et les instId d'origine sont conservés
     intégralement par sécurité (repli sur le dernier état connu, pas de perte
@@ -571,6 +575,15 @@ async def decouvrir_et_filtrer_marches_xperp_x10(session):
 
     OKX_SYMBOLS_INVERSE = {v: k for k, v in OKX_SYMBOLS.items()}
     MARCHES = MARCHES_24H + MARCHES_NUIT + MARCHES_JOUR
+
+    # Persistance en base — sans ça, la découverte repartirait de la liste
+    # statique d'origine à chaque redémarrage Railway, et le tirage
+    # alphabétique du cap donnerait un résultat différent à chaque fois.
+    etat["marches_24h"]   = MARCHES_24H
+    etat["marches_nuit"]  = MARCHES_NUIT
+    etat["marches_jour"]  = MARCHES_JOUR
+    etat["okx_symbols"]   = OKX_SYMBOLS
+    sauvegarder_etat(etat)
 
     if retires:
         log.warning(f"  🚫 Marchés retirés : {' | '.join(retires_detail)}")
@@ -1402,10 +1415,25 @@ async def boucle_principale():
 
     afficher_tableau_de_bord(etat)
 
+    # Restaure la liste de marchés découverte lors d'un run précédent (si
+    # elle existe) — sinon on repart de la liste statique d'origine (23
+    # marchés codés en dur) et decouvrir_et_filtrer_marches_xperp_x10 la
+    # complétera au premier appel ci-dessous.
+    global MARCHES_24H, MARCHES_NUIT, MARCHES_JOUR, MARCHES, OKX_SYMBOLS, OKX_SYMBOLS_INVERSE
+    if etat.get("marches_24h") or etat.get("marches_nuit") or etat.get("marches_jour"):
+        MARCHES_24H  = etat.get("marches_24h", MARCHES_24H)
+        MARCHES_NUIT = etat.get("marches_nuit", MARCHES_NUIT)
+        MARCHES_JOUR = etat.get("marches_jour", MARCHES_JOUR)
+        if etat.get("okx_symbols"):
+            OKX_SYMBOLS = etat["okx_symbols"]
+            OKX_SYMBOLS_INVERSE = {v: k for k, v in OKX_SYMBOLS.items()}
+        MARCHES = MARCHES_24H + MARCHES_NUIT + MARCHES_JOUR
+        log.info(f"  💾 Liste de marchés restaurée depuis l'état persisté : {len(MARCHES)} marchés")
+
     connector = aiohttp.TCPConnector(limit=50)
     async with aiohttp.ClientSession(connector=connector) as session:
         log.info("  🔧 Découverte et filtrage des marchés X-Perp x10 (OKX complet)...")
-        await decouvrir_et_filtrer_marches_xperp_x10(session)
+        await decouvrir_et_filtrer_marches_xperp_x10(session, etat)
 
         # Lance le flux WebSocket temps réel en tâche de fond (reconnexion auto en cas de coupure)
         asyncio.create_task(websocket_prix(session))
@@ -1452,7 +1480,7 @@ async def boucle_principale():
                     maintenant_utc.minute < 1 and
                     etat.get("dernier_scan_xperp", "") != maintenant_utc.strftime('%Y-%m-%d')):
                     log.info("  🔧 Vérification quotidienne des marchés X-Perp x10...")
-                    await decouvrir_et_filtrer_marches_xperp_x10(session)
+                    await decouvrir_et_filtrer_marches_xperp_x10(session, etat)
                     etat["dernier_scan_xperp"] = maintenant_utc.strftime('%Y-%m-%d')
                     sauvegarder_etat(etat)
 
