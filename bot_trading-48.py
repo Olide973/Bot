@@ -60,7 +60,11 @@ KILL_SWITCH_JOUR        = -10.0
 SEUIL_RUINE             = 300.0
 
 # ── Lock profits par paliers proportionnels au capital
-LOCK_PALIERS_PCT = [0.15, 0.20, 0.30, 0.60, 1.00, 1.60, 2.40, 3.60, 5.00, 7.00, 10.00, 15.00, 20.00, 30.00, 40.00]
+LOCK_PALIERS_PCT = [
+    0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50, 0.60, 0.70, 0.80,
+    1.00, 1.20, 1.50, 1.80, 2.20, 2.60, 3.00, 3.60, 4.20, 5.00,
+    6.00, 7.00, 8.50, 10.00, 12.50, 15.00, 20.00, 25.00, 30.00, 40.00,
+]
 
 def get_palier_lock(pnl_max, capital):
     """Retourne le gain garanti selon le PnL max atteint — proportionnel au capital."""
