@@ -10,6 +10,7 @@
 import asyncio
 import aiohttp
 import os
+import json
 import logging
 import time
 from datetime import datetime, timedelta
@@ -33,14 +34,19 @@ LEVIER                  = 10
 MISE_BASE_PCT           = 0.10
 MISE_MIN                = 10.0
 MISE_MAX_PCT            = 0.25
-CHECK_INTERVAL          = 3          # secondes entre chaque check prix
+CHECK_INTERVAL          = 1          # secondes — lecture du cache WebSocket (quasi instantané, plus de coût REST)
 PAUSE_SCAN              = 30         # secondes entre chaque scan de nouveaux marchés
 MAX_TRADES_SIMULTANES   = 10         # 10 marchés max = 1 par marché
 
 # ── Détection signal mean reversion — surveillance temps réel
 SEUIL_MOUVEMENT_PCT     = 0.50   # dès que le prix bouge de 0.50% → signal
 VOLUME_MINI             = 0.25   # volume min vs moyenne 24h
-STOP_LOSS_FIXE          = 2.0    # stop fixe = -2€ par trade, ni plus ni moins
+STOP_LOSS_FIXE          = 2.0    # stop fixe = -2€ par trade (avant frais), ni plus ni moins
+
+# ── Frais réels OKX — Swap Perpétuels, palier standard (non-VIP)
+#    Maker 0.02% / Taker 0.05% du notionnel. Le bot réagit à un signal et sort
+#    au marché à l'ouverture ET à la fermeture → taker des deux côtés.
+FRAIS_TAKER_PCT          = 0.05   # % du notionnel, par exécution (ouverture OU fermeture)
 
 # ── Filtre RSI 1h
 RSI_SEUIL_BAS           = 45     # RSI < 45 → marché baissier → inverser ACHAT en VENTE
@@ -100,6 +106,9 @@ OKX_SYMBOLS = {
     "ATOMUSDT":  "ATOM-USDT-SWAP",
 }
 
+# ── Table inverse : instId OKX → symbole interne (pour router les ticks WebSocket)
+OKX_SYMBOLS_INVERSE = {v: k for k, v in OKX_SYMBOLS.items()}
+
 # ── Correspondance interval (minutes) → bar OKX
 BAR_MAP = {
     15: "15m",
@@ -117,6 +126,7 @@ trades_ouverts    = {}    # { symbole: True }
 prix_reference    = {}    # { symbole: prix_au_moment_du_scan }
 cooldown_marches  = {}    # { symbole: timestamp_fin_cooldown }
 trades_lock       = None  # initialisé dans boucle_principale()
+PRIX_LIVE         = {}    # { symbole: dernier prix reçu via WebSocket OKX }
 
 log.info("=" * 60)
 log.info("  BOT REIVAX284 — V4 — OKX (Swap Perpétuels x10)")
@@ -124,7 +134,9 @@ log.info(f"  Capital : {CAPITAL_INITIAL}€ | Levier x{LEVIER}")
 log.info(f"  Marchés : {len(MARCHES)} cryptos | 24h/24 — 7j/7")
 log.info(f"  Signal : mouvement ≥ {SEUIL_MOUVEMENT_PCT}% depuis le prix de référence")
 log.info(f"  RSI 1h : seuil bas={RSI_SEUIL_BAS} | seuil haut={RSI_SEUIL_HAUT}")
-log.info(f"  Stop : fixe {STOP_LOSS_FIXE}€ par trade")
+log.info(f"  Stop : fixe {STOP_LOSS_FIXE}€ par trade (avant frais)")
+log.info(f"  Frais OKX : -{FRAIS_TAKER_PCT}% taker par exécution (ouverture + fermeture)")
+log.info(f"  Prix temps réel : WebSocket OKX (canal tickers)")
 log.info(f"  Kill switch : {KILL_SWITCH_JOUR}€/jour | Ruine : {SEUIL_RUINE}€")
 log.info(f"  Pas de timeout — trades ouverts jusqu'au stop ou au lock")
 log.info(f"  Mode : {'SIMULATION' if MODE_SIMULATION else 'LIVE'} (aucun ordre réel envoyé à OKX tant que SIMULATION)")
@@ -182,7 +194,8 @@ async def get_klines(session, symbole, interval=15, limite=50):
         log.error(f"Erreur klines {symbole} : {e}")
         return None
 
-async def get_prix_actuel(session, symbole):
+async def get_prix_rest(session, symbole):
+    """Prix via l'API REST OKX (fallback tant que le WebSocket n'a pas encore poussé de tick)."""
     okx_symbol = OKX_SYMBOLS.get(symbole, symbole)
     try:
         async with session.get(
@@ -198,8 +211,77 @@ async def get_prix_actuel(session, symbole):
                 return None
             return float(result[0]["last"])
     except Exception as e:
-        log.error(f"Erreur prix {symbole} : {e}")
+        log.error(f"Erreur prix REST {symbole} : {e}")
         return None
+
+async def get_prix_actuel(session, symbole):
+    """Prix temps réel : lit le cache alimenté par le WebSocket OKX.
+    Si aucun tick n'a encore été reçu pour ce marché (juste après démarrage
+    ou pendant une reconnexion), on retombe sur un appel REST ponctuel."""
+    prix_ws = PRIX_LIVE.get(symbole)
+    if prix_ws is not None:
+        return prix_ws
+    return await get_prix_rest(session, symbole)
+
+async def _ws_keepalive(ws):
+    """Envoie un 'ping' applicatif toutes les 20s — requis par OKX pour garder
+    la connexion WebSocket ouverte (sinon fermeture après ~30s d'inactivité)."""
+    try:
+        while not ws.closed:
+            await asyncio.sleep(20)
+            if not ws.closed:
+                await ws.send_str("ping")
+    except Exception:
+        pass
+
+async def websocket_prix(session):
+    """Connexion WebSocket temps réel OKX (canal public 'tickers').
+    Remplace le polling REST pour la détection de signal : PRIX_LIVE est mis
+    à jour en continu, dès qu'OKX pousse un tick, pour les 10 marchés suivis.
+    Se reconnecte automatiquement en cas de coupure."""
+    url = "wss://ws.okx.com:8443/ws/v5/public"
+    args = [{"channel": "tickers", "instId": OKX_SYMBOLS[m]} for m in MARCHES]
+
+    while True:
+        keepalive_task = None
+        try:
+            async with session.ws_connect(url, heartbeat=25) as ws:
+                await ws.send_json({"op": "subscribe", "args": args})
+                keepalive_task = asyncio.create_task(_ws_keepalive(ws))
+                log.info("  🔌 WebSocket OKX connecté — abonnement tickers (10 marchés)")
+
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        if msg.data == "pong":
+                            continue
+                        try:
+                            data = json.loads(msg.data)
+                        except Exception:
+                            continue
+                        if data.get("event") == "subscribe":
+                            continue
+                        if data.get("event") == "error":
+                            log.error(f"  Erreur abonnement WebSocket : {data}")
+                            continue
+                        if "data" in data and "arg" in data:
+                            inst_id = data["arg"].get("instId")
+                            symbole = OKX_SYMBOLS_INVERSE.get(inst_id)
+                            ticks   = data.get("data", [])
+                            if symbole and ticks:
+                                try:
+                                    PRIX_LIVE[symbole] = float(ticks[0]["last"])
+                                except (KeyError, ValueError, TypeError):
+                                    pass
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
+                        break
+        except Exception as e:
+            log.error(f"Erreur WebSocket OKX : {e}")
+        finally:
+            if keepalive_task:
+                keepalive_task.cancel()
+
+        log.warning("  🔌 WebSocket OKX déconnecté — reconnexion dans 5s")
+        await asyncio.sleep(5)
 
 # ═══════════════════════════════════════════════════════════════
 #  INDICATEURS
@@ -341,7 +423,12 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
 
     mise = calculer_mise(capital, etat_global)
 
-    # Stop loss fixe : -2€ par trade, ni plus ni moins
+    # Frais réels OKX (taker) — ouverture ET fermeture, sur le notionnel (mise × levier)
+    notionnel        = mise * LEVIER
+    frais_unitaire   = round(notionnel * FRAIS_TAKER_PCT / 100, 4)
+    frais_total_prevu = round(frais_unitaire * 2, 2)  # ouverture + fermeture
+
+    # Stop loss fixe : -2€ par trade (avant frais), ni plus ni moins
     stop_loss_eur = STOP_LOSS_FIXE
 
     rsi_1h = details.get("rsi_1h", 50.0)
@@ -365,7 +452,7 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
              f"Ref={details.get('prix_ref')} → {details.get('prix_actuel')}")
     log.info(f"  Vol={details.get('vol_ratio', 0):.2f}x | RSI 1h={rsi_1h} | Stop fixe : -{stop_loss_eur}€")
     log.info(f"  Prix entrée : {prix_entree} | Stop : {stop_initial} | Obj : {objectif_final}")
-    log.info(f"  Mise : {mise}€ × x{LEVIER} = {round(mise*LEVIER,2)}€ | Trades : {len(trades_ouverts)}/{MAX_TRADES_SIMULTANES}\n")
+    log.info(f"  Mise : {mise}€ × x{LEVIER} = {round(mise*LEVIER,2)}€ | Frais estimés (ouv+ferm) : -{frais_total_prevu}€ | Trades : {len(trades_ouverts)}/{MAX_TRADES_SIMULTANES}\n")
 
     await telegram(session,
         f"🐉📊 <b>TRADE OUVERT — REIVAX284 V4 OKX</b>\n"
@@ -374,6 +461,7 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
         f"Volume : {details.get('vol_ratio', 0):.2f}x | RSI 1h : {rsi_1h}\n"
         f"Prix : {prix_entree} | Stop : {stop_initial}\n"
         f"Mise : {mise}€ × x{LEVIER} | Stop max : -{stop_loss_eur}€\n"
+        f"Frais estimés (ouv+ferm) : -{frais_total_prevu}€\n"
         f"Trades : {len(trades_ouverts)}/{MAX_TRADES_SIMULTANES}"
     )
 
@@ -446,19 +534,23 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
             dernier_log = time.time()
 
         if atteint_stop:
-            if pnl > 0:
-                resultat_final = "GAGNE"
-            else:
-                resultat_final = "PERDU"
             log.info(f"\n  🛑 STOP [{symbole}] {'+' if pnl>=0 else ''}{pnl:.2f}€ | {duree}min")
             await telegram(session,
                 f"🐉🛑 <b>STOP</b>\n"
                 f"{symbole} {direction}\n"
-                f"Résultat : {'+' if pnl>=0 else ''}{pnl:.2f}€\n"
+                f"Résultat brut : {'+' if pnl>=0 else ''}{pnl:.2f}€\n"
                 f"Durée : {duree} min"
             )
             gain_final = pnl
             break
+
+    # ── Déduction des frais réels OKX (ouverture + fermeture) sur le gain brut
+    #    Le résultat GAGNE/PERDU est déterminé sur le gain NET, pas le brut :
+    #    un petit gain brut peut devenir négatif une fois les frais déduits.
+    gain_brut      = gain_final
+    gain_final     = round(gain_final - frais_total_prevu, 2)
+    resultat_final = "GAGNE" if gain_final > 0 else "PERDU"
+    log.info(f"  💸 Frais OKX déduits : -{frais_total_prevu}€ | Gain brut {'+' if gain_brut>=0 else ''}{gain_brut}€ → Net {'+' if gain_final>=0 else ''}{gain_final}€ ({resultat_final})")
 
     # ── Libérer le marché + mise à jour état global dans un seul lock
     async with trades_lock:
@@ -490,6 +582,7 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
             'direction':     direction,
             'resultat':      resultat_final,
             'gain':          round(gain_final, 2),
+            'frais':         frais_total_prevu,
             'mise':          round(mise, 2),
             'capital':       etat_global["capital"],
             'duree_minutes': duree,
@@ -507,6 +600,7 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
         'objectif':      objectif_final,
         'mise':          mise,
         'gain':          round(gain_final, 2),
+        'frais':         frais_total_prevu,
         'capital_apres': etat_global['capital'],
         'duree_minutes': duree,
         'score':         None,
@@ -957,10 +1051,17 @@ async def boucle_principale():
 
     connector = aiohttp.TCPConnector(limit=50)
     async with aiohttp.ClientSession(connector=connector) as session:
+        # Lance le flux WebSocket temps réel en tâche de fond (reconnexion auto en cas de coupure)
+        asyncio.create_task(websocket_prix(session))
+        log.info("  ⏳ Attente des premiers ticks WebSocket (3s)...")
+        await asyncio.sleep(3)
+
         await telegram(session,
             f"🐉🚀 <b>BOT REIVAX284 V4 OKX DÉMARRÉ (SIMULATION)</b>\n"
             f"Capital : {round(etat['capital'],2)}€\n"
             f"10 marchés Swap Perpétuels x{LEVIER} | 24h/24 — 7j/7\n"
+            f"Prix temps réel : WebSocket OKX\n"
+            f"Frais réels : -{FRAIS_TAKER_PCT}% taker (ouv+ferm)\n"
             f"Signal : mouvement ≥ {SEUIL_MOUVEMENT_PCT}%\n"
             f"Kill switch : {KILL_SWITCH_JOUR}€/jour\n"
             f"{(datetime.utcnow() - timedelta(hours=3)).strftime('%Y-%m-%d %H:%M:%S')}"
