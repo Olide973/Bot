@@ -1,13 +1,15 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║   MODULE BASE DE DONNÉES — REIVAX284 V4 OKX (PostgreSQL/Railway) ║
+║   MODULE BASE DE DONNÉES — REIVAX284 V4 OKX (PostgreSQL/pg8000)  ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
 import os
+import json
 import logging
-import psycopg2
-from psycopg2.extras import Json
+import ssl
+from urllib.parse import urlparse
+import pg8000.native as pg8000
 
 log = logging.getLogger(__name__)
 
@@ -15,7 +17,18 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 
 def get_connection():
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+    url = urlparse(DATABASE_URL)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return pg8000.Connection(
+        user=url.username,
+        password=url.password,
+        host=url.hostname,
+        port=url.port or 5432,
+        database=url.path.lstrip("/"),
+        ssl_context=ctx,
+    )
 
 
 def init_database():
@@ -25,15 +38,14 @@ def init_database():
         return
     try:
         conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("""
+        conn.run("""
             CREATE TABLE IF NOT EXISTS etat_bot (
                 id INTEGER PRIMARY KEY DEFAULT 1,
                 data JSONB NOT NULL,
                 maj_le TIMESTAMP DEFAULT NOW()
             );
         """)
-        cur.execute("""
+        conn.run("""
             CREATE TABLE IF NOT EXISTS trades (
                 id SERIAL PRIMARY KEY,
                 marche VARCHAR(20),
@@ -54,8 +66,6 @@ def init_database():
                 cree_le TIMESTAMP DEFAULT NOW()
             );
         """)
-        conn.commit()
-        cur.close()
         conn.close()
         log.info("  Base de données initialisée (etat_bot, trades)")
     except Exception as e:
@@ -68,13 +78,10 @@ def charger_etat():
         return {}
     try:
         conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT data FROM etat_bot WHERE id = 1;")
-        row = cur.fetchone()
-        cur.close()
+        rows = conn.run("SELECT data FROM etat_bot WHERE id = 1;")
         conn.close()
-        if row and row[0]:
-            return row[0]
+        if rows and rows[0][0]:
+            return rows[0][0]
         return {}
     except Exception as e:
         log.error(f"Erreur charger_etat : {e}")
@@ -87,14 +94,11 @@ def sauvegarder_etat(etat):
         return
     try:
         conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("""
+        conn.run("""
             INSERT INTO etat_bot (id, data, maj_le)
-            VALUES (1, %s, NOW())
+            VALUES (1, :data, NOW())
             ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, maj_le = NOW();
-        """, (Json(etat),))
-        conn.commit()
-        cur.close()
+        """, data=json.dumps(etat))
         conn.close()
     except Exception as e:
         log.error(f"Erreur sauvegarder_etat : {e}")
@@ -106,32 +110,33 @@ def enregistrer_trade(trade):
         return
     try:
         conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("""
+        conn.run("""
             INSERT INTO trades (
                 marche, direction, resultat, prix_entree, prix_sortie,
                 stop_loss, objectif, mise, gain, capital_apres,
                 duree_minutes, score, adx, atr, rsi
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
-        """, (
-            trade.get("marche"),
-            trade.get("direction"),
-            trade.get("resultat"),
-            trade.get("prix_entree"),
-            trade.get("prix_sortie"),
-            trade.get("stop_loss"),
-            trade.get("objectif"),
-            trade.get("mise"),
-            trade.get("gain"),
-            trade.get("capital_apres"),
-            trade.get("duree_minutes"),
-            trade.get("score"),
-            trade.get("adx"),
-            trade.get("atr"),
-            trade.get("rsi"),
-        ))
-        conn.commit()
-        cur.close()
+            ) VALUES (
+                :marche, :direction, :resultat, :prix_entree, :prix_sortie,
+                :stop_loss, :objectif, :mise, :gain, :capital_apres,
+                :duree_minutes, :score, :adx, :atr, :rsi
+            );
+        """,
+            marche=trade.get("marche"),
+            direction=trade.get("direction"),
+            resultat=trade.get("resultat"),
+            prix_entree=trade.get("prix_entree"),
+            prix_sortie=trade.get("prix_sortie"),
+            stop_loss=trade.get("stop_loss"),
+            objectif=trade.get("objectif"),
+            mise=trade.get("mise"),
+            gain=trade.get("gain"),
+            capital_apres=trade.get("capital_apres"),
+            duree_minutes=trade.get("duree_minutes"),
+            score=trade.get("score"),
+            adx=trade.get("adx"),
+            atr=trade.get("atr"),
+            rsi=trade.get("rsi"),
+        )
         conn.close()
     except Exception as e:
         log.error(f"Erreur enregistrer_trade : {e}")
