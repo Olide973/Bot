@@ -47,7 +47,7 @@ MAX_TRADES_SIMULTANES   = 10         # 10 marchés max = 1 par marché
 # ── Détection signal mean reversion — surveillance temps réel
 SEUIL_MOUVEMENT_PCT     = 0.50   # dès que le prix bouge de 0.50% → signal
 VOLUME_MINI             = 0.25   # volume min vs moyenne 24h
-STOP_LOSS_FIXE          = 2.0    # stop fixe = -2€ par trade, ni plus ni moins
+STOP_LOSS_FIXE          = 0.50   # stop fixe = -0.50€ par trade (avant frais), ni plus ni moins
 DUREE_MAX_MINUTES       = 360    # 6h — fermeture forcée si ni stop ni lock atteint avant
 
 # ── Filtre RSI 1h
@@ -61,7 +61,11 @@ SEUIL_RUINE             = 300.0
 
 # ── Lock profits par paliers proportionnels au capital
 # Premier palier : 0.15% = 0.75€ à 500€
-LOCK_PALIERS_PCT = [0.15, 0.30, 0.50, 0.80, 1.20, 1.80, 2.60, 3.80, 5.50, 7.50, 10.00, 15.00, 20.00, 30.00, 60.00]
+LOCK_PALIERS_PCT = [
+    0.15, 0.22, 0.30, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
+    1.80, 2.20, 2.60, 3.20, 3.80, 4.60, 5.50, 6.50, 7.50, 9.00,
+    10.00, 12.50, 15.00, 17.50, 20.00, 25.00, 30.00, 45.00, 60.00,
+]
 
 def get_palier_lock(pnl_max, capital):
     """Retourne le gain garanti selon le PnL max atteint — proportionnel au capital."""
@@ -508,8 +512,21 @@ def calculer_mise(capital, etat):
         mise *= BOOST_CONFIANCE
         log.info(f"  Mise boostée +20% ({wins_consec} wins consecutifs)")
 
-    mise = max(mise, MISE_MIN)
-    mise = min(mise, capital * MISE_MAX_PCT)
+    mise    = max(mise, MISE_MIN)
+    plafond = capital * MISE_MAX_PCT
+
+    if plafond >= MISE_MIN:
+        mise = min(mise, plafond)
+    else:
+        # Capital trop faible pour respecter le plafond ET le plancher en
+        # même temps (ne devrait jamais arriver en pratique : SEUIL_RUINE
+        # arrête le bot bien avant — capital < ~83€ avec les réglages
+        # actuels). Le plancher MISE_MIN prime dans ce cas, pour ne jamais
+        # ouvrir un trade en dessous du seuil où les frais deviennent
+        # disproportionnés par rapport au gain visé.
+        log.warning(f"  ⚠️ Capital très faible ({capital}€) : plafond mise "
+                    f"({plafond}€) < plancher ({MISE_MIN}€) — plancher appliqué")
+
     return round(mise, 2)
 
 # ═══════════════════════════════════════════════════════════════
