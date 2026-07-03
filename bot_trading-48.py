@@ -47,7 +47,7 @@ MAX_TRADES_SIMULTANES   = 10         # 10 marchés max = 1 par marché
 # ── Détection signal mean reversion — surveillance temps réel
 SEUIL_MOUVEMENT_PCT     = 0.50   # dès que le prix bouge de 0.50% → signal
 VOLUME_MINI             = 0.25   # volume min vs moyenne 24h
-STOP_LOSS_FIXE          = 0.50   # stop fixe = -0.50€ par trade (avant frais), ni plus ni moins
+STOP_LOSS_FIXE          = 25.0   # stop fixe = -25€ par trade (avant frais), ni plus ni moins
 DUREE_MAX_MINUTES       = 360    # 6h — fermeture forcée si ni stop ni lock atteint avant
 
 # ── Filtre RSI 1h
@@ -56,7 +56,7 @@ RSI_SEUIL_HAUT          = 55     # RSI > 55 → marché haussier → inverser VE
 RSI_PERIODE             = 14
 
 # ── Protections
-KILL_SWITCH_JOUR        = -10.0
+KILL_SWITCH_JOUR        = -100.0
 SEUIL_RUINE             = 300.0
 
 # ── Lock profits par paliers proportionnels au capital
