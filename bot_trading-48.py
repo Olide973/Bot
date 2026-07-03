@@ -293,6 +293,31 @@ def _okx_headers(method, path, body=""):
         headers["x-simulated-trading"] = "1"
     return headers
 
+async def okx_resoudre_instid_reel(session, base):
+    """Récupère l'instId du X-Perp tel que reconnu par l'entité my.okx.com
+    (France/EEA) — peut différer de celui découvert via www.okx.com utilisé
+    pour la simulation. Retourne None si non trouvé."""
+    try:
+        async with session.get(
+            OKX_BASE_URL + "/api/v5/public/instruments",
+            params={"instType": "FUTURES"},
+            headers=({"x-simulated-trading": "1"} if OKX_COMPTE_DEMO else {}),
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
+            data = await resp.json()
+            if data.get("code") != "0":
+                log.error(f"  Erreur résolution instId ({OKX_BASE_URL}) : {data}")
+                return None
+            for inst in data.get("data", []):
+                if inst.get("ruleType") != "xperp":
+                    continue
+                if inst.get("instId", "").split("-")[0] == base:
+                    return inst.get("instId")
+            return None
+    except Exception as e:
+        log.error(f"  Erreur résolution instId pour {base} : {e}")
+        return None
+
 async def okx_definir_levier(session, inst_id, levier):
     """Configure le levier sur un instrument avant ouverture (marge isolée)."""
     path = "/api/v5/account/set-leverage"
@@ -738,6 +763,20 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
             async with trades_lock:
                 trades_ouverts.pop(symbole, None)
             return
+
+        # L'instId découvert via www.okx.com (simulation) peut différer de
+        # celui reconnu par l'entité my.okx.com (France/EEA, démo ou réel) —
+        # on le re-résout ici juste avant d'envoyer l'ordre, pour éviter
+        # l'erreur 51001 "Instrument ID doesn't exist".
+        base = inst_id.split("-")[0]
+        inst_id_reel = await okx_resoudre_instid_reel(session, base)
+        if inst_id_reel is None:
+            log.error(f"  ❌ Impossible de résoudre l'instId réel pour {symbole} (base={base}) — trade annulé")
+            await telegram(session, f"❌ <b>TRADE ANNULÉ</b>\n{symbole} : instId introuvable côté {OKX_BASE_URL}.")
+            async with trades_lock:
+                trades_ouverts.pop(symbole, None)
+            return
+        inst_id = inst_id_reel
 
         taille_contrats = round(position / (prix_entree * ct_val), 0)
         if taille_contrats < 1:
