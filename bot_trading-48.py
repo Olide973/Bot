@@ -12,6 +12,9 @@ import asyncio
 import aiohttp
 import os
 import json
+import hmac
+import hashlib
+import base64
 import logging
 import time
 from datetime import datetime, timedelta
@@ -91,6 +94,7 @@ TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 OKX_API_KEY      = os.environ.get('OKX_API_KEY', '')
 OKX_API_SECRET   = os.environ.get('OKX_API_SECRET', '')
+OKX_API_PASSPHRASE = os.environ.get('OKX_API_PASSPHRASE', '')
 MODE_REEL        = os.environ.get('MODE_REEL', '0') == '1'
 
 # ── Reset complet piloté depuis Railway (Variables → RESET_TOUT = 1, puis Deploy)
@@ -103,6 +107,7 @@ RESET_TOUT = os.environ.get('RESET_TOUT', '0').strip().lower() in ('1', 'true', 
 # Chargés dynamiquement via API au démarrage et mis à jour chaque nuit à minuit
 MARCHES          = []   # liste des symboles actifs (levier x10 uniquement)
 OKX_SYMBOLS      = {}   # { "BTCUSD": "BTC-USD-YYMMDD", ... } — vrai instId X-Perp
+OKX_CT_VAL       = {}   # { "BTCUSD": 0.01, ... } — valeur d'un contrat (usage réel uniquement)
 
 # ═══════════════════════════════════════════════════════════════
 #  ÉTAT GLOBAL
@@ -143,7 +148,7 @@ async def charger_marches_x10(session):
     X-Perp (ex: BTC-USD-YYMMDD) — pas un Swap USDT. Supprime les marchés qui
     ne sont plus x10 ou qui n'ont plus de X-Perp.
     """
-    global MARCHES, OKX_SYMBOLS
+    global MARCHES, OKX_SYMBOLS, OKX_CT_VAL
 
     # Cryptos majeures à vérifier — mêmes candidats que la version Kraken
     # d'origine. Tous n'auront pas forcément de X-Perp (l'offre OKX X-Perp
@@ -175,6 +180,7 @@ async def charger_marches_x10(session):
 
         nouveaux_marches  = []
         nouveaux_symbols  = {}
+        nouveaux_ct_val   = {}
         marches_supprimes = []
 
         for base in CANDIDATS_BASE:
@@ -195,6 +201,10 @@ async def charger_marches_x10(session):
             if levier_max >= 10:
                 nouveaux_marches.append(symbole)
                 nouveaux_symbols[symbole] = inst["instId"]
+                try:
+                    nouveaux_ct_val[symbole] = float(inst.get("ctVal", 0) or 0)
+                except (TypeError, ValueError):
+                    nouveaux_ct_val[symbole] = 0.0
                 log.info(f"  ✅ {symbole} — X-Perp levier max x{levier_max:.0f} → inclus")
             else:
                 if symbole in MARCHES:
@@ -211,6 +221,7 @@ async def charger_marches_x10(session):
         anciens = set(MARCHES)
         MARCHES     = nouveaux_marches
         OKX_SYMBOLS = nouveaux_symbols
+        OKX_CT_VAL  = nouveaux_ct_val
         nouveaux = set(MARCHES)
 
         ajouts   = nouveaux - anciens
@@ -233,6 +244,101 @@ def get_marches_actifs():
 # ═══════════════════════════════════════════════════════════════
 #  TELEGRAM
 # ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+#  EXÉCUTION RÉELLE OKX — préparé mais INACTIF tant que MODE_REEL=0
+# ═══════════════════════════════════════════════════════════════
+#  ⚠️ NON TESTÉ EN CONDITIONS RÉELLES (pas d'accès réseau pour vérifier).
+#  Construit selon la documentation officielle OKX v5, mais À VALIDER
+#  OBLIGATOIREMENT sur le Demo Trading OKX (domaine wspap.okx.com séparé,
+#  argent fictif, données réelles — voir la conversation précédente) avant
+#  tout passage avec de l'argent réel. Ne jamais activer MODE_REEL=1 sans
+#  être passé par cette étape de validation.
+OKX_BASE_URL = "https://www.okx.com"
+
+def _okx_headers(method, path, body=""):
+    """Construit les en-têtes signés requis par l'API privée OKX v5."""
+    timestamp = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.') + \
+                f"{datetime.utcnow().microsecond // 1000:03d}Z"
+    message = timestamp + method + path + body
+    mac = hmac.new(OKX_API_SECRET.encode(), message.encode(), hashlib.sha256)
+    signature = base64.b64encode(mac.digest()).decode()
+    return {
+        "OK-ACCESS-KEY": OKX_API_KEY,
+        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": OKX_API_PASSPHRASE,
+        "Content-Type": "application/json",
+    }
+
+async def okx_definir_levier(session, inst_id, levier):
+    """Configure le levier sur un instrument avant ouverture (marge isolée)."""
+    path = "/api/v5/account/set-leverage"
+    body = json.dumps({"instId": inst_id, "lever": str(int(levier)), "mgnMode": "isolated"})
+    try:
+        async with session.post(
+            OKX_BASE_URL + path, data=body,
+            headers=_okx_headers("POST", path, body),
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+            if data.get("code") != "0":
+                log.error(f"  ❌ Erreur set-leverage {inst_id} : {data}")
+                return False
+            return True
+    except Exception as e:
+        log.error(f"  ❌ Exception set-leverage {inst_id} : {e}")
+        return False
+
+async def okx_placer_ordre_marche(session, inst_id, side, taille_contrats):
+    """Place un ordre au marché. side = 'buy' ou 'sell'. Retourne l'ordId si
+    succès, sinon None. taille_contrats est en nombre de contrats OKX (PAS en
+    USD ni en quantité de crypto brute) — voir le TODO de conversion ctVal
+    dans executer_trade avant tout usage réel."""
+    path = "/api/v5/trade/order"
+    body = json.dumps({
+        "instId": inst_id,
+        "tdMode": "isolated",
+        "side": side,
+        "ordType": "market",
+        "sz": str(taille_contrats),
+    })
+    try:
+        async with session.post(
+            OKX_BASE_URL + path, data=body,
+            headers=_okx_headers("POST", path, body),
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+            if data.get("code") != "0":
+                log.error(f"  ❌ Erreur ordre {inst_id} {side} : {data}")
+                return None
+            ord_id = data.get("data", [{}])[0].get("ordId")
+            log.warning(f"  💰 ORDRE RÉEL PLACÉ : {inst_id} {side} {taille_contrats} contrats (ordId={ord_id})")
+            return ord_id
+    except Exception as e:
+        log.error(f"  ❌ Exception ordre {inst_id} : {e}")
+        return None
+
+async def okx_fermer_position(session, inst_id):
+    """Ferme intégralement la position ouverte sur cet instrument (marge isolée)."""
+    path = "/api/v5/trade/close-position"
+    body = json.dumps({"instId": inst_id, "mgnMode": "isolated"})
+    try:
+        async with session.post(
+            OKX_BASE_URL + path, data=body,
+            headers=_okx_headers("POST", path, body),
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+            if data.get("code") != "0":
+                log.error(f"  ❌ Erreur fermeture position {inst_id} : {data}")
+                return False
+            log.warning(f"  💰 POSITION RÉELLE FERMÉE : {inst_id}")
+            return True
+    except Exception as e:
+        log.error(f"  ❌ Exception fermeture {inst_id} : {e}")
+        return False
+
 async def telegram(session, message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -596,6 +702,38 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
         f"Trades : {len(trades_ouverts)}/{MAX_TRADES_SIMULTANES}"
     )
 
+    # ── Exécution réelle — INACTIF tant que MODE_REEL=0 (comportement simulé
+    # inchangé dans ce cas). Voir l'avertissement en tête du bloc des
+    # fonctions okx_* : code non testé en conditions réelles, à valider sur
+    # le Demo Trading OKX avant tout usage avec de l'argent réel.
+    inst_id = OKX_SYMBOLS.get(symbole)
+    if MODE_REEL:
+        ct_val = OKX_CT_VAL.get(symbole, 0)
+        if not inst_id or not ct_val:
+            log.error(f"  ❌ MODE_REEL actif mais instId/ctVal manquant pour {symbole} — trade annulé")
+            await telegram(session, f"❌ <b>TRADE ANNULÉ</b>\n{symbole} : instId/ctVal manquant, impossible de trader en réel.")
+            async with trades_lock:
+                trades_ouverts.pop(symbole, None)
+            return
+
+        taille_contrats = round(position / (prix_entree * ct_val), 0)
+        if taille_contrats < 1:
+            log.error(f"  ❌ MODE_REEL actif mais taille calculée < 1 contrat pour {symbole} — trade annulé")
+            await telegram(session, f"❌ <b>TRADE ANNULÉ</b>\n{symbole} : taille de position trop petite (<1 contrat).")
+            async with trades_lock:
+                trades_ouverts.pop(symbole, None)
+            return
+
+        await okx_definir_levier(session, inst_id, LEVIER)
+        side = "buy" if direction == "ACHAT" else "sell"
+        ord_id = await okx_placer_ordre_marche(session, inst_id, side, taille_contrats)
+        if ord_id is None:
+            log.error(f"  ❌ Échec de l'ordre réel pour {symbole} — trade annulé")
+            await telegram(session, f"❌ <b>TRADE ANNULÉ</b>\n{symbole} : l'ordre réel a échoué côté OKX. Vérifie les logs.")
+            async with trades_lock:
+                trades_ouverts.pop(symbole, None)
+            return
+
     debut           = time.time()
     dernier_log     = 0
     pnl_max_atteint = 0.0
@@ -702,6 +840,17 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
             )
             gain_final = pnl_net
             break
+
+    # ── Fermeture réelle de la position — INACTIF tant que MODE_REEL=0
+    if MODE_REEL and inst_id:
+        succes_fermeture = await okx_fermer_position(session, inst_id)
+        if not succes_fermeture:
+            log.error(f"  ❌ ÉCHEC DE FERMETURE RÉELLE pour {symbole} — intervention manuelle probablement nécessaire")
+            await telegram(session,
+                f"🚨 <b>ALERTE — ÉCHEC FERMETURE RÉELLE</b>\n"
+                f"{symbole} : la position réelle n'a peut-être pas été fermée côté OKX.\n"
+                f"Vérifie manuellement sur l'app OKX immédiatement."
+            )
 
     # ── Libérer le marché + mise à jour état global dans un seul lock
     async with trades_lock:
