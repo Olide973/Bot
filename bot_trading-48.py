@@ -74,7 +74,7 @@ def get_palier_lock(pnl_max, capital):
 WINS_CONFIANCE          = 3
 BOOST_CONFIANCE         = 1.20
 
-# ── Frais OKX réels (Swap Perpétuels, palier standard/non-VIP)
+# ── Frais OKX réels (X-Perps, palier standard/non-VIP — identiques aux Swaps Perpétuels classiques)
 # Maker 0.02% / Taker 0.05% du notionnel — le bot sort au marché à l'ouverture
 # ET à la fermeture, donc taker des deux côtés. Pas de rollover/funding modélisé
 # ici (contrairement aux frais Kraken margin, OKX ne facture pas de frais de
@@ -93,10 +93,10 @@ MODE_REEL        = os.environ.get('MODE_REEL', '0') == '1'
 #    fonctionnement normal sans redéclencher un reset à chaque redémarrage.
 RESET_TOUT = os.environ.get('RESET_TOUT', '0').strip().lower() in ('1', 'true', 'oui', 'yes')
 
-# ── Marchés — uniquement ceux à levier x10 sur OKX (Swap Perpétuels)
+# ── Marchés — uniquement ceux à levier x10 sur OKX (X-Perps, compte France/EEA)
 # Chargés dynamiquement via API au démarrage et mis à jour chaque nuit à minuit
 MARCHES          = []   # liste des symboles actifs (levier x10 uniquement)
-OKX_SYMBOLS      = {}   # { "ETHUSDT": "ETH-USDT-SWAP", ... }
+OKX_SYMBOLS      = {}   # { "BTCUSD": "BTC-USD-YYMMDD", ... } — vrai instId X-Perp
 
 # ═══════════════════════════════════════════════════════════════
 #  ÉTAT GLOBAL
@@ -125,52 +125,56 @@ log.info("=" * 60)
 async def charger_marches_x10(session):
     """
     Vérifie, pour une liste de cryptos majeures connues, lesquelles ont
-    réellement un levier x10 disponible sur OKX (Swap Perpétuel USDT-margé).
-    Met à jour MARCHES et OKX_SYMBOLS dynamiquement. Supprime les marchés
-    qui ne sont plus x10.
-
-    Contrairement à un scan complet du catalogue OKX (instType=SWAP sans
-    filtre), qui remonte plusieurs centaines d'instruments — dont des actions
-    tokenisées et produits exotiques (AAPL, SOFTBANK, argent...) mélangés aux
-    vraies cryptos, ce qui sature aussi l'API en scan — on vérifie ici une
-    liste de candidats connus, comme le faisait la version Kraken d'origine.
+    réellement un X-Perp avec levier x10 disponible sur OKX — le produit
+    accessible sur le compte France/EEA (instType=FUTURES, ruleType=xperp),
+    plafonné à x10 côté OKX lui-même, contrairement aux Swaps Perpétuels
+    classiques (jusqu'à x50-x100) qui ne sont pas ceux réellement tradables
+    sur ce compte. Met à jour MARCHES et OKX_SYMBOLS avec le VRAI instId du
+    X-Perp (ex: BTC-USD-YYMMDD) — pas un Swap USDT. Supprime les marchés qui
+    ne sont plus x10 ou qui n'ont plus de X-Perp.
     """
     global MARCHES, OKX_SYMBOLS
 
     # Cryptos majeures à vérifier — mêmes candidats que la version Kraken
-    # d'origine, adaptés au format OKX (BASE-USDT-SWAP)
-    CANDIDATS = [
-        "ETHUSDT", "XRPUSDT", "SOLUSDT", "ADAUSDT", "LINKUSDT", "DOGEUSDT",
-        "LTCUSDT", "DOTUSDT", "TRXUSDT", "UNIUSDT", "HYPEUSDT", "AVAXUSDT",
-        "ATOMUSDT", "NEARUSDT", "AAVEUSDT", "ARBUSDT", "SUIUSDT", "FILUSDT",
-        "BTCUSDT", "ALGOUSDT", "INJUSDT", "OPUSDT", "BNBUSDT", "HBARUSDT",
+    # d'origine. Tous n'auront pas forcément de X-Perp (l'offre OKX X-Perp
+    # est plus restreinte que les Swaps classiques) — seuls ceux qui en ont
+    # un réellement à x10 seront gardés.
+    CANDIDATS_BASE = [
+        "ETH", "XRP", "SOL", "ADA", "LINK", "DOGE", "LTC", "DOT", "TRX", "UNI",
+        "HYPE", "AVAX", "ATOM", "NEAR", "AAVE", "ARB", "SUI", "FIL", "BTC",
+        "ALGO", "INJ", "OP", "BNB", "HBAR",
     ]
 
     try:
         async with session.get(
             "https://www.okx.com/api/v5/public/instruments",
-            params={"instType": "SWAP"},
+            params={"instType": "FUTURES"},
             timeout=aiohttp.ClientTimeout(total=20)
         ) as resp:
             data = await resp.json()
             if data.get("code") != "0":
                 log.error(f"  Erreur API OKX instruments : {data}")
                 return
-            instruments = {inst.get("instId", ""): inst for inst in data.get("data", [])}
+            xperps = {}
+            for inst in data.get("data", []):
+                if inst.get("ruleType") != "xperp":
+                    continue
+                base = inst.get("instId", "").split("-")[0]
+                if base:
+                    xperps[base] = inst
 
         nouveaux_marches  = []
         nouveaux_symbols  = {}
         marches_supprimes = []
 
-        for symbole_usdt in CANDIDATS:
-            base    = symbole_usdt[:-4]  # retire "USDT"
-            inst_id = f"{base}-USDT-SWAP"
-            inst    = instruments.get(inst_id)
+        for base in CANDIDATS_BASE:
+            symbole = f"{base}USD"  # X-Perps cotés en USD, pas en USDT
+            inst = xperps.get(base)
 
             if inst is None:
-                if symbole_usdt in MARCHES:
-                    marches_supprimes.append(symbole_usdt)
-                log.info(f"  ❌ {symbole_usdt} — pas de Swap OKX trouvé")
+                if symbole in MARCHES:
+                    marches_supprimes.append(symbole)
+                log.info(f"  ❌ {symbole} — pas de X-Perp OKX trouvé")
                 continue
 
             try:
@@ -179,13 +183,13 @@ async def charger_marches_x10(session):
                 levier_max = 0
 
             if levier_max >= 10:
-                nouveaux_marches.append(symbole_usdt)
-                nouveaux_symbols[symbole_usdt] = inst_id
-                log.info(f"  ✅ {symbole_usdt} — levier max x{levier_max:.0f} → inclus")
+                nouveaux_marches.append(symbole)
+                nouveaux_symbols[symbole] = inst["instId"]
+                log.info(f"  ✅ {symbole} — X-Perp levier max x{levier_max:.0f} → inclus")
             else:
-                if symbole_usdt in MARCHES:
-                    marches_supprimes.append(symbole_usdt)
-                log.info(f"  ❌ {symbole_usdt} — levier max x{levier_max:.0f} → exclu (pas x10)")
+                if symbole in MARCHES:
+                    marches_supprimes.append(symbole)
+                log.info(f"  ❌ {symbole} — X-Perp levier max x{levier_max:.0f} → exclu (pas x10)")
 
         # Fermer les trades ouverts sur les marchés supprimés
         if marches_supprimes:
