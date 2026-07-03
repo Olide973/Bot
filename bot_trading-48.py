@@ -264,7 +264,13 @@ def get_marches_actifs():
 #  argent fictif, données réelles — voir la conversation précédente) avant
 #  tout passage avec de l'argent réel. Ne jamais activer MODE_REEL=1 sans
 #  être passé par cette étape de validation.
-OKX_BASE_URL = "https://www.okx.com"
+# Domaine pour les appels PRIVÉS (authentifiés) — my.okx.com est le
+# sous-domaine spécifique à l'entité EEA/France (voir échange précédent :
+# les données publiques restent sur www.okx.com, qui fonctionne déjà bien
+# depuis le début, mais les clés API créées sur un compte France/EEA
+# n'existent QUE côté my.okx.com — les envoyer vers www.okx.com renvoie
+# "API key doesn't exist" (code 50119) même avec une clé 100% correcte).
+OKX_BASE_URL = "https://my.okx.com"
 
 def _okx_headers(method, path, body=""):
     """Construit les en-têtes signés requis par l'API privée OKX v5.
