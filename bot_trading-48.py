@@ -11,6 +11,7 @@
 import asyncio
 import aiohttp
 import os
+import json
 import logging
 import time
 from datetime import datetime, timedelta
@@ -47,6 +48,7 @@ MAX_TRADES_SIMULTANES   = 10         # 10 marchés max = 1 par marché
 SEUIL_MOUVEMENT_PCT     = 0.50   # dès que le prix bouge de 0.50% → signal
 VOLUME_MINI             = 0.25   # volume min vs moyenne 24h
 STOP_LOSS_FIXE          = 2.0    # stop fixe = -2€ par trade, ni plus ni moins
+DUREE_MAX_MINUTES       = 360    # 6h — fermeture forcée si ni stop ni lock atteint avant
 
 # ── Filtre RSI 1h
 RSI_SEUIL_BAS           = 45     # RSI < 45 → marché baissier → inverser ACHAT en VENTE
@@ -105,6 +107,10 @@ trades_ouverts    = {}    # { symbole: True }
 prix_reference    = {}    # { symbole: prix_au_moment_du_scan }
 cooldown_marches  = {}    # { symbole: timestamp_fin_cooldown }
 trades_lock       = None  # initialisé dans boucle_principale()
+PRIX_LIVE           = {}    # { symbole: dernier prix reçu via WebSocket OKX }
+PRIX_LIVE_TS        = {}    # { symbole: timestamp du dernier tick reçu — pour détecter un cache périmé }
+WS_CONNEXION_ACTIVE = None  # référence à la connexion WebSocket en cours (pour forcer une resynchro)
+SEUIL_FRAICHEUR_PRIX_SEC = 2.0  # au-delà, le cache WS est considéré périmé → repli REST
 
 log.info("=" * 60)
 log.info("  BOT MEAN REVERSION — OKX X10")
@@ -114,7 +120,7 @@ log.info(f"  RSI 1h : seuil bas={RSI_SEUIL_BAS} | seuil haut={RSI_SEUIL_HAUT}")
 log.info(f"  Stop : fixe {STOP_LOSS_FIXE}€ par trade")
 log.info(f"  Frais OKX : {OKX_TAKER_FEE*100:.2f}% ouv + {OKX_TAKER_FEE*100:.2f}% ferm (taker)")
 log.info(f"  Kill switch : {KILL_SWITCH_JOUR}€/jour | Ruine : {SEUIL_RUINE}€")
-log.info(f"  Pas de timeout — trades ouverts jusqu'au stop ou au lock")
+log.info(f"  Durée max par trade : {DUREE_MAX_MINUTES//60}h — fermeture forcée si ni stop ni lock atteint avant")
 log.info(f"  Telegram : {'ON' if TELEGRAM_TOKEN else 'OFF'}")
 log.info(f"  Mode : {'REEL' if MODE_REEL else 'SIMULATION'}")
 log.info("=" * 60)
@@ -268,7 +274,9 @@ async def get_klines(session, symbole, interval=15, limite=50):
         log.error(f"Erreur klines {symbole} : {e}")
         return None
 
-async def get_prix_actuel(session, symbole):
+async def get_prix_rest(session, symbole):
+    """Prix via l'API REST OKX (fallback tant que le WebSocket n'a pas encore
+    poussé de tick, ou si le cache est périmé)."""
     okx_symbol = OKX_SYMBOLS.get(symbole, symbole)
     try:
         async with session.get(
@@ -284,8 +292,96 @@ async def get_prix_actuel(session, symbole):
                 return None
             return float(result[0]["last"])
     except Exception as e:
-        log.error(f"Erreur prix {symbole} : {e}")
+        log.error(f"Erreur prix REST {symbole} : {e}")
         return None
+
+async def get_prix_actuel(session, symbole):
+    """Prix temps réel : lit le cache alimenté par le WebSocket OKX.
+    Double contrôle de fraîcheur : si le dernier tick reçu pour ce marché date
+    de plus de SEUIL_FRAICHEUR_PRIX_SEC, on ne lui fait plus confiance (marché
+    peu liquide où OKX ne pousse pas de tick pendant plusieurs secondes) et on
+    va chercher un prix frais via REST — pour éviter de piloter un stop loss
+    sur une valeur périmée qui a pu bouger fortement entre-temps."""
+    prix_ws = PRIX_LIVE.get(symbole)
+    ts_ws   = PRIX_LIVE_TS.get(symbole)
+    if prix_ws is not None and ts_ws is not None and (time.time() - ts_ws) <= SEUIL_FRAICHEUR_PRIX_SEC:
+        return prix_ws
+    prix_rest = await get_prix_rest(session, symbole)
+    if prix_rest is not None:
+        return prix_rest
+    return prix_ws  # REST a échoué mais on a quand même un prix WS (même périmé) → mieux que rien
+
+async def _ws_keepalive(ws):
+    """Envoie un 'ping' applicatif toutes les 20s — requis par OKX pour garder
+    la connexion WebSocket ouverte (sinon fermeture après ~30s d'inactivité)."""
+    try:
+        while not ws.closed:
+            await asyncio.sleep(20)
+            if not ws.closed:
+                await ws.send_str("ping")
+    except Exception:
+        pass
+
+async def websocket_prix(session):
+    """Connexion WebSocket temps réel OKX (canal public 'tickers').
+    Remplace le polling REST pour la détection de signal : PRIX_LIVE est mis
+    à jour en continu, dès qu'OKX pousse un tick, pour les marchés suivis.
+    Se reconnecte automatiquement en cas de coupure, et relit MARCHES à
+    chaque reconnexion (donc prend en compte les marchés ajoutés/retirés par
+    le rafraîchissement quotidien de minuit)."""
+    global WS_CONNEXION_ACTIVE
+    url = "wss://ws.okx.com:8443/ws/v5/public"
+
+    while True:
+        keepalive_task = None
+        if not MARCHES:
+            await asyncio.sleep(5)
+            continue
+        args = [{"channel": "tickers", "instId": OKX_SYMBOLS[m]} for m in MARCHES if m in OKX_SYMBOLS]
+        try:
+            async with session.ws_connect(url, heartbeat=25) as ws:
+                WS_CONNEXION_ACTIVE = ws
+                await ws.send_json({"op": "subscribe", "args": args})
+                keepalive_task = asyncio.create_task(_ws_keepalive(ws))
+                log.info(f"  🔌 WebSocket OKX connecté — abonnement tickers ({len(args)} marchés)")
+
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        if msg.data == "pong":
+                            continue
+                        try:
+                            data = json.loads(msg.data)
+                        except Exception:
+                            continue
+                        if data.get("event") in ("subscribe", "error"):
+                            if data.get("event") == "error":
+                                log.error(f"  Erreur abonnement WebSocket : {data}")
+                            continue
+                        if "data" in data and "arg" in data:
+                            inst_id = data["arg"].get("instId")
+                            symbole = None
+                            for s, i in OKX_SYMBOLS.items():
+                                if i == inst_id:
+                                    symbole = s
+                                    break
+                            ticks = data.get("data", [])
+                            if symbole and ticks:
+                                try:
+                                    PRIX_LIVE[symbole]    = float(ticks[0]["last"])
+                                    PRIX_LIVE_TS[symbole] = time.time()
+                                except (KeyError, ValueError, TypeError):
+                                    pass
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
+                        break
+        except Exception as e:
+            log.error(f"Erreur WebSocket OKX : {e}")
+        finally:
+            WS_CONNEXION_ACTIVE = None
+            if keepalive_task:
+                keepalive_task.cancel()
+
+        log.warning("  🔌 WebSocket OKX déconnecté — reconnexion dans 5s")
+        await asyncio.sleep(5)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -493,7 +589,7 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
     pnl             = 0.0
     duree           = 0
 
-    # ── Boucle de surveillance — sans timeout
+    # ── Boucle de surveillance — jusqu'au stop, au lock, ou 6h max
     while True:
         await asyncio.sleep(CHECK_INTERVAL)
 
@@ -540,6 +636,24 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
             )
             resultat_final = "GAGNE"
             gain_final     = gain_net
+            break
+
+        # Durée maximale : fermeture forcée à 6h si ni stop ni lock atteint
+        if duree >= DUREE_MAX_MINUTES:
+            frais   = calc_frais(position)
+            pnl_net = round(pnl - frais["total"], 4)
+            resultat_final = "GAGNE" if pnl_net > 0 else "PERDU"
+            log.warning(f"\n  ⏰ DURÉE MAX ATTEINTE [{symbole}] {'+' if pnl>=0 else ''}{pnl:.2f}€ | "
+                        f"net={pnl_net:+.4f}€ | {duree}min")
+            await telegram(session,
+                f"⏰ <b>DURÉE MAX (6h) — FERMETURE FORCÉE</b>\n"
+                f"{symbole} {direction}\n"
+                f"PnL brut : {'+' if pnl>=0 else ''}{pnl:.2f}€\n"
+                f"Frais (ouv+ferm) : -{frais['total']}€\n"
+                f"Résultat net : {'+' if pnl_net>=0 else ''}{pnl_net}€\n"
+                f"Durée : {duree} min"
+            )
+            gain_final = pnl_net
             break
 
         # Stop loss
@@ -1124,6 +1238,14 @@ async def boucle_principale():
             f"{(datetime.utcnow() - timedelta(hours=3)).strftime('%Y-%m-%d %H:%M:%S')}"
         )
 
+        # Lance le flux WebSocket temps réel en tâche de fond (reconnexion
+        # auto en cas de coupure) — remplace le polling REST pour la
+        # détection de signal, pour réagir aux mouvements de prix OKX en
+        # temps réel plutôt que d'attendre le prochain appel REST.
+        asyncio.create_task(websocket_prix(session))
+        log.info("  ⏳ Attente des premiers ticks WebSocket (3s)...")
+        await asyncio.sleep(3)
+
         while True:
             try:
                 if reset_pnl_jour_si_nouveau_jour(etat):
@@ -1143,6 +1265,14 @@ async def boucle_principale():
                         f"🔄 <b>Marchés x10 mis à jour</b>\n"
                         f"{len(MARCHES)} marchés actifs : {', '.join(MARCHES)}"
                     )
+                    # Force une reconnexion WebSocket pour resynchroniser
+                    # l'abonnement avec la liste de marchés à jour
+                    if WS_CONNEXION_ACTIVE is not None and not WS_CONNEXION_ACTIVE.closed:
+                        log.info("  🔌 Resynchronisation WebSocket forcée (marchés mis à jour)")
+                        try:
+                            await WS_CONNEXION_ACTIVE.close()
+                        except Exception as e:
+                            log.error(f"Erreur lors de la resynchronisation WebSocket : {e}")
 
                 # Rapport quotidien à 19h Guyane = 22h UTC
                 if (maintenant_utc.hour == 22 and
