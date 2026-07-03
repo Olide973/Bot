@@ -124,15 +124,27 @@ log.info("=" * 60)
 # ═══════════════════════════════════════════════════════════════
 async def charger_marches_x10(session):
     """
-    Récupère depuis l'API publique OKX (instType=SWAP) tous les marchés USDT
-    avec levier x10 réellement disponible (champ 'lever' de l'instrument).
-    Met à jour MARCHES et OKX_SYMBOLS dynamiquement. Contrairement à Kraken,
-    OKX retourne tous ses Swaps Perpétuels en un seul appel — pas besoin d'une
-    liste de correspondances codée en dur, la découverte couvre tout le
-    catalogue crypto disponible.
-    Supprime les marchés qui ne sont plus x10.
+    Vérifie, pour une liste de cryptos majeures connues, lesquelles ont
+    réellement un levier x10 disponible sur OKX (Swap Perpétuel USDT-margé).
+    Met à jour MARCHES et OKX_SYMBOLS dynamiquement. Supprime les marchés
+    qui ne sont plus x10.
+
+    Contrairement à un scan complet du catalogue OKX (instType=SWAP sans
+    filtre), qui remonte plusieurs centaines d'instruments — dont des actions
+    tokenisées et produits exotiques (AAPL, SOFTBANK, argent...) mélangés aux
+    vraies cryptos, ce qui sature aussi l'API en scan — on vérifie ici une
+    liste de candidats connus, comme le faisait la version Kraken d'origine.
     """
     global MARCHES, OKX_SYMBOLS
+
+    # Cryptos majeures à vérifier — mêmes candidats que la version Kraken
+    # d'origine, adaptés au format OKX (BASE-USDT-SWAP)
+    CANDIDATS = [
+        "ETHUSDT", "XRPUSDT", "SOLUSDT", "ADAUSDT", "LINKUSDT", "DOGEUSDT",
+        "LTCUSDT", "DOTUSDT", "TRXUSDT", "UNIUSDT", "HYPEUSDT", "AVAXUSDT",
+        "ATOMUSDT", "NEARUSDT", "AAVEUSDT", "ARBUSDT", "SUIUSDT", "FILUSDT",
+        "BTCUSDT", "ALGOUSDT", "INJUSDT", "OPUSDT", "BNBUSDT", "HBARUSDT",
+    ]
 
     try:
         async with session.get(
@@ -144,19 +156,22 @@ async def charger_marches_x10(session):
             if data.get("code") != "0":
                 log.error(f"  Erreur API OKX instruments : {data}")
                 return
-            instruments = data.get("data", [])
+            instruments = {inst.get("instId", ""): inst for inst in data.get("data", [])}
 
         nouveaux_marches  = []
         nouveaux_symbols  = {}
         marches_supprimes = []
 
-        for inst in instruments:
-            inst_id = inst.get("instId", "")
-            # On ne garde que les Swaps Perpétuels cotés en USDT (marge stable)
-            if not inst_id.endswith("-USDT-SWAP"):
+        for symbole_usdt in CANDIDATS:
+            base    = symbole_usdt[:-4]  # retire "USDT"
+            inst_id = f"{base}-USDT-SWAP"
+            inst    = instruments.get(inst_id)
+
+            if inst is None:
+                if symbole_usdt in MARCHES:
+                    marches_supprimes.append(symbole_usdt)
+                log.info(f"  ❌ {symbole_usdt} — pas de Swap OKX trouvé")
                 continue
-            base = inst_id.split("-")[0]
-            symbole_usdt = f"{base}USDT"
 
             try:
                 levier_max = float(inst.get("lever", 0) or 0)
@@ -166,9 +181,11 @@ async def charger_marches_x10(session):
             if levier_max >= 10:
                 nouveaux_marches.append(symbole_usdt)
                 nouveaux_symbols[symbole_usdt] = inst_id
+                log.info(f"  ✅ {symbole_usdt} — levier max x{levier_max:.0f} → inclus")
             else:
                 if symbole_usdt in MARCHES:
                     marches_supprimes.append(symbole_usdt)
+                log.info(f"  ❌ {symbole_usdt} — levier max x{levier_max:.0f} → exclu (pas x10)")
 
         # Fermer les trades ouverts sur les marchés supprimés
         if marches_supprimes:
@@ -639,12 +656,15 @@ def verifier_protections(etat, capital):
     return "OK"
 
 def reset_pnl_jour_si_nouveau_jour(etat):
+    """Retourne True si le PnL du jour a été remis à 0 (changement de jour)."""
     maintenant_guyane = datetime.utcnow() - timedelta(hours=3)
     aujourd_hui = maintenant_guyane.strftime('%Y-%m-%d')
     if etat.get("date_jour", "") != aujourd_hui:
         etat["pnl_jour"]  = 0.0
         etat["date_jour"] = aujourd_hui
         log.info("  Nouveau jour — PnL remis à 0")
+        return True
+    return False
 
 # ═══════════════════════════════════════════════════════════════
 #  RAPPORT QUOTIDIEN
@@ -1050,6 +1070,13 @@ async def boucle_principale():
         if champ not in etat:
             etat[champ] = valeur
 
+    # Sauvegarde immédiate de l'état complet (avec les valeurs par défaut
+    # tout juste peuplées) — sans ça, un redémarrage juste après un
+    # RESET_TOUT rechargerait un état incomplet/vide depuis la base plutôt
+    # que le pnl_jour à 0 fraîchement réinitialisé, et le kill switch
+    # pourrait sembler ne pas s'être remis à zéro.
+    sauvegarder_etat(etat)
+
     afficher_tableau_de_bord(etat)
 
     connector = aiohttp.TCPConnector(limit=50)
@@ -1095,7 +1122,8 @@ async def boucle_principale():
 
         while True:
             try:
-                reset_pnl_jour_si_nouveau_jour(etat)
+                if reset_pnl_jour_si_nouveau_jour(etat):
+                    sauvegarder_etat(etat)
 
                 maintenant_utc = datetime.utcnow()
 
