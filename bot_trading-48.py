@@ -97,6 +97,15 @@ OKX_API_SECRET   = os.environ.get('OKX_API_SECRET', '')
 OKX_API_PASSPHRASE = os.environ.get('OKX_API_PASSPHRASE', '')
 MODE_REEL        = os.environ.get('MODE_REEL', '0') == '1'
 
+# ── Sécurité à DEUX niveaux avant de toucher de l'argent réel :
+#    1) MODE_REEL doit être à 1 pour envoyer le moindre ordre (sinon simulation pure)
+#    2) OKX_COMPTE_DEMO reste à 1 PAR DÉFAUT — même avec MODE_REEL=1, les ordres
+#       partent avec l'en-tête x-simulated-trading:1, qui les cantonne à l'argent
+#       fictif du compte Démo Trading OKX. Il faut DEUX actions volontaires et
+#       explicites sur Railway (MODE_REEL=1 ET OKX_COMPTE_DEMO=0) pour qu'un ordre
+#       touche enfin de l'argent réel — jamais un seul interrupteur suffit.
+OKX_COMPTE_DEMO  = os.environ.get('OKX_COMPTE_DEMO', '1') == '1'
+
 # ── Reset complet piloté depuis Railway (Variables → RESET_TOUT = 1, puis Deploy)
 #    Remet à zéro : capital, PnL jour, kill switch, compteurs, historique.
 #    Remettre à 0 (ou supprimer la variable) + redeploy pour revenir en
@@ -132,6 +141,8 @@ log.info(f"  Kill switch : {KILL_SWITCH_JOUR}€/jour | Ruine : {SEUIL_RUINE}€
 log.info(f"  Durée max par trade : {DUREE_MAX_MINUTES//60}h — fermeture forcée si ni stop ni lock atteint avant")
 log.info(f"  Telegram : {'ON' if TELEGRAM_TOKEN else 'OFF'}")
 log.info(f"  Mode : {'REEL' if MODE_REEL else 'SIMULATION'}")
+if MODE_REEL:
+    log.warning(f"  ⚠️ Compte ciblé pour les ordres : {'DÉMO (argent fictif)' if OKX_COMPTE_DEMO else '🚨 RÉEL — ARGENT VÉRITABLE 🚨'}")
 log.info("=" * 60)
 
 # ═══════════════════════════════════════════════════════════════
@@ -256,19 +267,25 @@ def get_marches_actifs():
 OKX_BASE_URL = "https://www.okx.com"
 
 def _okx_headers(method, path, body=""):
-    """Construit les en-têtes signés requis par l'API privée OKX v5."""
+    """Construit les en-têtes signés requis par l'API privée OKX v5.
+    Ajoute x-simulated-trading:1 tant que OKX_COMPTE_DEMO=1 (valeur par
+    défaut) — c'est cet en-tête qui garantit que les ordres restent cantonnés
+    au compte Démo Trading (argent fictif), indépendamment de MODE_REEL."""
     timestamp = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.') + \
                 f"{datetime.utcnow().microsecond // 1000:03d}Z"
     message = timestamp + method + path + body
     mac = hmac.new(OKX_API_SECRET.encode(), message.encode(), hashlib.sha256)
     signature = base64.b64encode(mac.digest()).decode()
-    return {
+    headers = {
         "OK-ACCESS-KEY": OKX_API_KEY,
         "OK-ACCESS-SIGN": signature,
         "OK-ACCESS-TIMESTAMP": timestamp,
         "OK-ACCESS-PASSPHRASE": OKX_API_PASSPHRASE,
         "Content-Type": "application/json",
     }
+    if OKX_COMPTE_DEMO:
+        headers["x-simulated-trading"] = "1"
+    return headers
 
 async def okx_definir_levier(session, inst_id, levier):
     """Configure le levier sur un instrument avant ouverture (marge isolée)."""
@@ -1401,7 +1418,8 @@ async def boucle_principale():
             f"Frais OKX : {OKX_TAKER_FEE*100:.2f}% ouv + {OKX_TAKER_FEE*100:.2f}% ferm (taker)\n"
             f"Kill switch : {KILL_SWITCH_JOUR}€/jour\n"
             f"Mode : {'REEL' if MODE_REEL else 'SIMULATION'}\n"
-            f"{(datetime.utcnow() - timedelta(hours=3)).strftime('%Y-%m-%d %H:%M:%S')}"
+            + (f"Compte ordres : {'DÉMO (fictif)' if OKX_COMPTE_DEMO else '🚨 RÉEL — ARGENT VÉRITABLE 🚨'}\n" if MODE_REEL else "")
+            + f"{(datetime.utcnow() - timedelta(hours=3)).strftime('%Y-%m-%d %H:%M:%S')}"
         )
 
         # Lance le flux WebSocket temps réel en tâche de fond (reconnexion
