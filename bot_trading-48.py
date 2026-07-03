@@ -36,34 +36,25 @@ log = logging.getLogger(__name__)
 CAPITAL_INITIAL         = 500.0
 LEVIER                  = 10
 
-# ── Mise calculée pour avoir des frais totaux de ~0.50€ avec les vrais frais OKX
-# Frais réels OKX (taker, palier standard) = 0.05% ouverture + 0.05% fermeture = 0.10% total
-# Pour frais = 0.50€ → position = 0.50 / 0.0010 = 500€ → mise = 500 / 10 = 50€
-# Soit 50 / 500 = 10% du capital
-MISE_BASE_PCT           = 0.10    # 10% du capital → mise ~50€ → position ~500€ → frais ~0.50€
-MISE_MIN                = 10.0    # mise minimum cohérente avec l'objectif frais 0.50€
-MISE_MAX_PCT            = 0.12    # plafond légèrement au-dessus pour le boost confiance
-CHECK_INTERVAL          = 3          # secondes entre chaque check prix
-PAUSE_SCAN              = 30         # secondes entre chaque scan de nouveaux marchés
-MAX_TRADES_SIMULTANES   = 10         # 10 marchés max = 1 par marché
+MISE_BASE_PCT           = 0.10
+MISE_MIN                = 10.0
+MISE_MAX_PCT            = 0.12
+CHECK_INTERVAL          = 3
+PAUSE_SCAN              = 30
+MAX_TRADES_SIMULTANES   = 10
 
-# ── Détection signal mean reversion — surveillance temps réel
-SEUIL_MOUVEMENT_PCT     = 0.50   # dès que le prix bouge de 0.50% → signal
-VOLUME_MINI             = 0.25   # volume min vs moyenne 24h
-STOP_LOSS_FIXE          = 25.0   # stop fixe = -25€ par trade (avant frais), ni plus ni moins
-DUREE_MAX_MINUTES       = 360    # 6h — fermeture forcée si ni stop ni lock atteint avant
+SEUIL_MOUVEMENT_PCT     = 0.50
+VOLUME_MINI             = 0.25
+STOP_LOSS_FIXE          = 25.0
+DUREE_MAX_MINUTES       = 360
 
-# ── Filtre RSI 1h
-RSI_SEUIL_BAS           = 45     # RSI < 45 → marché baissier → inverser ACHAT en VENTE
-RSI_SEUIL_HAUT          = 55     # RSI > 55 → marché haussier → inverser VENTE en ACHAT
+RSI_SEUIL_BAS           = 45
+RSI_SEUIL_HAUT          = 55
 RSI_PERIODE             = 14
 
-# ── Protections
 KILL_SWITCH_JOUR        = -100.0
 SEUIL_RUINE             = 300.0
 
-# ── Lock profits par paliers proportionnels au capital
-# Premier palier : 0.15% = 0.75€ à 500€
 LOCK_PALIERS_PCT = [
     0.17, 0.22, 0.30, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
     1.80, 2.20, 2.60, 3.20, 3.80, 4.60, 5.50, 6.50, 7.50, 9.00,
@@ -71,7 +62,6 @@ LOCK_PALIERS_PCT = [
 ]
 
 def get_palier_lock(pnl_max, capital):
-    """Retourne le gain garanti selon le PnL max atteint — proportionnel au capital."""
     lock = 0.0
     for pct in LOCK_PALIERS_PCT:
         palier_eur = round(capital * pct / 100, 2)
@@ -79,16 +69,10 @@ def get_palier_lock(pnl_max, capital):
             lock = palier_eur
     return lock
 
-# ── Gestion mise dynamique
 WINS_CONFIANCE          = 3
 BOOST_CONFIANCE         = 1.20
 
-# ── Frais OKX réels (X-Perps, palier standard/non-VIP — identiques aux Swaps Perpétuels classiques)
-# Maker 0.02% / Taker 0.05% du notionnel — le bot sort au marché à l'ouverture
-# ET à la fermeture, donc taker des deux côtés. Pas de rollover/funding modélisé
-# ici (contrairement aux frais Kraken margin, OKX ne facture pas de frais de
-# financement séparé de cette façon sur ce produit dans cette version du bot).
-OKX_TAKER_FEE            = 0.0005  # 0.05% par exécution (ouverture OU fermeture)
+OKX_TAKER_FEE            = 0.0005
 
 TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
@@ -97,38 +81,25 @@ OKX_API_SECRET   = os.environ.get('OKX_API_SECRET', '')
 OKX_API_PASSPHRASE = os.environ.get('OKX_API_PASSPHRASE', '')
 MODE_REEL        = os.environ.get('MODE_REEL', '0') == '1'
 
-# ── Sécurité à DEUX niveaux avant de toucher de l'argent réel :
-#    1) MODE_REEL doit être à 1 pour envoyer le moindre ordre (sinon simulation pure)
-#    2) OKX_COMPTE_DEMO reste à 1 PAR DÉFAUT — même avec MODE_REEL=1, les ordres
-#       partent avec l'en-tête x-simulated-trading:1, qui les cantonne à l'argent
-#       fictif du compte Démo Trading OKX. Il faut DEUX actions volontaires et
-#       explicites sur Railway (MODE_REEL=1 ET OKX_COMPTE_DEMO=0) pour qu'un ordre
-#       touche enfin de l'argent réel — jamais un seul interrupteur suffit.
 OKX_COMPTE_DEMO  = os.environ.get('OKX_COMPTE_DEMO', '1') == '1'
 
-# ── Reset complet piloté depuis Railway (Variables → RESET_TOUT = 1, puis Deploy)
-#    Remet à zéro : capital, PnL jour, kill switch, compteurs, historique.
-#    Remettre à 0 (ou supprimer la variable) + redeploy pour revenir en
-#    fonctionnement normal sans redéclencher un reset à chaque redémarrage.
 RESET_TOUT = os.environ.get('RESET_TOUT', '0').strip().lower() in ('1', 'true', 'oui', 'yes')
 
-# ── Marchés — uniquement ceux à levier x10 sur OKX (X-Perps, compte France/EEA)
-# Chargés dynamiquement via API au démarrage et mis à jour chaque nuit à minuit
-MARCHES          = []   # liste des symboles actifs (levier x10 uniquement)
-OKX_SYMBOLS      = {}   # { "BTCUSD": "BTC-USD-YYMMDD", ... } — vrai instId X-Perp
-OKX_CT_VAL       = {}   # { "BTCUSD": 0.01, ... } — valeur d'un contrat (usage réel uniquement)
+MARCHES          = []
+OKX_SYMBOLS      = {}
+OKX_CT_VAL       = {}
 
 # ═══════════════════════════════════════════════════════════════
 #  ÉTAT GLOBAL
 # ═══════════════════════════════════════════════════════════════
-trades_ouverts    = {}    # { symbole: True }
-prix_reference    = {}    # { symbole: prix_au_moment_du_scan }
-cooldown_marches  = {}    # { symbole: timestamp_fin_cooldown }
-trades_lock       = None  # initialisé dans boucle_principale()
-PRIX_LIVE           = {}    # { symbole: dernier prix reçu via WebSocket OKX }
-PRIX_LIVE_TS        = {}    # { symbole: timestamp du dernier tick reçu — pour détecter un cache périmé }
-WS_CONNEXION_ACTIVE = None  # référence à la connexion WebSocket en cours (pour forcer une resynchro)
-SEUIL_FRAICHEUR_PRIX_SEC = 2.0  # au-delà, le cache WS est considéré périmé → repli REST
+trades_ouverts    = {}
+prix_reference    = {}
+cooldown_marches  = {}
+trades_lock       = None
+PRIX_LIVE           = {}
+PRIX_LIVE_TS        = {}
+WS_CONNEXION_ACTIVE = None
+SEUIL_FRAICHEUR_PRIX_SEC = 2.0
 
 log.info("=" * 60)
 log.info("  BOT MEAN REVERSION — OKX X10")
@@ -149,22 +120,8 @@ log.info("=" * 60)
 #  CHARGEMENT MARCHÉS x10 DEPUIS API OKX
 # ═══════════════════════════════════════════════════════════════
 async def charger_marches_x10(session):
-    """
-    Vérifie, pour une liste de cryptos majeures connues, lesquelles ont
-    réellement un X-Perp avec levier x10 disponible sur OKX — le produit
-    accessible sur le compte France/EEA (instType=FUTURES, ruleType=xperp),
-    plafonné à x10 côté OKX lui-même, contrairement aux Swaps Perpétuels
-    classiques (jusqu'à x50-x100) qui ne sont pas ceux réellement tradables
-    sur ce compte. Met à jour MARCHES et OKX_SYMBOLS avec le VRAI instId du
-    X-Perp (ex: BTC-USD-YYMMDD) — pas un Swap USDT. Supprime les marchés qui
-    ne sont plus x10 ou qui n'ont plus de X-Perp.
-    """
     global MARCHES, OKX_SYMBOLS, OKX_CT_VAL
 
-    # Cryptos majeures à vérifier — mêmes candidats que la version Kraken
-    # d'origine. Tous n'auront pas forcément de X-Perp (l'offre OKX X-Perp
-    # est plus restreinte que les Swaps classiques) — seuls ceux qui en ont
-    # un réellement à x10 seront gardés.
     CANDIDATS_BASE = [
         "ETH", "XRP", "SOL", "ADA", "LINK", "DOGE", "LTC", "DOT", "TRX", "UNI",
         "HYPE", "AVAX", "ATOM", "NEAR", "AAVE", "ARB", "SUI", "FIL", "BTC",
@@ -195,7 +152,7 @@ async def charger_marches_x10(session):
         marches_supprimes = []
 
         for base in CANDIDATS_BASE:
-            symbole = f"{base}USD"  # X-Perps cotés en USD, pas en USDT
+            symbole = f"{base}USD"
             inst = xperps.get(base)
 
             if inst is None:
@@ -222,7 +179,6 @@ async def charger_marches_x10(session):
                     marches_supprimes.append(symbole)
                 log.info(f"  ❌ {symbole} — X-Perp levier max x{levier_max:.0f} → exclu (pas x10)")
 
-        # Fermer les trades ouverts sur les marchés supprimés
         if marches_supprimes:
             log.warning(f"  Marchés supprimés (plus x10) : {marches_supprimes}")
             for m in marches_supprimes:
@@ -249,34 +205,14 @@ async def charger_marches_x10(session):
         log.error(f"  Erreur chargement marchés x10 : {e}")
 
 def get_marches_actifs():
-    """Retourne tous les marchés actifs (levier x10 uniquement) — trading 24h/24, 7j/7."""
     return MARCHES
 
 # ═══════════════════════════════════════════════════════════════
-#  TELEGRAM
+#  EXÉCUTION RÉELLE OKX
 # ═══════════════════════════════════════════════════════════════
-# ═══════════════════════════════════════════════════════════════
-#  EXÉCUTION RÉELLE OKX — préparé mais INACTIF tant que MODE_REEL=0
-# ═══════════════════════════════════════════════════════════════
-#  ⚠️ NON TESTÉ EN CONDITIONS RÉELLES (pas d'accès réseau pour vérifier).
-#  Construit selon la documentation officielle OKX v5, mais À VALIDER
-#  OBLIGATOIREMENT sur le Demo Trading OKX (domaine wspap.okx.com séparé,
-#  argent fictif, données réelles — voir la conversation précédente) avant
-#  tout passage avec de l'argent réel. Ne jamais activer MODE_REEL=1 sans
-#  être passé par cette étape de validation.
-# Domaine pour les appels PRIVÉS (authentifiés) — my.okx.com est le
-# sous-domaine spécifique à l'entité EEA/France (voir échange précédent :
-# les données publiques restent sur www.okx.com, qui fonctionne déjà bien
-# depuis le début, mais les clés API créées sur un compte France/EEA
-# n'existent QUE côté my.okx.com — les envoyer vers www.okx.com renvoie
-# "API key doesn't exist" (code 50119) même avec une clé 100% correcte).
 OKX_BASE_URL = "https://my.okx.com"
 
 def _okx_headers(method, path, body=""):
-    """Construit les en-têtes signés requis par l'API privée OKX v5.
-    Ajoute x-simulated-trading:1 tant que OKX_COMPTE_DEMO=1 (valeur par
-    défaut) — c'est cet en-tête qui garantit que les ordres restent cantonnés
-    au compte Démo Trading (argent fictif), indépendamment de MODE_REEL."""
     timestamp = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.') + \
                 f"{datetime.utcnow().microsecond // 1000:03d}Z"
     message = timestamp + method + path + body
@@ -295,14 +231,7 @@ def _okx_headers(method, path, body=""):
 
 async def okx_resoudre_instid_reel(session, base):
     """Récupère l'instId du X-Perp tel que réellement disponible pour CE
-    COMPTE, via l'endpoint AUTHENTIFIÉ /api/v5/account/instruments — pas le
-    catalogue public générique (/api/v5/public/instruments), qui diffère
-    selon la région/le type de compte. Confirmé par la documentation
-    officielle OKX elle-même : les utilisateurs sont classés en deux
-    catégories selon leur pays, et reçoivent des résultats différents
-    (parfois un tableau vide) sur les endpoints d'instruments génériques.
-    L'endpoint /account/instruments, lui, est scopé au compte qui appelle —
-    donc fiable quelle que soit la région. Retourne None si non trouvé."""
+    COMPTE, via l'endpoint AUTHENTIFIÉ /api/v5/account/instruments."""
     path = "/api/v5/account/instruments"
     query = "?instType=FUTURES"
     try:
@@ -312,6 +241,20 @@ async def okx_resoudre_instid_reel(session, base):
             timeout=aiohttp.ClientTimeout(total=15)
         ) as resp:
             data = await resp.json()
+            # 🔍 DEBUG TEMPORAIRE — à retirer une fois le problème identifié.
+            # Affiche la réponse brute complète (code, msg, et les 3 premiers
+            # instruments reçus) pour voir précisément ce que renvoie OKX :
+            # une vraie liste vide, un code d'erreur, ou des instruments dont
+            # le format d'instId/ruleType ne correspond pas à ce qu'on filtre.
+            nb_instruments = len(data.get("data", []))
+            apercu = data.get("data", [])[:3]
+            log.warning(
+                f"  🔍 DEBUG account/instruments (base={base}) — "
+                f"code={data.get('code')} msg={data.get('msg')!r} "
+                f"nb_instruments={nb_instruments} demo={OKX_COMPTE_DEMO}"
+            )
+            log.warning(f"  🔍 DEBUG apercu (3 premiers) : {json.dumps(apercu)[:1500]}")
+
             if data.get("code") != "0":
                 log.warning(f"  Résolution instId (account/instruments) : réponse invalide {data}")
                 return None
@@ -328,7 +271,6 @@ async def okx_resoudre_instid_reel(session, base):
         return None
 
 async def okx_definir_levier(session, inst_id, levier):
-    """Configure le levier sur un instrument avant ouverture (marge isolée)."""
     path = "/api/v5/account/set-leverage"
     body = json.dumps({"instId": inst_id, "lever": str(int(levier)), "mgnMode": "isolated"})
     try:
@@ -347,10 +289,6 @@ async def okx_definir_levier(session, inst_id, levier):
         return False
 
 async def okx_placer_ordre_marche(session, inst_id, side, taille_contrats):
-    """Place un ordre au marché. side = 'buy' ou 'sell'. Retourne l'ordId si
-    succès, sinon None. taille_contrats est en nombre de contrats OKX (PAS en
-    USD ni en quantité de crypto brute) — voir le TODO de conversion ctVal
-    dans executer_trade avant tout usage réel."""
     path = "/api/v5/trade/order"
     body = json.dumps({
         "instId": inst_id,
@@ -377,7 +315,6 @@ async def okx_placer_ordre_marche(session, inst_id, side, taille_contrats):
         return None
 
 async def okx_fermer_position(session, inst_id):
-    """Ferme intégralement la position ouverte sur cet instrument (marge isolée)."""
     path = "/api/v5/trade/close-position"
     body = json.dumps({"instId": inst_id, "mgnMode": "isolated"})
     try:
@@ -427,7 +364,7 @@ async def get_klines(session, symbole, interval=15, limite=50):
             candles = data.get("data", [])
             if not candles:
                 return None
-            candles = list(reversed(candles))  # OKX renvoie du plus récent au plus ancien
+            candles = list(reversed(candles))
             df = pd.DataFrame(candles, columns=[
                 'time', 'open', 'high', 'low', 'close',
                 'volume', 'volCcy', 'volCcyQuote', 'confirm'
@@ -442,8 +379,6 @@ async def get_klines(session, symbole, interval=15, limite=50):
         return None
 
 async def get_prix_rest(session, symbole):
-    """Prix via l'API REST OKX (fallback tant que le WebSocket n'a pas encore
-    poussé de tick, ou si le cache est périmé)."""
     okx_symbol = OKX_SYMBOLS.get(symbole, symbole)
     try:
         async with session.get(
@@ -463,12 +398,6 @@ async def get_prix_rest(session, symbole):
         return None
 
 async def get_prix_actuel(session, symbole):
-    """Prix temps réel : lit le cache alimenté par le WebSocket OKX.
-    Double contrôle de fraîcheur : si le dernier tick reçu pour ce marché date
-    de plus de SEUIL_FRAICHEUR_PRIX_SEC, on ne lui fait plus confiance (marché
-    peu liquide où OKX ne pousse pas de tick pendant plusieurs secondes) et on
-    va chercher un prix frais via REST — pour éviter de piloter un stop loss
-    sur une valeur périmée qui a pu bouger fortement entre-temps."""
     prix_ws = PRIX_LIVE.get(symbole)
     ts_ws   = PRIX_LIVE_TS.get(symbole)
     if prix_ws is not None and ts_ws is not None and (time.time() - ts_ws) <= SEUIL_FRAICHEUR_PRIX_SEC:
@@ -476,11 +405,9 @@ async def get_prix_actuel(session, symbole):
     prix_rest = await get_prix_rest(session, symbole)
     if prix_rest is not None:
         return prix_rest
-    return prix_ws  # REST a échoué mais on a quand même un prix WS (même périmé) → mieux que rien
+    return prix_ws
 
 async def _ws_keepalive(ws):
-    """Envoie un 'ping' applicatif toutes les 20s — requis par OKX pour garder
-    la connexion WebSocket ouverte (sinon fermeture après ~30s d'inactivité)."""
     try:
         while not ws.closed:
             await asyncio.sleep(20)
@@ -490,12 +417,6 @@ async def _ws_keepalive(ws):
         pass
 
 async def websocket_prix(session):
-    """Connexion WebSocket temps réel OKX (canal public 'tickers').
-    Remplace le polling REST pour la détection de signal : PRIX_LIVE est mis
-    à jour en continu, dès qu'OKX pousse un tick, pour les marchés suivis.
-    Se reconnecte automatiquement en cas de coupure, et relit MARCHES à
-    chaque reconnexion (donc prend en compte les marchés ajoutés/retirés par
-    le rafraîchissement quotidien de minuit)."""
     global WS_CONNEXION_ACTIVE
     url = "wss://ws.okx.com:8443/ws/v5/public"
 
@@ -564,7 +485,6 @@ def calc_atr(df, periode=14):
         return 0.0
 
 def calc_volume_ratio(df):
-    """Ratio bougie fermée vs moyenne 24h."""
     try:
         volumes = df['volume'].tolist()
         if len(volumes) < 10:
@@ -574,13 +494,12 @@ def calc_volume_ratio(df):
         if nb == 0:
             return 0.0
         moyenne = sum(echantillon) / nb
-        recent  = volumes[-2]   # dernière bougie FERMÉE
+        recent  = volumes[-2]
         return round(recent / moyenne, 2) if moyenne > 0 else 0.0
     except Exception:
         return 0.0
 
 def calc_rsi_1h(df, periode=14):
-    """Calcule le RSI sur les bougies 1h."""
     try:
         if len(df) < periode + 1:
             return 50.0
@@ -597,7 +516,6 @@ async def analyser_marche(session, symbole):
     if prix_actuel is None:
         return "NEUTRE", {}
 
-    # Enregistrement du prix de référence au premier passage
     if symbole not in prix_reference:
         prix_reference[symbole] = prix_actuel
         log.info(f"  {symbole} : prix référence enregistré @ {prix_actuel}")
@@ -610,7 +528,6 @@ async def analyser_marche(session, symbole):
 
     variation_pct = (prix_actuel - prix_ref) / prix_ref * 100
 
-    # Récupération des données techniques
     df_15m = await get_klines(session, symbole, interval=15, limite=50)
     df_1h  = await get_klines(session, symbole, interval=60, limite=50)
 
@@ -625,7 +542,6 @@ async def analyser_marche(session, symbole):
     if df_1h is not None and len(df_1h) >= 20:
         rsi_1h = calc_rsi_1h(df_1h, RSI_PERIODE)
 
-    # Filtre volume
     if vol_ratio < VOLUME_MINI:
         log.info(f"  {symbole} : Vol {vol_ratio:.2f}x | Variation={variation_pct:+.2f}% → skip volume")
         return "NEUTRE", {}
@@ -639,7 +555,6 @@ async def analyser_marche(session, symbole):
         "prix_actuel":   prix_actuel,
     }
 
-    # Signal ACHAT : prix a chuté de >= 0.50%
     if variation_pct <= -SEUIL_MOUVEMENT_PCT:
         prix_reference[symbole] = prix_actuel
         if rsi_1h < RSI_SEUIL_BAS:
@@ -649,7 +564,6 @@ async def analyser_marche(session, symbole):
             log.info(f"  {symbole} ACHAT | Chute={variation_pct:.2f}% | RSI={rsi_1h} | Vol={vol_ratio:.2f}x")
             return "ACHAT", details
 
-    # Signal VENTE : prix a monté de >= 0.50%
     if variation_pct >= SEUIL_MOUVEMENT_PCT:
         prix_reference[symbole] = prix_actuel
         if rsi_1h > RSI_SEUIL_HAUT:
@@ -670,7 +584,6 @@ def calculer_mise(capital, etat):
 
     mise = capital * MISE_BASE_PCT
 
-    # Boost après plusieurs gains consécutifs
     if wins_consec >= WINS_CONFIANCE:
         mise *= BOOST_CONFIANCE
         log.info(f"  Mise boostée +20% ({wins_consec} wins consecutifs)")
@@ -681,12 +594,6 @@ def calculer_mise(capital, etat):
     if plafond >= MISE_MIN:
         mise = min(mise, plafond)
     else:
-        # Capital trop faible pour respecter le plafond ET le plancher en
-        # même temps (ne devrait jamais arriver en pratique : SEUIL_RUINE
-        # arrête le bot bien avant — capital < ~83€ avec les réglages
-        # actuels). Le plancher MISE_MIN prime dans ce cas, pour ne jamais
-        # ouvrir un trade en dessous du seuil où les frais deviennent
-        # disproportionnés par rapport au gain visé.
         log.warning(f"  ⚠️ Capital très faible ({capital}€) : plafond mise "
                     f"({plafond}€) < plancher ({MISE_MIN}€) — plancher appliqué")
 
@@ -696,7 +603,6 @@ def calculer_mise(capital, etat):
 #  CALCUL FRAIS OKX
 # ═══════════════════════════════════════════════════════════════
 def calc_frais(position):
-    """Calcule les frais réels OKX : ouverture + fermeture (taker, 0.05% chacune)."""
     frais_ouv  = round(position * OKX_TAKER_FEE, 4)
     frais_ferm = round(position * OKX_TAKER_FEE, 4)
     total      = round(frais_ouv + frais_ferm, 4)
@@ -719,12 +625,10 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
     mise = calculer_mise(capital, etat_global)
     position = round(mise * LEVIER, 2)
 
-    # Stop loss fixe : -2€ par trade, ni plus ni moins
     stop_loss_eur = STOP_LOSS_FIXE
 
     rsi_1h = details.get("rsi_1h", 50.0)
 
-    # Calcul stop et objectif en prix
     ratio_prix = stop_loss_eur / position if position > 0 else 0.001
     if direction == "ACHAT":
         stop_initial   = round(prix_entree * (1 - ratio_prix), 8)
@@ -733,10 +637,8 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
         stop_initial   = round(prix_entree * (1 + ratio_prix), 8)
         objectif_final = round(prix_entree * (1 - ratio_prix * 2), 8)
 
-    # Frais d'ouverture
     frais_ouv = round(position * OKX_TAKER_FEE, 4)
 
-    # Numéro de trade — sera attribué dans le lock final
     numero_trade = 0
 
     log.info(f"\n  {'='*55}")
@@ -759,10 +661,6 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
         f"Trades : {len(trades_ouverts)}/{MAX_TRADES_SIMULTANES}"
     )
 
-    # ── Exécution réelle — INACTIF tant que MODE_REEL=0 (comportement simulé
-    # inchangé dans ce cas). Voir l'avertissement en tête du bloc des
-    # fonctions okx_* : code non testé en conditions réelles, à valider sur
-    # le Demo Trading OKX avant tout usage avec de l'argent réel.
     inst_id = OKX_SYMBOLS.get(symbole)
     if MODE_REEL:
         ct_val = OKX_CT_VAL.get(symbole, 0)
@@ -773,10 +671,6 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
                 trades_ouverts.pop(symbole, None)
             return
 
-        # L'instId découvert via www.okx.com (simulation) peut différer de
-        # celui reconnu par l'entité my.okx.com (France/EEA, démo ou réel) —
-        # on le re-résout ici juste avant d'envoyer l'ordre, pour éviter
-        # l'erreur 51001 "Instrument ID doesn't exist".
         base = inst_id.split("-")[0]
         inst_id_reel = await okx_resoudre_instid_reel(session, base)
         if inst_id_reel is None:
@@ -815,7 +709,6 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
     pnl             = 0.0
     duree           = 0
 
-    # ── Boucle de surveillance — jusqu'au stop, au lock, ou 6h max
     while True:
         await asyncio.sleep(CHECK_INTERVAL)
 
@@ -826,7 +719,6 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
         prix_sortie = prix_actuel
         duree       = int((time.time() - debut) / 60)
 
-        # Calcul PnL brut
         if direction == "ACHAT":
             pnl = round((prix_actuel - prix_entree) / prix_entree * mise * LEVIER, 2)
         else:
@@ -835,7 +727,6 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
         if pnl > pnl_max_atteint:
             pnl_max_atteint = pnl
 
-        # Lock paliers
         nouveau_lock = get_palier_lock(pnl_max_atteint, capital)
         if nouveau_lock > lock_actuel:
             lock_actuel = nouveau_lock
@@ -846,7 +737,6 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
                 f"Gain verrouillé ✅"
             )
 
-        # Sortie lock : PnL redescend sous le palier verrouillé
         if lock_actuel > 0 and pnl < lock_actuel:
             frais    = calc_frais(position)
             gain_net = round(lock_actuel - frais["total"], 4)
@@ -864,7 +754,6 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
             gain_final     = gain_net
             break
 
-        # Durée maximale : fermeture forcée à 6h si ni stop ni lock atteint
         if duree >= DUREE_MAX_MINUTES:
             frais   = calc_frais(position)
             pnl_net = round(pnl - frais["total"], 4)
@@ -882,11 +771,9 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
             gain_final = pnl_net
             break
 
-        # Stop loss
         atteint_stop = (prix_actuel <= stop_initial if direction == "ACHAT"
                         else prix_actuel >= stop_initial)
 
-        # Log toutes les minutes
         if time.time() - dernier_log >= 60:
             lock_flag = f" LOCK{lock_actuel}€" if lock_actuel > 0 else ""
             log.info(f"  [{datetime.now().strftime('%H:%M:%S')}] {symbole} {prix_actuel} | "
@@ -912,7 +799,6 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
             gain_final = pnl_net
             break
 
-    # ── Fermeture réelle de la position — INACTIF tant que MODE_REEL=0
     if MODE_REEL and inst_id:
         succes_fermeture = await okx_fermer_position(session, inst_id)
         if not succes_fermeture:
@@ -923,13 +809,11 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
                 f"Vérifie manuellement sur l'app OKX immédiatement."
             )
 
-    # ── Libérer le marché + mise à jour état global dans un seul lock
     async with trades_lock:
         trades_ouverts.pop(symbole, None)
         cooldown_marches.pop(symbole, None)
         log.info(f"  [{symbole}] libéré")
 
-        # Mise à jour capital et stats dans le même lock — pas de race condition
         etat_global["nb_trades"] = etat_global.get("nb_trades", 0) + 1
         numero_trade             = etat_global["nb_trades"]
         etat_global["capital"]   = round(etat_global["capital"] + gain_final, 2)
@@ -980,7 +864,6 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
     sauvegarder_etat(etat_global)
     afficher_tableau_de_bord(etat_global)
 
-    # Rapport Telegram après chaque trade
     nb_trades_total = etat_global.get("nb_trades", 0)
     nb_wins   = etat_global.get("nb_wins", 0)
     win_rate  = (nb_wins / nb_trades_total * 100) if nb_trades_total > 0 else 0
@@ -1011,7 +894,6 @@ def verifier_protections(etat, capital):
     return "OK"
 
 def reset_pnl_jour_si_nouveau_jour(etat):
-    """Retourne True si le PnL du jour a été remis à 0 (changement de jour)."""
     maintenant_guyane = datetime.utcnow() - timedelta(hours=3)
     aujourd_hui = maintenant_guyane.strftime('%Y-%m-%d')
     if etat.get("date_jour", "") != aujourd_hui:
@@ -1025,7 +907,6 @@ def reset_pnl_jour_si_nouveau_jour(etat):
 #  RAPPORT QUOTIDIEN
 # ═══════════════════════════════════════════════════════════════
 async def envoyer_rapport_quotidien(session, etat):
-    """Envoie chaque jour à 19h Guyane (22h UTC)."""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -1075,7 +956,6 @@ async def envoyer_rapport_quotidien(session, etat):
                 tranche = f"{heure_guyane:02d}h"
                 heure_pertes[tranche] = heure_pertes.get(tranche, 0) + 1
 
-    # Graphique capital intraday
     try:
         capitaux_jour = []
         heures_jour   = []
@@ -1184,7 +1064,6 @@ async def envoyer_rapport_quotidien(session, etat):
 #  RAPPORT HEBDOMADAIRE
 # ═══════════════════════════════════════════════════════════════
 async def envoyer_rapport_hebdomadaire(session, etat):
-    """Envoie chaque dimanche à 19h Guyane (22h UTC)."""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -1217,7 +1096,6 @@ async def envoyer_rapport_hebdomadaire(session, etat):
     capitaux     = [capital_par_jour[j] for j in jours_tries]
     labels_jours = [j[5:] for j in jours_tries]
 
-    # Graphique
     try:
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 7),
                                         gridspec_kw={'height_ratios': [3, 1]})
@@ -1306,7 +1184,6 @@ async def envoyer_rapport_hebdomadaire(session, etat):
     except Exception as e:
         log.error(f"Erreur graphique hebdomadaire : {e}")
 
-    # Rapport texte semaine + total
     gains_total    = {}
     wins_total     = {}
     pertes_total   = {}
@@ -1405,7 +1282,6 @@ async def boucle_principale():
         etat = {}
         sauvegarder_etat(etat)
 
-    # Initialiser les champs manquants
     for champ, valeur in [
         ("capital", CAPITAL_INITIAL),
         ("pnl_jour", 0.0),
@@ -1425,11 +1301,6 @@ async def boucle_principale():
         if champ not in etat:
             etat[champ] = valeur
 
-    # Sauvegarde immédiate de l'état complet (avec les valeurs par défaut
-    # tout juste peuplées) — sans ça, un redémarrage juste après un
-    # RESET_TOUT rechargerait un état incomplet/vide depuis la base plutôt
-    # que le pnl_jour à 0 fraîchement réinitialisé, et le kill switch
-    # pourrait sembler ne pas s'être remis à zéro.
     sauvegarder_etat(etat)
 
     afficher_tableau_de_bord(etat)
@@ -1437,14 +1308,9 @@ async def boucle_principale():
     connector = aiohttp.TCPConnector(limit=50)
     async with aiohttp.ClientSession(connector=connector) as session:
 
-        # ── Chargement initial des marchés x10 depuis l'API OKX
         log.info("  Chargement des marchés x10 depuis l'API OKX...")
         await charger_marches_x10(session)
 
-        # Si aucun marché trouvé (panne API, réseau...), on réessaie quelques
-        # fois avant d'abandonner — et surtout, on prévient TOUJOURS sur
-        # Telegram plutôt que de s'arrêter en silence (bug précédent : un
-        # simple `return` ici empêchait le moindre message de partir).
         tentatives = 0
         while not MARCHES and tentatives < 3:
             tentatives += 1
@@ -1476,10 +1342,6 @@ async def boucle_principale():
             + f"{(datetime.utcnow() - timedelta(hours=3)).strftime('%Y-%m-%d %H:%M:%S')}"
         )
 
-        # Lance le flux WebSocket temps réel en tâche de fond (reconnexion
-        # auto en cas de coupure) — remplace le polling REST pour la
-        # détection de signal, pour réagir aux mouvements de prix OKX en
-        # temps réel plutôt que d'attendre le prochain appel REST.
         asyncio.create_task(websocket_prix(session))
         log.info("  ⏳ Attente des premiers ticks WebSocket (3s)...")
         await asyncio.sleep(3)
@@ -1491,7 +1353,6 @@ async def boucle_principale():
 
                 maintenant_utc = datetime.utcnow()
 
-                # ── Mise à jour des marchés x10 chaque jour à minuit Guyane (3h UTC)
                 if (maintenant_utc.hour == 3 and
                     maintenant_utc.minute < 1 and
                     etat.get("dernier_maj_marches", "") != maintenant_utc.strftime('%Y-%m-%d')):
@@ -1503,8 +1364,6 @@ async def boucle_principale():
                         f"🔄 <b>Marchés x10 mis à jour</b>\n"
                         f"{len(MARCHES)} marchés actifs : {', '.join(MARCHES)}"
                     )
-                    # Force une reconnexion WebSocket pour resynchroniser
-                    # l'abonnement avec la liste de marchés à jour
                     if WS_CONNEXION_ACTIVE is not None and not WS_CONNEXION_ACTIVE.closed:
                         log.info("  🔌 Resynchronisation WebSocket forcée (marchés mis à jour)")
                         try:
@@ -1512,7 +1371,6 @@ async def boucle_principale():
                         except Exception as e:
                             log.error(f"Erreur lors de la resynchronisation WebSocket : {e}")
 
-                # Rapport quotidien à 19h Guyane = 22h UTC
                 if (maintenant_utc.hour == 22 and
                     maintenant_utc.minute < 1 and
                     etat.get("dernier_rapport_quotidien", "") != maintenant_utc.strftime('%Y-%m-%d')):
@@ -1520,7 +1378,6 @@ async def boucle_principale():
                     etat["dernier_rapport_quotidien"] = maintenant_utc.strftime('%Y-%m-%d')
                     sauvegarder_etat(etat)
 
-                # Rapport hebdomadaire dimanche à 22h UTC
                 if (maintenant_utc.weekday() == 6 and
                     maintenant_utc.hour == 22 and
                     maintenant_utc.minute < 1 and
@@ -1529,7 +1386,6 @@ async def boucle_principale():
                     etat["derniere_semaine"] = maintenant_utc.strftime('%Y-%W')
                     sauvegarder_etat(etat)
 
-                # Vérification protections
                 statut = verifier_protections(etat, etat["capital"])
                 if statut == "RUINE":
                     await telegram(session,
@@ -1540,7 +1396,6 @@ async def boucle_principale():
                     etat = charger_etat()
                     continue
 
-                # Scan des marchés disponibles
                 async with trades_lock:
                     slots_libres        = MAX_TRADES_SIMULTANES - len(trades_ouverts)
                     marches_actifs      = get_marches_actifs()
@@ -1573,7 +1428,6 @@ async def boucle_principale():
                     await asyncio.sleep(PAUSE_SCAN)
                     continue
 
-                # Trier par variation la plus forte
                 meilleurs = sorted(
                     signaux.items(),
                     key=lambda x: x[1]["details"].get("variation_pct", 0),
