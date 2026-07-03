@@ -294,28 +294,37 @@ def _okx_headers(method, path, body=""):
     return headers
 
 async def okx_resoudre_instid_reel(session, base):
-    """Récupère l'instId du X-Perp tel que reconnu par l'entité my.okx.com
-    (France/EEA) — peut différer de celui découvert via www.okx.com utilisé
-    pour la simulation. Retourne None si non trouvé."""
+    """Récupère l'instId du X-Perp tel que réellement disponible pour CE
+    COMPTE, via l'endpoint AUTHENTIFIÉ /api/v5/account/instruments — pas le
+    catalogue public générique (/api/v5/public/instruments), qui diffère
+    selon la région/le type de compte. Confirmé par la documentation
+    officielle OKX elle-même : les utilisateurs sont classés en deux
+    catégories selon leur pays, et reçoivent des résultats différents
+    (parfois un tableau vide) sur les endpoints d'instruments génériques.
+    L'endpoint /account/instruments, lui, est scopé au compte qui appelle —
+    donc fiable quelle que soit la région. Retourne None si non trouvé."""
+    path = "/api/v5/account/instruments"
+    query = "?instType=FUTURES"
     try:
         async with session.get(
-            OKX_BASE_URL + "/api/v5/public/instruments",
-            params={"instType": "FUTURES"},
-            headers=({"x-simulated-trading": "1"} if OKX_COMPTE_DEMO else {}),
+            OKX_BASE_URL + path + query,
+            headers=_okx_headers("GET", path + query, ""),
             timeout=aiohttp.ClientTimeout(total=15)
         ) as resp:
             data = await resp.json()
             if data.get("code") != "0":
-                log.error(f"  Erreur résolution instId ({OKX_BASE_URL}) : {data}")
+                log.warning(f"  Résolution instId (account/instruments) : réponse invalide {data}")
                 return None
             for inst in data.get("data", []):
                 if inst.get("ruleType") != "xperp":
                     continue
                 if inst.get("instId", "").split("-")[0] == base:
+                    log.info(f"  ✅ instId résolu via /account/instruments : {inst.get('instId')}")
                     return inst.get("instId")
+            log.warning(f"  Résolution instId (account/instruments) : aucun X-Perp trouvé pour base={base}")
             return None
     except Exception as e:
-        log.error(f"  Erreur résolution instId pour {base} : {e}")
+        log.error(f"  Erreur résolution instId (account/instruments) pour {base} : {e}")
         return None
 
 async def okx_definir_levier(session, inst_id, levier):
