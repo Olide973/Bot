@@ -1059,17 +1059,34 @@ async def boucle_principale():
         log.info("  Chargement des marchés x10 depuis l'API OKX...")
         await charger_marches_x10(session)
 
+        # Si aucun marché trouvé (panne API, réseau...), on réessaie quelques
+        # fois avant d'abandonner — et surtout, on prévient TOUJOURS sur
+        # Telegram plutôt que de s'arrêter en silence (bug précédent : un
+        # simple `return` ici empêchait le moindre message de partir).
+        tentatives = 0
+        while not MARCHES and tentatives < 3:
+            tentatives += 1
+            log.warning(f"  Aucun marché x10 trouvé (tentative {tentatives}/3) — nouvel essai dans 10s...")
+            await asyncio.sleep(10)
+            await charger_marches_x10(session)
+
         if not MARCHES:
-            log.error("  Aucun marché x10 trouvé — bot arrêté")
-            return
+            log.error("  Aucun marché x10 trouvé après plusieurs tentatives")
+            await telegram(session,
+                "⚠️ <b>ALERTE DÉMARRAGE</b>\n"
+                "Aucun marché x10 trouvé sur OKX après 3 tentatives.\n"
+                "Le bot reste actif et réessaiera automatiquement à minuit Guyane, "
+                "mais ne pourra pas trader tant que ce problème persiste.\n"
+                "Vérifie les logs Railway pour plus de détails."
+            )
 
         await telegram(session,
             (f"🔄 <b>RESET COMPLET EFFECTUÉ</b>\nCapital, PnL, compteurs et historique remis à zéro.\n\n" if RESET_TOUT else "")
             + f"🚀 <b>BOT DÉMARRÉ</b>\n"
             f"Capital : {round(etat['capital'],2)}€\n"
             f"Marchés x10 : {len(MARCHES)} cryptos | 24h/24 — 7j/7\n"
-            f"{', '.join(MARCHES)}\n\n"
-            f"Signal : mouvement >= {SEUIL_MOUVEMENT_PCT}%\n"
+            + (f"{', '.join(MARCHES)}\n\n" if MARCHES else "\n")
+            + f"Signal : mouvement >= {SEUIL_MOUVEMENT_PCT}%\n"
             f"Frais OKX : {OKX_TAKER_FEE*100:.2f}% ouv + {OKX_TAKER_FEE*100:.2f}% ferm (taker)\n"
             f"Kill switch : {KILL_SWITCH_JOUR}€/jour\n"
             f"Mode : {'REEL' if MODE_REEL else 'SIMULATION'}\n"
