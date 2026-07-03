@@ -212,9 +212,13 @@ log.info("=" * 60)
 # ═══════════════════════════════════════════════════════════════
 #  TELEGRAM
 # ═══════════════════════════════════════════════════════════════
+TELEGRAM_LIMITE_CARACTERES = 4000  # marge sous la limite réelle de 4096 imposée par Telegram
+
 async def telegram(session, message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
+    if len(message) > TELEGRAM_LIMITE_CARACTERES:
+        message = message[:TELEGRAM_LIMITE_CARACTERES] + "\n\n… (message tronqué, trop long pour Telegram)"
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         await session.post(url, data={
@@ -388,6 +392,8 @@ async def get_funding_rate(session, inst_id):
         log.error(f"Erreur funding rate {inst_id} : {e}")
         return None
 
+MARCHES_TOTAL_MAX = 80  # garde-fou large : évite une explosion incontrôlée (rate-limit, taille des messages Telegram...), pas une restriction en usage normal (~35-42 marchés crypto x10 recensés actuellement)
+
 async def decouvrir_et_filtrer_marches_xperp_x10(session, etat):
     """Construit la liste des marchés à partir de TOUS les X-Perps OKX supportant
     réellement le levier x{LEVIER} (API publique, instType=FUTURES, ruleType=xperp)
@@ -540,10 +546,14 @@ async def decouvrir_et_filtrer_marches_xperp_x10(session, etat):
         else:
             retires_detail.append(f"{m} (aucun X-Perp crypto trouvé)")
 
-    # 2) Découvrir toutes les bases éligibles qu'on ne suit pas encore — plus
-    #    de plafond total, tous les marchés crypto x{LEVIER} découverts sont conservés
+    # 2) Découvrir toutes les bases éligibles qu'on ne suit pas encore — dans
+    #    la limite du plafond de sécurité large (MARCHES_TOTAL_MAX)
+    total_actuel     = len(MARCHES_24H) + len(MARCHES_NUIT) + len(MARCHES_JOUR)
+    places_dispo     = max(0, MARCHES_TOTAL_MAX - total_actuel)
     bases_connues    = {base_actuelle(m) for m in (MARCHES_24H + MARCHES_NUIT + MARCHES_JOUR)}
     nouvelles_bases  = sorted(b for b in xperps if b not in bases_connues)
+    ignorees_par_cap = nouvelles_bases[places_dispo:]
+    nouvelles_bases  = nouvelles_bases[:places_dispo]
 
     ajoutes = []
     for base in nouvelles_bases:
@@ -568,14 +578,24 @@ async def decouvrir_et_filtrer_marches_xperp_x10(session, etat):
         log.warning(f"  🚫 Marchés retirés : {' | '.join(retires_detail)}")
     if ajoutes:
         log.info(f"  ➕ Nouveaux marchés découverts (X-Perp x{LEVIER} confirmé) : {', '.join(ajoutes)}")
+    if ignorees_par_cap:
+        log.warning(f"  ⏭️ {len(ignorees_par_cap)} marché(s) ignoré(s) (plafond de sécurité {MARCHES_TOTAL_MAX} atteint) : {', '.join(ignorees_par_cap)}")
     log.info(f"  Marchés actifs après découverte : {len(MARCHES)} (dont {len(ajoutes)} nouveaux, {len(retires)} retirés)")
+
+    # Liste complète tronquée par sécurité si trop longue (limite Telegram) —
+    # la troncature globale du message dans telegram() protège aussi, mais on
+    # évite ici de gaspiller le message entier sur une liste géante.
+    liste_marches_str = ', '.join(sorted(MARCHES))
+    if len(liste_marches_str) > 2500:
+        liste_marches_str = liste_marches_str[:2500] + f"… (+{len(MARCHES)} marchés au total, liste tronquée)"
 
     await telegram(session,
         f"🐉🔧 <b>DÉCOUVERTE + FILTRAGE X-PERP x{LEVIER}</b>\n"
         f"Total marchés actifs : <b>{len(MARCHES)}</b>\n\n"
         f"➕ Ajoutés ({len(ajoutes)}) : {', '.join(ajoutes) if ajoutes else 'aucun'}\n\n"
         f"🚫 Retirés ({len(retires)}) : {', '.join(retires) if retires else 'aucun'}"
-        + f"\n\n📋 Liste complète actuelle ({len(MARCHES)}) :\n{', '.join(sorted(MARCHES))}"
+        + (f"\n\n⏭️ {len(ignorees_par_cap)} ignoré(s) (plafond sécurité {MARCHES_TOTAL_MAX})" if ignorees_par_cap else "")
+        + f"\n\n📋 Liste complète actuelle ({len(MARCHES)}) :\n{liste_marches_str}"
     )
 
     # Si la liste de marchés a changé, force une reconnexion WebSocket pour que
@@ -1146,6 +1166,113 @@ async def envoyer_rapport_quotidien(session, etat):
     await telegram(session, message)
 
 # ═══════════════════════════════════════════════════════════════
+#  RAPPORT MARCHÉS ACCUMULÉ (par marché, depuis le début du suivi)
+# ═══════════════════════════════════════════════════════════════
+async def envoyer_rapport_marches_accumule(session, etat):
+    """Envoie chaque jour à 16h Guyane (19h UTC) un classement de TOUS les
+    marchés par performance ACCUMULÉE depuis le tout début du suivi (pas
+    juste la journée) — pour voir d'un coup d'œil quels marchés rapportent
+    de l'argent au bot sur la durée, et lesquels en font perdre."""
+    historique = etat.get("historique", [])
+    if not historique:
+        return
+
+    maintenant_guyane = datetime.utcnow() - timedelta(hours=3)
+    date_affich = maintenant_guyane.strftime('%d/%m/%Y')
+
+    gains_par_marche  = {}
+    wins_par_marche   = {}
+    pertes_par_marche = {}
+
+    for h in historique:
+        marche   = h.get("marche", "?")
+        gain     = h.get("gain", 0)
+        resultat = h.get("resultat", "")
+        gains_par_marche[marche] = round(gains_par_marche.get(marche, 0) + gain, 2)
+        if resultat == "GAGNE":
+            wins_par_marche[marche] = wins_par_marche.get(marche, 0) + 1
+        else:
+            pertes_par_marche[marche] = pertes_par_marche.get(marche, 0) + 1
+
+    classement = sorted(gains_par_marche.items(), key=lambda x: x[1], reverse=True)
+    gagnants   = [(m, g) for m, g in classement if g > 0]
+    perdants   = [(m, g) for m, g in classement if g <= 0]
+
+    nb_trades_total = len(historique)
+    total_gagne = round(sum(g for g in gains_par_marche.values() if g > 0), 2)
+    total_perdu = round(sum(g for g in gains_par_marche.values() if g < 0), 2)
+    net_total   = round(sum(gains_par_marche.values()), 2)
+
+    # Limite d'affichage pour rester dans les limites Telegram si beaucoup de marchés
+    MAX_LIGNES = 20
+    lignes_gagnants = "\n".join(
+        f"✅ <code>{m:<12} +{g:<8}€ {wins_par_marche.get(m,0)}G/{pertes_par_marche.get(m,0)}P</code>"
+        for m, g in gagnants[:MAX_LIGNES]
+    )
+    if len(gagnants) > MAX_LIGNES:
+        lignes_gagnants += f"\n… et {len(gagnants) - MAX_LIGNES} autre(s)"
+
+    lignes_perdants = "\n".join(
+        f"❌ <code>{m:<12} {g:<9}€ {wins_par_marche.get(m,0)}G/{pertes_par_marche.get(m,0)}P</code>"
+        for m, g in perdants[:MAX_LIGNES]
+    )
+    if len(perdants) > MAX_LIGNES:
+        lignes_perdants += f"\n… et {len(perdants) - MAX_LIGNES} autre(s)"
+
+    message = (
+        f"🐉📊 <b>RAPPORT MARCHÉS ACCUMULÉ — {date_affich}</b>\n"
+        f"Performance cumulée depuis le début du suivi\n\n"
+        f"Trades total : <b>{nb_trades_total}</b>\n"
+        f"Gagné cumulé : +{total_gagne}€ | Perdu cumulé : {total_perdu}€\n"
+        f"<b>NET cumulé : {'+' if net_total>=0 else ''}{net_total}€</b>\n\n"
+        f"<b>📈 MARCHÉS GAGNANTS ({len(gagnants)})</b>\n"
+        f"{lignes_gagnants if lignes_gagnants else 'aucun'}\n\n"
+        f"<b>📉 MARCHÉS PERDANTS ({len(perdants)})</b>\n"
+        f"{lignes_perdants if lignes_perdants else 'aucun'}"
+    )
+    log.info("  Envoi rapport marchés accumulé Telegram")
+    await telegram(session, message)
+
+# ═══════════════════════════════════════════════════════════════
+#  RAPPORT MARCHÉS HORAIRE (condensé, top gagnants/perdants)
+# ═══════════════════════════════════════════════════════════════
+TOP_MARCHES_HORAIRE = 5  # nombre de marchés affichés de chaque côté (gagnants/perdants)
+
+async def envoyer_rapport_marches_horaire(session, etat):
+    """Envoie chaque heure (à la minute pile) un résumé condensé : les
+    TOP_MARCHES_HORAIRE marchés les plus gagnants et les plus perdants,
+    en performance ACCUMULÉE depuis le début du suivi (même logique que le
+    rapport quotidien de 16h, mais condensé et beaucoup plus fréquent)."""
+    historique = etat.get("historique", [])
+    if not historique:
+        return
+
+    gains_par_marche = {}
+    for h in historique:
+        marche = h.get("marche", "?")
+        gain   = h.get("gain", 0)
+        gains_par_marche[marche] = round(gains_par_marche.get(marche, 0) + gain, 2)
+
+    classement = sorted(gains_par_marche.items(), key=lambda x: x[1], reverse=True)
+    top_gagnants = [(m, g) for m, g in classement if g > 0][:TOP_MARCHES_HORAIRE]
+    tous_perdants = sorted([(m, g) for m, g in classement if g <= 0], key=lambda x: x[1])
+    top_perdants = tous_perdants[:TOP_MARCHES_HORAIRE]
+
+    heure_guyane = (datetime.utcnow() - timedelta(hours=3)).strftime('%H:%M')
+
+    lignes_gagnants = "\n".join(f"✅ {m} : +{g}€" for m, g in top_gagnants) or "aucun"
+    lignes_perdants = "\n".join(f"❌ {m} : {g}€" for m, g in top_perdants) or "aucun"
+
+    message = (
+        f"🐉⏱ <b>TOP MARCHÉS — {heure_guyane}</b>\n"
+        f"(cumulé depuis le début)\n\n"
+        f"<b>Top {len(top_gagnants)} gagnants</b>\n{lignes_gagnants}\n\n"
+        f"<b>Top {len(top_perdants)} perdants</b>\n{lignes_perdants}"
+    )
+    log.info("  Envoi rapport marchés horaire Telegram")
+    await telegram(session, message)
+
+# ═══════════════════════════════════════════════════════════════
 #  RAPPORT HEBDOMADAIRE
 # ═══════════════════════════════════════════════════════════════
 async def envoyer_rapport_hebdomadaire(session, etat):
@@ -1385,6 +1512,8 @@ async def boucle_principale():
         ("pertes_consecutives", 0),
         ("historique", []),
         ("dernier_scan_xperp", ""),
+        ("dernier_rapport_marches", ""),
+        ("dernier_rapport_horaire", ""),
     ]:
         if champ not in etat:
             etat[champ] = valeur
@@ -1409,7 +1538,13 @@ async def boucle_principale():
     connector = aiohttp.TCPConnector(limit=50)
     async with aiohttp.ClientSession(connector=connector) as session:
         log.info("  🔧 Découverte et filtrage des marchés X-Perp x10 (OKX complet)...")
-        await decouvrir_et_filtrer_marches_xperp_x10(session, etat)
+        try:
+            await decouvrir_et_filtrer_marches_xperp_x10(session, etat)
+        except Exception as e:
+            # Filet de sécurité ultime : quoi qu'il arrive dans la découverte,
+            # le bot doit démarrer quand même (avec la liste précédente/statique)
+            # plutôt que de rester complètement silencieux, y compris sur Telegram.
+            log.error(f"  ❌ Erreur inattendue pendant la découverte des marchés : {e} — démarrage avec la liste actuelle")
 
         # Lance le flux WebSocket temps réel en tâche de fond (reconnexion auto en cas de coupure)
         asyncio.create_task(websocket_prix(session))
@@ -1440,6 +1575,22 @@ async def boucle_principale():
                     etat.get("dernier_rapport_quotidien", "") != maintenant_utc.strftime('%Y-%m-%d')):
                     await envoyer_rapport_quotidien(session, etat)
                     etat["dernier_rapport_quotidien"] = maintenant_utc.strftime('%Y-%m-%d')
+                    sauvegarder_etat(etat)
+
+                # Rapport marchés accumulé à 16h Guyane = 19h UTC
+                if (maintenant_utc.hour == 19 and
+                    maintenant_utc.minute < 1 and
+                    etat.get("dernier_rapport_marches", "") != maintenant_utc.strftime('%Y-%m-%d')):
+                    await envoyer_rapport_marches_accumule(session, etat)
+                    etat["dernier_rapport_marches"] = maintenant_utc.strftime('%Y-%m-%d')
+                    sauvegarder_etat(etat)
+
+                # Rapport horaire condensé (top marchés gagnants/perdants) — chaque heure pile
+                cle_heure_actuelle = maintenant_utc.strftime('%Y-%m-%d %H')
+                if (maintenant_utc.minute < 1 and
+                    etat.get("dernier_rapport_horaire", "") != cle_heure_actuelle):
+                    await envoyer_rapport_marches_horaire(session, etat)
+                    etat["dernier_rapport_horaire"] = cle_heure_actuelle
                     sauvegarder_etat(etat)
 
                 # Rapport hebdomadaire dimanche à 22h UTC
