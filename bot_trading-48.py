@@ -87,6 +87,12 @@ OKX_API_KEY      = os.environ.get('OKX_API_KEY', '')
 OKX_API_SECRET   = os.environ.get('OKX_API_SECRET', '')
 MODE_REEL        = os.environ.get('MODE_REEL', '0') == '1'
 
+# ── Reset complet piloté depuis Railway (Variables → RESET_TOUT = 1, puis Deploy)
+#    Remet à zéro : capital, PnL jour, kill switch, compteurs, historique.
+#    Remettre à 0 (ou supprimer la variable) + redeploy pour revenir en
+#    fonctionnement normal sans redéclencher un reset à chaque redémarrage.
+RESET_TOUT = os.environ.get('RESET_TOUT', '0').strip().lower() in ('1', 'true', 'oui', 'yes')
+
 # ── Marchés — uniquement ceux à levier x10 sur OKX (Swap Perpétuels)
 # Chargés dynamiquement via API au démarrage et mis à jour chaque nuit à minuit
 MARCHES          = []   # liste des symboles actifs (levier x10 uniquement)
@@ -1019,6 +1025,11 @@ async def boucle_principale():
     init_database()
     etat = charger_etat()
 
+    if RESET_TOUT:
+        log.warning("  🔄 RESET_TOUT activé sur Railway — remise à zéro complète de l'état du bot")
+        etat = {}
+        sauvegarder_etat(etat)
+
     # Initialiser les champs manquants
     for champ, valeur in [
         ("capital", CAPITAL_INITIAL),
@@ -1034,6 +1045,7 @@ async def boucle_principale():
         ("cumul_net", 0.0),
         ("pertes_consecutives", 0),
         ("historique", []),
+        ("dernier_maj_marches", ""),
     ]:
         if champ not in etat:
             etat[champ] = valeur
@@ -1052,9 +1064,11 @@ async def boucle_principale():
             return
 
         await telegram(session,
-            f"🚀 <b>BOT DÉMARRÉ</b>\n"
+            (f"🔄 <b>RESET COMPLET EFFECTUÉ</b>\nCapital, PnL, compteurs et historique remis à zéro.\n\n" if RESET_TOUT else "")
+            + f"🚀 <b>BOT DÉMARRÉ</b>\n"
             f"Capital : {round(etat['capital'],2)}€\n"
             f"Marchés x10 : {len(MARCHES)} cryptos | 24h/24 — 7j/7\n"
+            f"{', '.join(MARCHES)}\n\n"
             f"Signal : mouvement >= {SEUIL_MOUVEMENT_PCT}%\n"
             f"Frais OKX : {OKX_TAKER_FEE*100:.2f}% ouv + {OKX_TAKER_FEE*100:.2f}% ferm (taker)\n"
             f"Kill switch : {KILL_SWITCH_JOUR}€/jour\n"
@@ -1062,19 +1076,20 @@ async def boucle_principale():
             f"{(datetime.utcnow() - timedelta(hours=3)).strftime('%Y-%m-%d %H:%M:%S')}"
         )
 
-        derniere_maj_leviers = datetime.utcnow().date()
-
         while True:
             try:
                 reset_pnl_jour_si_nouveau_jour(etat)
 
                 maintenant_utc = datetime.utcnow()
 
-                # ── Mise à jour des marchés x10 chaque nuit à minuit UTC
-                if maintenant_utc.date() > derniere_maj_leviers:
-                    log.info("  Minuit — mise à jour des marchés x10...")
+                # ── Mise à jour des marchés x10 chaque jour à minuit Guyane (3h UTC)
+                if (maintenant_utc.hour == 3 and
+                    maintenant_utc.minute < 1 and
+                    etat.get("dernier_maj_marches", "") != maintenant_utc.strftime('%Y-%m-%d')):
+                    log.info("  Minuit Guyane — mise à jour des marchés x10...")
                     await charger_marches_x10(session)
-                    derniere_maj_leviers = maintenant_utc.date()
+                    etat["dernier_maj_marches"] = maintenant_utc.strftime('%Y-%m-%d')
+                    sauvegarder_etat(etat)
                     await telegram(session,
                         f"🔄 <b>Marchés x10 mis à jour</b>\n"
                         f"{len(MARCHES)} marchés actifs : {', '.join(MARCHES)}"
