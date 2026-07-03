@@ -1328,6 +1328,32 @@ async def boucle_principale():
                 "Vérifie les logs Railway pour plus de détails."
             )
 
+        # 🔍 DEBUG TEMPORAIRE — dump complet des instruments FUTURES vus par
+        # CE compte (démo ou réel selon OKX_COMPTE_DEMO), pour savoir
+        # exactement quels X-Perps sont réellement tradables via l'API,
+        # plutôt que de le découvrir un par un à chaque trade annulé.
+        # À retirer une fois la liste CANDIDATS_BASE ajustée.
+        if MODE_REEL:
+            try:
+                path_dbg  = "/api/v5/account/instruments"
+                query_dbg = "?instType=FUTURES"
+                async with session.get(
+                    OKX_BASE_URL + path_dbg + query_dbg,
+                    headers=_okx_headers("GET", path_dbg + query_dbg, ""),
+                    timeout=aiohttp.ClientTimeout(total=15)
+                ) as resp_dbg:
+                    data_dbg = await resp_dbg.json()
+                    liste_dbg = data_dbg.get("data", [])
+                    log.warning(f"  🔍 DUMP COMPLET — {len(liste_dbg)} instruments FUTURES vus par le compte (demo={OKX_COMPTE_DEMO}) :")
+                    for inst_dbg in liste_dbg:
+                        log.warning(
+                            f"    instId={inst_dbg.get('instId')} | "
+                            f"ruleType={inst_dbg.get('ruleType')} | "
+                            f"lever={inst_dbg.get('lever')}"
+                        )
+            except Exception as e:
+                log.error(f"  Erreur dump complet instruments : {e}")
+
         await telegram(session,
             (f"🔄 <b>RESET COMPLET EFFECTUÉ</b>\nCapital, PnL, compteurs et historique remis à zéro.\n\n" if RESET_TOUT else "")
             + f"🚀 <b>BOT DÉMARRÉ</b>\n"
