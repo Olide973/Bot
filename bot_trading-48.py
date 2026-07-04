@@ -308,14 +308,28 @@ async def filtrer_marches_selon_compte(session):
         supprimes        = avant - set(nouveaux_marches)
 
         MARCHES = nouveaux_marches
+        nouveaux_ct_val_exec = {}
         for m in MARCHES:
             inst_exec = inst_par_base[m[:-3]]
             OKX_SYMBOLS_EXEC[m] = inst_exec.get("instId")  # instId d'exécution, scopé au compte — jamais utilisé pour les prix
+            ct_val_public = OKX_CT_VAL.get(m)
+            try:
+                ct_val_exec = float(inst_exec.get("ctVal", 0) or 0)
+            except (TypeError, ValueError):
+                ct_val_exec = 0.0
+            nouveaux_ct_val_exec[m] = ct_val_exec
+            ecart = " ⚠️ ÉCART DÉTECTÉ" if ct_val_public and ct_val_exec and ct_val_public != ct_val_exec else ""
             log.info(f"     [DIAG-EXEC] {m} instId={inst_exec.get('instId')} "
                      f"ctVal={inst_exec.get('ctVal')} ctValCcy={inst_exec.get('ctValCcy')} "
                      f"settleCcy={inst_exec.get('settleCcy')} instFamily={inst_exec.get('instFamily')} "
-                     f"(vs ctVal catalogue public utilisé pour le calcul de taille : {OKX_CT_VAL.get(m)})")
-        OKX_CT_VAL = {k: v for k, v in OKX_CT_VAL.items() if k in MARCHES}
+                     f"(vs ctVal catalogue public : {ct_val_public}){ecart}")
+        # CORRECTIF : on utilise désormais le ctVal de l'instrument d'EXÉCUTION
+        # (celui du compte, effectivement tradé), pas celui du catalogue public
+        # — les deux peuvent référencer des contrats différents (échéances
+        # distinctes) avec un ctVal différent, comme confirmé sur BTCUSD
+        # (0.0001 côté catalogue public vs 1 côté compte, facteur 10000,
+        # cause de la sur-taille de position et de l'échec systématique).
+        OKX_CT_VAL = nouveaux_ct_val_exec
 
         compte_label = "DÉMO" if OKX_COMPTE_DEMO else "RÉEL"
         if supprimes:
