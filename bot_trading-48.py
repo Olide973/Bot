@@ -218,6 +218,9 @@ async def charger_marches_x10(session):
                 except (TypeError, ValueError):
                     nouveaux_ct_val[symbole] = 0.0
                 log.info(f"  ✅ {symbole} — X-Perp levier max x{levier_max:.0f} → inclus")
+                log.info(f"     [DIAG] {symbole} instId={inst.get('instId')} "
+                         f"ctVal={inst.get('ctVal')} ctValCcy={inst.get('ctValCcy')} "
+                         f"settleCcy={inst.get('settleCcy')} instFamily={inst.get('instFamily')}")
             else:
                 if symbole in MARCHES:
                     marches_supprimes.append(symbole)
@@ -292,21 +295,26 @@ async def filtrer_marches_selon_compte(session):
             log.error(f"  ❌ Erreur filtrage marchés selon compte : {data}")
             return
 
-        instid_par_base = {}
+        inst_par_base = {}
         for inst in data.get("data", []):
             if inst.get("ruleType") != "xperp":
                 continue
             base = inst.get("instId", "").split("-")[0]
             if base:
-                instid_par_base[base] = inst.get("instId")
+                inst_par_base[base] = inst  # instrument complet, scopé au compte
 
         avant            = set(MARCHES)
-        nouveaux_marches = [m for m in MARCHES if m[:-3] in instid_par_base]
+        nouveaux_marches = [m for m in MARCHES if m[:-3] in inst_par_base]
         supprimes        = avant - set(nouveaux_marches)
 
         MARCHES = nouveaux_marches
         for m in MARCHES:
-            OKX_SYMBOLS_EXEC[m] = instid_par_base[m[:-3]]  # instId d'exécution, scopé au compte — jamais utilisé pour les prix
+            inst_exec = inst_par_base[m[:-3]]
+            OKX_SYMBOLS_EXEC[m] = inst_exec.get("instId")  # instId d'exécution, scopé au compte — jamais utilisé pour les prix
+            log.info(f"     [DIAG-EXEC] {m} instId={inst_exec.get('instId')} "
+                     f"ctVal={inst_exec.get('ctVal')} ctValCcy={inst_exec.get('ctValCcy')} "
+                     f"settleCcy={inst_exec.get('settleCcy')} instFamily={inst_exec.get('instFamily')} "
+                     f"(vs ctVal catalogue public utilisé pour le calcul de taille : {OKX_CT_VAL.get(m)})")
         OKX_CT_VAL = {k: v for k, v in OKX_CT_VAL.items() if k in MARCHES}
 
         compte_label = "DÉMO" if OKX_COMPTE_DEMO else "RÉEL"
@@ -409,6 +417,34 @@ async def okx_definir_levier(session, inst_id, levier):
     except Exception as e:
         log.error(f"  ❌ Exception set-leverage {inst_id} : {e}")
         return False
+
+async def okx_diag_solde(session, ccy_attendue=None):
+    """[DIAGNOSTIC UNIQUEMENT — ne bloque jamais un trade] Lit le solde du
+    compte (/api/v5/account/balance) et logge le disponible par devise.
+    Sert à comparer ce qui est réellement disponible juste avant un ordre
+    BTC vs ETH/DOGE, pour confirmer ou infirmer une carence de marge dans
+    une devise précise (ex: USDC) signalée par l'erreur OKX 51008."""
+    path  = "/api/v5/account/balance"
+    query = f"?ccy={ccy_attendue}" if ccy_attendue else ""
+    try:
+        async with session.get(
+            OKX_BASE_URL + path + query,
+            headers=_okx_headers("GET", path + query, ""),
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+            if data.get("code") != "0":
+                log.error(f"  [DIAG-SOLDE] Erreur lecture solde : {data}")
+                return
+            details = data.get("data", [{}])[0].get("details", [])
+            if not details:
+                log.warning(f"  [DIAG-SOLDE] Aucun détail de devise renvoyé (compte vide ou devise absente) : {data}")
+                return
+            for d in details:
+                log.info(f"  [DIAG-SOLDE] {d.get('ccy')} : dispo={d.get('availBal')} "
+                         f"| équité={d.get('eq')} | gelé={d.get('frozenBal')}")
+    except Exception as e:
+        log.error(f"  [DIAG-SOLDE] Exception lecture solde : {e}")
 
 async def okx_placer_ordre_marche(session, inst_id, side, taille_contrats):
     """Place un ordre au marché. side = 'buy' ou 'sell'. Retourne l'ordId si
@@ -852,6 +888,9 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
             async with trades_lock:
                 trades_ouverts.pop(symbole, None)
             return
+
+        log.info(f"  [DIAG-SOLDE] Avant ordre {symbole} — état du compte :")
+        await okx_diag_solde(session)
 
         await okx_definir_levier(session, inst_id, LEVIER)
         side = "buy" if direction == "ACHAT" else "sell"
