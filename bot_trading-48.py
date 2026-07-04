@@ -957,7 +957,45 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
                 f"Gain verrouillé ✅"
             )
 
-        # Sortie lock : PnL redescend sous le palier verrouillé
+        # Stop loss — calculé et vérifié EN PREMIER, avant toute logique de
+        # lock. Priorité absolue : si le prix a franchi le niveau de stop,
+        # c'est un STOP, peu importe qu'un palier de lock ait été posé
+        # auparavant. AVANT ce correctif, un effondrement brutal du prix
+        # après un lock pouvait déclencher la branche "Sortie lock" (qui ne
+        # vérifie que pnl < lock_actuel, sans limite basse) et rapporter le
+        # gain du palier au lieu de la perte réelle — alors que la position
+        # réelle pouvait déjà avoir été liquidée par OKX entre-temps.
+        atteint_stop = (prix_actuel <= stop_initial if direction == "ACHAT"
+                        else prix_actuel >= stop_initial)
+
+        # Log toutes les minutes
+        if time.time() - dernier_log >= 60:
+            lock_flag = f" LOCK{lock_actuel}€" if lock_actuel > 0 else ""
+            log.info(f"  [{datetime.now().strftime('%H:%M:%S')}] {symbole} {prix_actuel} | "
+                     f"PnL {'+' if pnl>=0 else ''}{pnl:.2f}€{lock_flag} | {duree}min")
+            dernier_log = time.time()
+
+        if atteint_stop:
+            frais   = calc_frais(position)
+            pnl_net = round(pnl - frais["total"], 4)
+            if pnl_net > 0:
+                resultat_final = "GAGNE"
+            else:
+                resultat_final = "PERDU"
+            log.info(f"\n  STOP [{symbole}] {'+' if pnl>=0 else ''}{pnl:.2f}€ | net={pnl_net:+.4f}€ | {duree}min")
+            await telegram(session,
+                f"🛑 <b>STOP</b>\n"
+                f"{symbole} {direction}\n"
+                f"PnL brut : {'+' if pnl>=0 else ''}{pnl:.2f}€\n"
+                f"Frais (ouv+ferm) : -{frais['total']}€\n"
+                f"Résultat net : {'+' if pnl_net>=0 else ''}{pnl_net}€\n"
+                f"Durée : {duree} min"
+            )
+            gain_final = pnl_net
+            break
+
+        # Sortie lock : PnL redescend sous le palier verrouillé (mais le
+        # stop n'est pas atteint, sinon on serait déjà sorti ci-dessus)
         if lock_actuel > 0 and pnl < lock_actuel:
             frais    = calc_frais(position)
             gain_net = round(lock_actuel - frais["total"], 4)
@@ -984,36 +1022,6 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
                         f"net={pnl_net:+.4f}€ | {duree}min")
             await telegram(session,
                 f"⏰ <b>DURÉE MAX (6h) — FERMETURE FORCÉE</b>\n"
-                f"{symbole} {direction}\n"
-                f"PnL brut : {'+' if pnl>=0 else ''}{pnl:.2f}€\n"
-                f"Frais (ouv+ferm) : -{frais['total']}€\n"
-                f"Résultat net : {'+' if pnl_net>=0 else ''}{pnl_net}€\n"
-                f"Durée : {duree} min"
-            )
-            gain_final = pnl_net
-            break
-
-        # Stop loss
-        atteint_stop = (prix_actuel <= stop_initial if direction == "ACHAT"
-                        else prix_actuel >= stop_initial)
-
-        # Log toutes les minutes
-        if time.time() - dernier_log >= 60:
-            lock_flag = f" LOCK{lock_actuel}€" if lock_actuel > 0 else ""
-            log.info(f"  [{datetime.now().strftime('%H:%M:%S')}] {symbole} {prix_actuel} | "
-                     f"PnL {'+' if pnl>=0 else ''}{pnl:.2f}€{lock_flag} | {duree}min")
-            dernier_log = time.time()
-
-        if atteint_stop:
-            frais   = calc_frais(position)
-            pnl_net = round(pnl - frais["total"], 4)
-            if pnl_net > 0:
-                resultat_final = "GAGNE"
-            else:
-                resultat_final = "PERDU"
-            log.info(f"\n  STOP [{symbole}] {'+' if pnl>=0 else ''}{pnl:.2f}€ | net={pnl_net:+.4f}€ | {duree}min")
-            await telegram(session,
-                f"🛑 <b>STOP</b>\n"
                 f"{symbole} {direction}\n"
                 f"PnL brut : {'+' if pnl>=0 else ''}{pnl:.2f}€\n"
                 f"Frais (ouv+ferm) : -{frais['total']}€\n"
