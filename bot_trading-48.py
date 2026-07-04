@@ -115,7 +115,8 @@ RESET_TOUT = os.environ.get('RESET_TOUT', '0').strip().lower() in ('1', 'true', 
 # ── Marchés — uniquement ceux à levier x10 sur OKX (X-Perps, compte France/EEA)
 # Chargés dynamiquement via API au démarrage et mis à jour chaque nuit à minuit
 MARCHES          = []   # liste des symboles actifs (levier x10 uniquement)
-OKX_SYMBOLS      = {}   # { "BTCUSD": "BTC-USD-YYMMDD", ... } — vrai instId X-Perp
+OKX_SYMBOLS      = {}   # { "BTCUSD": "BTC-USD-YYMMDD", ... } — instId PUBLIC (www.okx.com), utilisé pour les prix (WebSocket + REST) — NE PAS écraser avec l'instId du compte
+OKX_SYMBOLS_EXEC = {}   # { "BTCUSD": "BTC-USD-YYMMDD", ... } — instId scopé au COMPTE (démo ou réel), utilisé uniquement pour passer/fermer un ordre
 OKX_CT_VAL       = {}   # { "BTCUSD": 0.01, ... } — valeur d'un contrat (usage réel uniquement)
 
 # ═══════════════════════════════════════════════════════════════
@@ -263,10 +264,16 @@ async def filtrer_marches_selon_compte(session):
     produits TradFi hors périmètre) — d'où des trades ouverts puis
     systématiquement annulés faute d'instId reconnu. Ce filtre évite le
     problème à la source : on ne scanne/trade que ce qui est effectivement
-    exécutable pour CE compte (démo ou réel) à cet instant, et on corrige au
-    passage OKX_SYMBOLS avec le vrai instId scopé au compte plutôt que celui
-    (potentiellement différent) découvert via le catalogue public."""
-    global MARCHES, OKX_SYMBOLS, OKX_CT_VAL
+    exécutable pour CE compte (démo ou réel) à cet instant.
+
+    IMPORTANT : on stocke l'instId scopé au compte dans OKX_SYMBOLS_EXEC,
+    PAS dans OKX_SYMBOLS — ce dernier reste celui du catalogue public et
+    continue d'alimenter le WebSocket + le repli REST pour les prix. Écraser
+    OKX_SYMBOLS ici cassait silencieusement la détection de prix (bug réel
+    rencontré : plus aucun signal détecté après ce filtrage, faute de prix
+    reçu, car le WebSocket restait abonné à l'ancien instId public tandis
+    que le code cherchait à faire correspondre le nouvel instId compte)."""
+    global MARCHES, OKX_SYMBOLS_EXEC, OKX_CT_VAL
 
     if not MODE_REEL:
         return  # inutile en simulation pure, aucun ordre n'est jamais envoyé
@@ -299,7 +306,7 @@ async def filtrer_marches_selon_compte(session):
 
         MARCHES = nouveaux_marches
         for m in MARCHES:
-            OKX_SYMBOLS[m] = instid_par_base[m[:-3]]  # instId correct, scopé au compte
+            OKX_SYMBOLS_EXEC[m] = instid_par_base[m[:-3]]  # instId d'exécution, scopé au compte — jamais utilisé pour les prix
         OKX_CT_VAL = {k: v for k, v in OKX_CT_VAL.items() if k in MARCHES}
 
         compte_label = "DÉMO" if OKX_COMPTE_DEMO else "RÉEL"
@@ -820,29 +827,23 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
     # inchangé dans ce cas). Voir l'avertissement en tête du bloc des
     # fonctions okx_* : code non testé en conditions réelles, à valider sur
     # le Demo Trading OKX avant tout usage avec de l'argent réel.
-    inst_id = OKX_SYMBOLS.get(symbole)
+    inst_id = None
     if MODE_REEL:
-        ct_val = OKX_CT_VAL.get(symbole, 0)
-        if not inst_id or not ct_val:
-            log.error(f"  ❌ MODE_REEL actif mais instId/ctVal manquant pour {symbole} — trade annulé")
-            await telegram(session, f"❌ <b>TRADE ANNULÉ</b>\n{symbole} : instId/ctVal manquant, impossible de trader en réel.")
-            async with trades_lock:
-                trades_ouverts.pop(symbole, None)
-            return
+        ct_val  = OKX_CT_VAL.get(symbole, 0)
+        inst_id = OKX_SYMBOLS_EXEC.get(symbole)  # déjà résolu par filtrer_marches_selon_compte
 
-        # L'instId découvert via www.okx.com (simulation) peut différer de
-        # celui reconnu par l'entité my.okx.com (France/EEA, démo ou réel) —
-        # on le re-résout ici juste avant d'envoyer l'ordre, pour éviter
-        # l'erreur 51001 "Instrument ID doesn't exist".
-        base = inst_id.split("-")[0]
-        inst_id_reel = await okx_resoudre_instid_reel(session, base)
-        if inst_id_reel is None:
-            log.error(f"  ❌ Impossible de résoudre l'instId réel pour {symbole} (base={base}) — trade annulé")
-            await telegram(session, f"❌ <b>TRADE ANNULÉ</b>\n{symbole} : instId introuvable côté {OKX_BASE_URL}.")
+        if not inst_id:
+            # Filet de sécurité : marché pas encore résolu (ex: ajouté entre
+            # deux rafraîchissements) — on le résout à la volée.
+            base    = symbole[:-3]
+            inst_id = await okx_resoudre_instid_reel(session, base)
+
+        if not inst_id or not ct_val:
+            log.error(f"  ❌ Impossible de résoudre l'instId d'exécution pour {symbole} — trade annulé")
+            await telegram(session, f"❌ <b>TRADE ANNULÉ</b>\n{symbole} : instId d'exécution introuvable pour ce compte.")
             async with trades_lock:
                 trades_ouverts.pop(symbole, None)
             return
-        inst_id = inst_id_reel
 
         taille_contrats = round(position / (prix_entree * ct_val), 0)
         if taille_contrats < 1:
