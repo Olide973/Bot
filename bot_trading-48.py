@@ -50,7 +50,7 @@ MAX_TRADES_SIMULTANES   = 10         # 10 marchés max = 1 par marché
 # ── Détection signal mean reversion — surveillance temps réel
 SEUIL_MOUVEMENT_PCT     = 0.50   # dès que le prix bouge de 0.50% → signal
 VOLUME_MINI             = 0.25   # volume min vs moyenne 24h
-STOP_LOSS_FIXE          = 25.0   # stop fixe = -25€ par trade (avant frais), ni plus ni moins
+STOP_LOSS_PCT           = 0.015  # stop = 1.5% du prix d'entrée (≈ -10€ au capital/mise actuels) — évolue avec la taille de position, contrairement à un stop fixe en €
 DUREE_MAX_MINUTES       = 360    # 6h — fermeture forcée si ni stop ni lock atteint avant
 
 # ── Filtre RSI 1h
@@ -136,7 +136,7 @@ log.info("  BOT MEAN REVERSION — OKX X10")
 log.info(f"  Capital : {CAPITAL_INITIAL}€ | Levier x{LEVIER} (marchés x10 uniquement)")
 log.info(f"  Signal : mouvement >= {SEUIL_MOUVEMENT_PCT}% depuis le prix de référence")
 log.info(f"  RSI 1h : seuil bas={RSI_SEUIL_BAS} | seuil haut={RSI_SEUIL_HAUT}")
-log.info(f"  Stop : fixe {STOP_LOSS_FIXE}€ par trade")
+log.info(f"  Stop : {STOP_LOSS_PCT*100:.2f}% du prix d'entrée par trade")
 log.info(f"  Frais OKX : {OKX_TAKER_FEE*100:.2f}% ouv + {OKX_TAKER_FEE*100:.2f}% ferm (taker)")
 log.info(f"  Kill switch : {KILL_SWITCH_JOUR}€/jour | Ruine : {SEUIL_RUINE}€")
 log.info(f"  Durée max par trade : {DUREE_MAX_MINUTES//60}h — fermeture forcée si ni stop ni lock atteint avant")
@@ -460,6 +460,61 @@ async def okx_diag_solde(session, ccy_attendue=None):
     except Exception as e:
         log.error(f"  [DIAG-SOLDE] Exception lecture solde : {e}")
 
+async def okx_diag_statut_ordre(session, inst_id, ord_id):
+    """[DIAGNOSTIC UNIQUEMENT] Interroge /api/v5/trade/order pour connaître
+    l'état réel de l'ordre d'ouverture (state: filled/canceled/live/
+    partially_filled) et la quantité effectivement remplie (accFillSz).
+    But : vérifier si un ordre annoncé 'placé' avec succès (code=0 à la
+    soumission) a réellement été REMPLI, ce qui n'est pas garanti par le
+    seul code=0 (qui signifie juste 'accepté par le moteur de matching')."""
+    path  = "/api/v5/trade/order"
+    query = f"?instId={inst_id}&ordId={ord_id}"
+    try:
+        async with session.get(
+            OKX_BASE_URL + path + query,
+            headers=_okx_headers("GET", path + query, ""),
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+            if data.get("code") != "0" or not data.get("data"):
+                log.error(f"  [DIAG-ORDRE] Erreur lecture statut ordre {ord_id} : {data}")
+                return
+            o = data["data"][0]
+            log.info(f"  [DIAG-ORDRE] {inst_id} ordId={ord_id} state={o.get('state')} "
+                     f"sz={o.get('sz')} accFillSz={o.get('accFillSz')} "
+                     f"avgPx={o.get('avgPx')} px={o.get('px')}")
+    except Exception as e:
+        log.error(f"  [DIAG-ORDRE] Exception lecture statut ordre {ord_id} : {e}")
+
+async def okx_diag_position(session, inst_id):
+    """[DIAGNOSTIC UNIQUEMENT] Interroge /api/v5/account/positions pour voir
+    si OKX considère qu'une position existe réellement sur cet instrument,
+    juste avant une tentative de fermeture — but : confirmer si l'erreur
+    'Position doesn't exist' (51023) reflète un état déjà connu avant même
+    d'appeler close-position, ou une surprise de dernière seconde."""
+    path  = "/api/v5/account/positions"
+    query = f"?instId={inst_id}"
+    try:
+        async with session.get(
+            OKX_BASE_URL + path + query,
+            headers=_okx_headers("GET", path + query, ""),
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+            if data.get("code") != "0":
+                log.error(f"  [DIAG-POSITION] Erreur lecture position {inst_id} : {data}")
+                return
+            positions = data.get("data", [])
+            if not positions:
+                log.warning(f"  [DIAG-POSITION] {inst_id} : AUCUNE position ouverte côté OKX au moment du check")
+                return
+            for p in positions:
+                log.info(f"  [DIAG-POSITION] {inst_id} pos={p.get('pos')} "
+                         f"avgPx={p.get('avgPx')} upl={p.get('upl')} "
+                         f"mgnMode={p.get('mgnMode')} posSide={p.get('posSide')}")
+    except Exception as e:
+        log.error(f"  [DIAG-POSITION] Exception lecture position {inst_id} : {e}")
+
 async def okx_placer_ordre_marche(session, inst_id, side, taille_contrats):
     """Place un ordre au marché. side = 'buy' ou 'sell'. Retourne l'ordId si
     succès, sinon None. taille_contrats est en nombre de contrats OKX (PAS en
@@ -491,7 +546,9 @@ async def okx_placer_ordre_marche(session, inst_id, side, taille_contrats):
         return None
 
 async def okx_fermer_position(session, inst_id):
-    """Ferme intégralement la position ouverte sur cet instrument (marge isolée)."""
+    """Ferme intégralement la position ouverte sur cet instrument (marge isolée).
+    Retourne True si la position est fermée (ou déjà inexistante), False
+    seulement en cas de véritable échec où une position existe encore."""
     path = "/api/v5/trade/close-position"
     body = json.dumps({"instId": inst_id, "mgnMode": "isolated"})
     try:
@@ -502,6 +559,17 @@ async def okx_fermer_position(session, inst_id):
         ) as resp:
             data = await resp.json()
             if data.get("code") != "0":
+                # CAS SPÉCIAL : code 51023 = "Position doesn't exist" — ça ne
+                # veut PAS dire que la fermeture a échoué, ça veut dire qu'il
+                # n'y a déjà plus de position à fermer (but atteint, par ex.
+                # déjà close par un mécanisme OKX). Ce n'est pas une erreur.
+                sCode = None
+                if isinstance(data.get("data"), list) and data["data"]:
+                    sCode = data["data"][0].get("sCode")
+                if data.get("code") == "51023" or sCode == "51023":
+                    log.info(f"  ℹ️ Position déjà inexistante pour {inst_id} (51023) — "
+                             f"rien à fermer, considéré comme fermé.")
+                    return True
                 log.error(f"  ❌ Erreur fermeture position {inst_id} : {data}")
                 return False
             log.warning(f"  💰 POSITION RÉELLE FERMÉE : {inst_id}")
@@ -833,13 +901,13 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
     mise = calculer_mise(capital, etat_global)
     position = round(mise * LEVIER, 2)
 
-    # Stop loss fixe : -2€ par trade, ni plus ni moins
-    stop_loss_eur = STOP_LOSS_FIXE
+    # Stop loss en pourcentage du prix d'entrée (fixe en %, pas en €)
+    ratio_prix    = STOP_LOSS_PCT
+    stop_loss_eur = round(position * ratio_prix, 2)  # équivalent € affiché, dérivé du %
 
     rsi_1h = details.get("rsi_1h", 50.0)
 
     # Calcul stop et objectif en prix
-    ratio_prix = stop_loss_eur / position if position > 0 else 0.001
     if direction == "ACHAT":
         stop_initial   = round(prix_entree * (1 - ratio_prix), 8)
         objectif_final = round(prix_entree * (1 + ratio_prix * 2), 8)
@@ -916,12 +984,15 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
                 trades_ouverts.pop(symbole, None)
             return
 
+        await asyncio.sleep(1)  # laisse le temps au matching engine de remplir avant de vérifier
+        await okx_diag_statut_ordre(session, inst_id, ord_id)
+
     debut           = time.time()
     dernier_log     = 0
     pnl_max_atteint = 0.0
     lock_actuel     = 0.0
     resultat_final  = "PERDU"
-    gain_final      = -STOP_LOSS_FIXE
+    gain_final      = -stop_loss_eur
     prix_sortie     = prix_entree
     pnl             = 0.0
     duree           = 0
@@ -1033,6 +1104,7 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
 
     # ── Fermeture réelle de la position — INACTIF tant que MODE_REEL=0
     if MODE_REEL and inst_id:
+        await okx_diag_position(session, inst_id)
         succes_fermeture = await okx_fermer_position(session, inst_id)
         if not succes_fermeture:
             log.error(f"  ❌ ÉCHEC DE FERMETURE RÉELLE pour {symbole} — intervention manuelle probablement nécessaire")
