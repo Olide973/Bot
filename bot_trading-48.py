@@ -50,7 +50,7 @@ MAX_TRADES_SIMULTANES   = 10         # 10 marchés max = 1 par marché
 # ── Détection signal mean reversion — surveillance temps réel
 SEUIL_MOUVEMENT_PCT     = 0.50   # dès que le prix bouge de 0.50% → signal
 VOLUME_MINI             = 0.25   # volume min vs moyenne 24h
-STOP_LOSS_PCT           = 0.015  # stop = 1.5% du prix d'entrée (≈ -10€ au capital/mise actuels) — évolue avec la taille de position, contrairement à un stop fixe en €
+STOP_LOSS_PCT           = 0.075  # stop = 7.5% du prix d'entrée (≈ -50€ au capital/mise actuels) — évolue avec la taille de position, contrairement à un stop fixe en €
 DUREE_MAX_MINUTES       = 360    # 6h — fermeture forcée si ni stop ni lock atteint avant
 
 # ── Filtre RSI 1h
