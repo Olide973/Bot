@@ -61,6 +61,7 @@ RSI_PERIODE             = 14
 # ── Protections
 KILL_SWITCH_JOUR        = -100.0
 SEUIL_RUINE             = 300.0
+SEUIL_CAPITAL_BTC       = 6000.0  # capital mini pour que BTCUSD soit inclus dans le scan — sous ce seuil, 1 seul contrat BTC (ctVal=1 ≈ 1 BTC) coûte plus cher que toute la position ; BTC est retiré des marchés actifs jusqu'à ce que le capital dépasse ce seuil
 
 # ── Lock profits par paliers proportionnels au capital
 # Premier palier : 0.15% = 0.75€ à 500€
@@ -918,34 +919,13 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
     # Frais d'ouverture
     frais_ouv = round(position * OKX_TAKER_FEE, 4)
 
-    # Numéro de trade — sera attribué dans le lock final
-    numero_trade = 0
-
-    log.info(f"\n  {'='*55}")
-    log.info(f"  TRADE EN COURS — {datetime.now().strftime('%H:%M:%S')}")
-    log.info(f"  {symbole} ({direction})")
-    log.info(f"  Variation : {details.get('variation_pct', 0):.2f}% | "
-             f"Ref={details.get('prix_ref')} → {details.get('prix_actuel')}")
-    log.info(f"  Vol={details.get('vol_ratio', 0):.2f}x | RSI 1h={rsi_1h} | Stop fixe : -{stop_loss_eur}€")
-    log.info(f"  Prix entrée : {prix_entree} | Stop : {stop_initial} | Obj : {objectif_final}")
-    log.info(f"  Mise : {mise}€ x x{LEVIER} = {position}€ | Frais ouv : -{frais_ouv}€ | Trades : {len(trades_ouverts)}/{MAX_TRADES_SIMULTANES}\n")
-
-    await telegram(session,
-        f"📊 <b>TRADE OUVERT</b>\n"
-        f"{'🟢 ACHAT' if direction == 'ACHAT' else '🔴 VENTE'} {symbole}\n"
-        f"Variation : {details.get('variation_pct', 0):.2f}% depuis ref\n"
-        f"Volume : {details.get('vol_ratio', 0):.2f}x | RSI 1h : {rsi_1h}\n"
-        f"Prix : {prix_entree} | Stop : {stop_initial}\n"
-        f"Mise : {mise}€ x x{LEVIER} = {position}€\n"
-        f"Frais ouverture : -{frais_ouv}€ | Stop max : -{stop_loss_eur}€\n"
-        f"Trades : {len(trades_ouverts)}/{MAX_TRADES_SIMULTANES}"
-    )
-
-    # ── Exécution réelle — INACTIF tant que MODE_REEL=0 (comportement simulé
-    # inchangé dans ce cas). Voir l'avertissement en tête du bloc des
-    # fonctions okx_* : code non testé en conditions réelles, à valider sur
-    # le Demo Trading OKX avant tout usage avec de l'argent réel.
-    inst_id = None
+    # ── Résolution de l'instrument et vérification de la taille — TOUJOURS
+    # avant l'annonce Telegram. Avant ce correctif, le message "TRADE OUVERT"
+    # partait systématiquement, même pour un trade annulé juste après (ex:
+    # BTCUSD dont la taille calculée est < 1 contrat) — ce qui donnait
+    # l'impression trompeuse d'un double trade sur le même marché.
+    inst_id         = None
+    taille_contrats = None
     if MODE_REEL:
         ct_val  = OKX_CT_VAL.get(symbole, 0)
         inst_id = OKX_SYMBOLS_EXEC.get(symbole)  # déjà résolu par filtrer_marches_selon_compte
@@ -971,6 +951,29 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
                 trades_ouverts.pop(symbole, None)
             return
 
+    log.info(f"\n  {'='*55}")
+    log.info(f"  TRADE EN COURS — {datetime.now().strftime('%H:%M:%S')}")
+    log.info(f"  {symbole} ({direction})")
+    log.info(f"  Variation : {details.get('variation_pct', 0):.2f}% | "
+             f"Ref={details.get('prix_ref')} → {details.get('prix_actuel')}")
+    log.info(f"  Vol={details.get('vol_ratio', 0):.2f}x | RSI 1h={rsi_1h} | Stop fixe : -{stop_loss_eur}€")
+    log.info(f"  Prix entrée : {prix_entree} | Stop : {stop_initial} | Obj : {objectif_final}")
+    log.info(f"  Mise : {mise}€ x x{LEVIER} = {position}€ | Frais ouv : -{frais_ouv}€ | Trades : {len(trades_ouverts)}/{MAX_TRADES_SIMULTANES}\n")
+
+    await telegram(session,
+        f"📊 <b>TRADE OUVERT</b>\n"
+        f"{'🟢 ACHAT' if direction == 'ACHAT' else '🔴 VENTE'} {symbole}\n"
+        f"Variation : {details.get('variation_pct', 0):.2f}% depuis ref\n"
+        f"Volume : {details.get('vol_ratio', 0):.2f}x | RSI 1h : {rsi_1h}\n"
+        f"Prix : {prix_entree} | Stop : {stop_initial}\n"
+        f"Mise : {mise}€ x x{LEVIER} = {position}€\n"
+        f"Frais ouverture : -{frais_ouv}€ | Stop max : -{stop_loss_eur}€\n"
+        f"Trades : {len(trades_ouverts)}/{MAX_TRADES_SIMULTANES}"
+    )
+
+    # ── Exécution réelle — INACTIF tant que MODE_REEL=0 (comportement simulé
+    # inchangé dans ce cas). instId/taille déjà validés ci-dessus.
+    if MODE_REEL:
         log.info(f"  [DIAG-SOLDE] Avant ordre {symbole} — état du compte :")
         await okx_diag_solde(session)
 
@@ -1746,6 +1749,10 @@ async def boucle_principale():
                         m for m in marches_actifs
                         if m not in trades_ouverts
                         and time.time() >= cooldown_marches.get(m, 0)
+                        # BTCUSD retiré tant que le capital ne permet pas 1 contrat entier
+                        # (ctVal=1 ≈ 1 BTC de notionnel par contrat) — uniquement en
+                        # MODE_REEL, où cette contrainte existe réellement. Voir SEUIL_CAPITAL_BTC
+                        and not (MODE_REEL and m == "BTCUSD" and etat["capital"] < SEUIL_CAPITAL_BTC)
                     ]
 
                 if slots_libres <= 0:
