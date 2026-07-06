@@ -33,7 +33,7 @@ log = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════
 #  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════
-CAPITAL_INITIAL         = 561.18  # en USDC — vraie valeur du compte de trading après conversion EUR→USDC (495.18€ ≈ 561.18 USDC au taux du moment)
+CAPITAL_INITIAL         = 543.65  # en USDC — capital réel actuel du compte de trading
 SEUIL_ALERTE_PERTE      = 50.0  # alerte Telegram dès que le capital descend à CAPITAL_INITIAL - ce montant
 LEVIER                  = 10
 
