@@ -1223,8 +1223,19 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
             verif_reelle = await okx_recuperer_position_reelle(session, inst_id)
             if verif_reelle:
                 net_reel = round(verif_reelle["pnl"] - abs(verif_reelle["fee"]), 4)
+                gain_interne_original = gain_final  # conservé pour le message de comparaison, avant écrasement
                 log.info(f"  [VÉRIF-RÉELLE] {symbole} — OKX: pnl={verif_reelle['pnl']} "
                          f"frais={verif_reelle['fee']} net={net_reel} | Bot interne: {gain_final}")
+                # Le résultat RÉEL OKX devient le résultat OFFICIEL du trade —
+                # élimine l'écart à la source plutôt que de juste le signaler.
+                # Garde-fou : rejeté si manifestement aberrant (gain plus grand
+                # que la position elle-même ne peut jamais arriver légitimement).
+                if abs(net_reel) <= position:
+                    gain_final     = net_reel
+                    resultat_final = "GAGNE" if net_reel > 0 else "PERDU"
+                else:
+                    log.error(f"  [VÉRIF-RÉELLE] ⚠️ net_reel={net_reel} invraisemblable "
+                              f"(position={position}) — calcul interne conservé")
 
     # ── Libérer le marché + mise à jour état global dans un seul lock
     async with trades_lock:
@@ -1309,14 +1320,14 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
     # Vérification réelle OKX vs calcul interne — copiable/envoyable tel quel
     if verif_reelle is not None:
         net_reel  = round(verif_reelle["pnl"] - abs(verif_reelle["fee"]), 4)
-        ecart     = round(net_reel - gain_final, 4)
-        flag      = "✅ Cohérent" if abs(ecart) < 0.05 else "⚠️ ÉCART DÉTECTÉ"
+        ecart     = round(net_reel - gain_interne_original, 4)
+        flag      = "✅ Cohérent" if abs(ecart) < 0.05 else "⚠️ ÉCART (corrigé automatiquement)"
         msg_verif = (
             f"🔍 <b>VÉRIFICATION RÉELLE OKX</b> — {symbole}\n"
             f"PnL réel OKX : {verif_reelle['pnl']:+.4f} USDC\n"
             f"Frais réels OKX : -{abs(verif_reelle['fee']):.4f} USDC\n"
-            f"Net réel OKX : {net_reel:+.4f} USDC\n"
-            f"Calcul interne bot : {gain_final:+.4f}€\n"
+            f"Net réel OKX (retenu comme résultat officiel) : {net_reel:+.4f} USDC\n"
+            f"Calcul interne bot (estimation avant vérif) : {gain_interne_original:+.4f}€\n"
             f"Écart : {ecart:+.4f} — {flag}"
         )
         if solde_reel is not None:
