@@ -1192,10 +1192,30 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
     verif_reelle = None
     if MODE_REEL:
         await asyncio.sleep(1)  # laisse le temps à OKX de refléter la fermeture
-        solde_reel = await okx_recuperer_solde_reel(session, "USDC")
-        if solde_reel is not None:
-            log.info(f"  [SOLDE-RÉEL] Capital resynchronisé sur OKX : {solde_reel:.2f} USDC "
-                     f"(vs calcul interne : {round(etat_global['capital'] + gain_final, 2)}€)")
+        solde_brut = await okx_recuperer_solde_reel(session, "USDC")
+        if solde_brut is not None:
+            capital_actuel = etat_global["capital"]
+            # Garde-fou de plausibilité : un solde qui s'écarte de plus de
+            # 50% du capital actuel en un seul trade est presque certainement
+            # une anomalie (ex: solde démo OKX par défaut sans rapport avec
+            # les fonds réellement alloués), pas un vrai résultat de trade.
+            # On le rejette plutôt que de laisser un chiffre aberrant fausser
+            # toutes les mises futures.
+            ecart_relatif = abs(solde_brut - capital_actuel) / capital_actuel if capital_actuel > 0 else 0
+            if ecart_relatif > 0.5:
+                log.error(f"  [SOLDE-RÉEL] ⚠️ Solde OKX invraisemblable rejeté : {solde_brut:.2f} USDC "
+                          f"vs capital actuel {capital_actuel}€ (écart {ecart_relatif*100:.0f}%) — "
+                          f"repli sur le calcul interne pour ce trade")
+                await telegram(session,
+                    f"⚠️ <b>SOLDE OKX INVRAISEMBLABLE IGNORÉ</b>\n"
+                    f"OKX a renvoyé {solde_brut:.2f} USDC, très éloigné du capital actuel "
+                    f"({capital_actuel}€) — probablement un solde démo par défaut sans rapport "
+                    f"avec tes fonds réels. Ignoré par sécurité, calcul interne conservé."
+                )
+            else:
+                solde_reel = solde_brut
+                log.info(f"  [SOLDE-RÉEL] Capital resynchronisé sur OKX : {solde_reel:.2f} USDC "
+                         f"(vs calcul interne : {round(capital_actuel + gain_final, 2)}€)")
         else:
             log.warning(f"  [SOLDE-RÉEL] Échec de lecture — repli sur le calcul interne pour ce trade")
 
