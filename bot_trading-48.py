@@ -434,6 +434,42 @@ async def okx_definir_levier(session, inst_id, levier):
         log.error(f"  ❌ Exception set-leverage {inst_id} : {e}")
         return False
 
+async def okx_recuperer_solde_reel(session, ccy="USDC"):
+    """Récupère l'équité RÉELLE du compte OKX pour la devise donnée
+    (par défaut USDC, la devise de marge de tous les contrats X-Perp
+    utilisés). Retourne un float, ou None en cas d'échec.
+
+    Utilisé comme SOURCE DE VÉRITÉ pour le capital après chaque trade réel,
+    à la place du calcul cumulatif interne (capital + gain_final) qui peut
+    dériver du vrai solde OKX — notamment quand une position est fermée
+    manuellement par l'utilisateur (prix de sortie réel inconnu du bot),
+    ou par accumulation de petits écarts d'arrondi/prix sur de nombreux
+    trades. Le bot n'a plus le droit de "deviner" son capital : il va le
+    lire directement sur le compte réel."""
+    path  = "/api/v5/account/balance"
+    query = f"?ccy={ccy}"
+    try:
+        async with session.get(
+            OKX_BASE_URL + path + query,
+            headers=_okx_headers("GET", path + query, ""),
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+            if data.get("code") != "0":
+                log.error(f"  [SOLDE-RÉEL] Erreur lecture solde réel : {data}")
+                return None
+            details = data.get("data", [{}])[0].get("details", [])
+            for d in details:
+                if d.get("ccy") == ccy:
+                    eq = d.get("eq")
+                    if eq is not None:
+                        return float(eq)
+            log.warning(f"  [SOLDE-RÉEL] Devise {ccy} introuvable dans la réponse du solde")
+            return None
+    except Exception as e:
+        log.error(f"  [SOLDE-RÉEL] Exception lecture solde réel : {e}")
+        return None
+
 async def okx_diag_solde(session, ccy_attendue=None):
     """[DIAGNOSTIC UNIQUEMENT — ne bloque jamais un trade] Lit le solde du
     compte (/api/v5/account/balance) et logge le disponible par devise.
@@ -1118,6 +1154,20 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
                 f"Vérifie manuellement sur l'app OKX immédiatement."
             )
 
+    # ── Resynchronisation avec le VRAI solde OKX avant de mettre à jour le
+    # capital — uniquement en MODE_REEL. Le calcul interne (capital +
+    # gain_final) sert de solution de secours seulement si cette lecture
+    # échoue (ex: coupure réseau), jamais comme source principale.
+    solde_reel = None
+    if MODE_REEL:
+        await asyncio.sleep(1)  # laisse le temps à OKX de refléter la fermeture
+        solde_reel = await okx_recuperer_solde_reel(session, "USDC")
+        if solde_reel is not None:
+            log.info(f"  [SOLDE-RÉEL] Capital resynchronisé sur OKX : {solde_reel:.2f} USDC "
+                     f"(vs calcul interne : {round(etat_global['capital'] + gain_final, 2)}€)")
+        else:
+            log.warning(f"  [SOLDE-RÉEL] Échec de lecture — repli sur le calcul interne pour ce trade")
+
     # ── Libérer le marché + mise à jour état global dans un seul lock
     async with trades_lock:
         trades_ouverts.pop(symbole, None)
@@ -1127,7 +1177,10 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
         # Mise à jour capital et stats dans le même lock — pas de race condition
         etat_global["nb_trades"] = etat_global.get("nb_trades", 0) + 1
         numero_trade             = etat_global["nb_trades"]
-        etat_global["capital"]   = round(etat_global["capital"] + gain_final, 2)
+        if solde_reel is not None:
+            etat_global["capital"] = round(solde_reel, 2)  # source de vérité OKX
+        else:
+            etat_global["capital"] = round(etat_global["capital"] + gain_final, 2)  # repli
         etat_global["cumul_net"] = round(etat_global["capital"] - CAPITAL_INITIAL, 2)
         etat_global["pnl_jour"]  = round(etat_global.get("pnl_jour", 0) + gain_final, 2)
 
