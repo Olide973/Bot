@@ -65,9 +65,9 @@ SEUIL_RUINE             = 300.0
 SEUIL_CAPITAL_BTC       = 6000.0  # capital mini pour que BTCUSD soit inclus dans le scan — sous ce seuil, 1 seul contrat BTC (ctVal=1 ≈ 1 BTC) coûte plus cher que toute la position ; BTC est retiré des marchés actifs jusqu'à ce que le capital dépasse ce seuil
 
 # ── Lock profits par paliers proportionnels au capital
-# Premier palier : 0.15% = 0.75€ à 500€
+# Premier palier : 0.20% = 1.00€ à 500€
 LOCK_PALIERS_PCT = [
-    0.17, 0.22, 0.30, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
+    0.20, 0.22, 0.30, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
     1.80, 2.20, 2.60, 3.20, 3.80, 4.60, 5.50, 6.50, 7.50, 9.00,
     10.00, 12.50, 15.00, 17.50, 20.00, 25.00, 30.00, 45.00, 60.00,
 ]
@@ -436,11 +436,14 @@ async def okx_definir_levier(session, inst_id, levier):
 
 async def okx_recuperer_position_reelle(session, inst_id):
     """Interroge /api/v5/account/positions-history pour récupérer le résultat
-    RÉEL (PnL réalisé et frais) de la dernière position fermée sur cet
-    instrument. Sert à comparer directement, dans le rapport Telegram, ce
-    que le bot calcule en interne vs ce qu'OKX a réellement enregistré —
-    pour repérer immédiatement tout écart sans avoir à aller chercher
-    manuellement dans l'app OKX à chaque fois."""
+    RÉEL (PnL réalisé, frais de transaction ET frais de financement séparés)
+    de la dernière position fermée sur cet instrument. Sert à comparer
+    directement, dans le rapport Telegram, ce que le bot calcule en interne
+    vs ce qu'OKX a réellement enregistré — et à distinguer clairement les
+    frais d'ouverture/fermeture (0.05%+0.05% attendus) des frais de
+    financement (funding fee, prélevés périodiquement sur les positions
+    tenues assez longtemps, jamais pris en compte dans le calcul interne
+    du bot)."""
     path  = "/api/v5/account/positions-history"
     query = f"?instId={inst_id}&limit=1"
     try:
@@ -455,10 +458,11 @@ async def okx_recuperer_position_reelle(session, inst_id):
                 return None
             p = data["data"][0]
             return {
-                "pnl":      float(p.get("pnl", 0) or 0),
-                "fee":      float(p.get("fee", 0) or 0),
-                "open_px":  p.get("openAvgPx"),
-                "close_px": p.get("closeAvgPx"),
+                "pnl":         float(p.get("pnl", 0) or 0),
+                "fee":         float(p.get("fee", 0) or 0),           # frais de transaction (ouv+ferm)
+                "funding_fee": float(p.get("fundingFee", 0) or 0),    # frais de financement séparés
+                "open_px":     p.get("openAvgPx"),
+                "close_px":    p.get("closeAvgPx"),
             }
     except Exception as e:
         log.error(f"  [VÉRIF-RÉELLE] Exception position-history {inst_id} : {e}")
@@ -553,6 +557,43 @@ async def okx_diag_statut_ordre(session, inst_id, ord_id):
                      f"avgPx={o.get('avgPx')} px={o.get('px')}")
     except Exception as e:
         log.error(f"  [DIAG-ORDRE] Exception lecture statut ordre {ord_id} : {e}")
+
+async def okx_position_existe_deja(session, inst_id):
+    """Vérifie auprès d'OKX (source de vérité externe, pas juste l'état
+    interne Python) si une position non-nulle existe déjà sur cet
+    instrument. Sert de garde-fou avant d'ouvrir un nouveau trade réel —
+    protège contre les doublons qui peuvent survenir si plusieurs
+    instances du bot tournent en parallèle (ex: ancien déploiement
+    Railway pas complètement arrêté avant qu'un nouveau démarre), un cas
+    que le verrou interne (trades_lock/trades_ouverts) ne peut pas
+    détecter puisqu'il ne connaît que l'état de SA PROPRE instance.
+    Retourne True si une position existe déjà (trade à annuler), False
+    si la voie est libre, None si la vérification a échoué (dans ce cas,
+    on laisse passer plutôt que de bloquer indéfiniment sur une panne
+    réseau — le risque de doublon reste plus rare que celui de blocage
+    permanent)."""
+    path  = "/api/v5/account/positions"
+    query = f"?instId={inst_id}"
+    try:
+        async with session.get(
+            OKX_BASE_URL + path + query,
+            headers=_okx_headers("GET", path + query, ""),
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+            if data.get("code") != "0":
+                log.error(f"  [ANTI-DOUBLON] Erreur lecture position {inst_id} : {data}")
+                return None
+            for p in data.get("data", []):
+                pos_size = float(p.get("pos", 0) or 0)
+                if pos_size != 0:
+                    log.warning(f"  [ANTI-DOUBLON] Position déjà existante sur {inst_id} "
+                                f"(pos={pos_size}) — nouvelle ouverture bloquée")
+                    return True
+            return False
+    except Exception as e:
+        log.error(f"  [ANTI-DOUBLON] Exception vérification position {inst_id} : {e}")
+        return None
 
 async def okx_diag_position(session, inst_id):
     """[DIAGNOSTIC UNIQUEMENT] Interroge /api/v5/account/positions pour voir
@@ -1018,6 +1059,25 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
                 trades_ouverts.pop(symbole, None)
             return
 
+        # Vérification anti-doublon : une position existe-t-elle DÉJÀ
+        # réellement sur OKX pour cet instrument ? Protège contre le cas
+        # où plusieurs instances du bot tourneraient en parallèle (ex:
+        # ancien déploiement Railway pas complètement arrêté) — le verrou
+        # interne (trades_ouverts) ne peut pas détecter ce cas puisqu'il
+        # ne connaît que l'état de SA PROPRE instance.
+        position_deja_existante = await okx_position_existe_deja(session, inst_id)
+        if position_deja_existante is True:
+            log.error(f"  ❌ Position déjà existante sur OKX pour {symbole} — trade annulé "
+                      f"(probable doublon d'instance)")
+            await telegram(session,
+                f"❌ <b>TRADE ANNULÉ</b>\n{symbole} : une position existe déjà réellement sur OKX "
+                f"pour cet instrument — ouverture bloquée pour éviter un doublon "
+                f"(possible instance du bot en double)."
+            )
+            async with trades_lock:
+                trades_ouverts.pop(symbole, None)
+            return
+
     log.info(f"\n  {'='*55}")
     log.info(f"  TRADE EN COURS — {datetime.now().strftime('%H:%M:%S')}")
     log.info(f"  {symbole} ({direction})")
@@ -1222,10 +1282,13 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
         if inst_id:
             verif_reelle = await okx_recuperer_position_reelle(session, inst_id)
             if verif_reelle:
-                net_reel = round(verif_reelle["pnl"] - abs(verif_reelle["fee"]), 4)
+                net_reel = round(verif_reelle["pnl"] - abs(verif_reelle["fee"])
+                                  - abs(verif_reelle["funding_fee"]), 4)
                 gain_interne_original = gain_final  # conservé pour le message de comparaison, avant écrasement
                 log.info(f"  [VÉRIF-RÉELLE] {symbole} — OKX: pnl={verif_reelle['pnl']} "
-                         f"frais={verif_reelle['fee']} net={net_reel} | Bot interne: {gain_final}")
+                         f"frais_transaction={verif_reelle['fee']} "
+                         f"frais_financement={verif_reelle['funding_fee']} "
+                         f"net={net_reel} | Bot interne: {gain_final}")
                 # Le résultat RÉEL OKX devient le résultat OFFICIEL du trade —
                 # élimine l'écart à la source plutôt que de juste le signaler.
                 # Garde-fou : rejeté si manifestement aberrant (gain plus grand
@@ -1319,13 +1382,18 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
 
     # Vérification réelle OKX vs calcul interne — copiable/envoyable tel quel
     if verif_reelle is not None:
-        net_reel  = round(verif_reelle["pnl"] - abs(verif_reelle["fee"]), 4)
+        net_reel  = round(verif_reelle["pnl"] - abs(verif_reelle["fee"])
+                           - abs(verif_reelle["funding_fee"]), 4)
         ecart     = round(net_reel - gain_interne_original, 4)
         flag      = "✅ Cohérent" if abs(ecart) < 0.05 else "⚠️ ÉCART (corrigé automatiquement)"
         msg_verif = (
             f"🔍 <b>VÉRIFICATION RÉELLE OKX</b> — {symbole}\n"
             f"PnL réel OKX : {verif_reelle['pnl']:+.4f} USDC\n"
-            f"Frais réels OKX : -{abs(verif_reelle['fee']):.4f} USDC\n"
+            f"Frais de transaction (ouv+ferm) : -{abs(verif_reelle['fee']):.4f} USDC\n"
+        )
+        if abs(verif_reelle["funding_fee"]) > 0.0001:
+            msg_verif += f"Frais de financement (funding) : -{abs(verif_reelle['funding_fee']):.4f} USDC\n"
+        msg_verif += (
             f"Net réel OKX (retenu comme résultat officiel) : {net_reel:+.4f} USDC\n"
             f"Calcul interne bot (estimation avant vérif) : {gain_interne_original:+.4f}€\n"
             f"Écart : {ecart:+.4f} — {flag}"
