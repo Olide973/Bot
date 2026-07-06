@@ -33,7 +33,8 @@ log = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════
 #  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════
-CAPITAL_INITIAL         = 500.0
+CAPITAL_INITIAL         = 495.18
+SEUIL_ALERTE_PERTE      = 50.0  # alerte Telegram dès que le capital descend à CAPITAL_INITIAL - ce montant
 LEVIER                  = 10
 
 # ── Mise calculée pour avoir des frais totaux de ~0.50€ avec les vrais frais OKX
@@ -1130,6 +1131,17 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
         etat_global["cumul_net"] = round(etat_global["capital"] - CAPITAL_INITIAL, 2)
         etat_global["pnl_jour"]  = round(etat_global.get("pnl_jour", 0) + gain_final, 2)
 
+        # Alerte perte cumulée — se déclenche une seule fois au franchissement
+        # du seuil, se réarme si le capital remonte au-dessus (pour pouvoir
+        # réalerter en cas de nouvelle chute plus tard)
+        alerte_perte_a_envoyer = False
+        if etat_global["capital"] <= CAPITAL_INITIAL - SEUIL_ALERTE_PERTE:
+            if not etat_global.get("alerte_perte_envoyee", False):
+                alerte_perte_a_envoyer = True
+                etat_global["alerte_perte_envoyee"] = True
+        else:
+            etat_global["alerte_perte_envoyee"] = False
+
         if resultat_final == "GAGNE":
             etat_global["nb_wins"]             = etat_global.get("nb_wins", 0) + 1
             etat_global["total_gagne"]         = round(etat_global.get("total_gagne", 0) + gain_final, 2)
@@ -1153,6 +1165,15 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
             'rsi':           rsi_1h,
             'vol_ratio':     details.get("vol_ratio", 0.0),
         })
+
+    if alerte_perte_a_envoyer:
+        await telegram(session,
+            f"🆘 <b>ALERTE PERTE CAPITAL</b>\n"
+            f"Capital actuel : {etat_global['capital']}€\n"
+            f"Capital de départ : {CAPITAL_INITIAL}€\n"
+            f"Perte cumulée : {round(etat_global['capital'] - CAPITAL_INITIAL, 2)}€\n"
+            f"Seuil d'alerte (-{SEUIL_ALERTE_PERTE}€) franchi."
+        )
 
     enregistrer_trade({
         'marche':        symbole,
