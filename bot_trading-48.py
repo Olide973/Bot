@@ -17,6 +17,8 @@ import hashlib
 import base64
 import logging
 import time
+import uuid
+import signal
 from datetime import datetime, timedelta
 import pandas as pd
 from ta.volatility import AverageTrueRange
@@ -34,7 +36,7 @@ log = logging.getLogger(__name__)
 #  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════
 CAPITAL_INITIAL         = 543.65  # en USDC — capital réel actuel du compte de trading
-SEUIL_ALERTE_PERTE      = 50.0  # alerte Telegram dès que le capital descend à CAPITAL_INITIAL - ce montant
+SEUIL_ALERTE_PERTE_PCT  = 10.0  # alerte Telegram dès que le capital descend de ce % sous CAPITAL_INITIAL
 LEVIER                  = 10
 
 # ── Mise calculée pour avoir des frais totaux de ~0.50€ avec les vrais frais OKX
@@ -128,6 +130,8 @@ trades_ouverts    = {}    # { symbole: True }
 prix_reference    = {}    # { symbole: prix_au_moment_du_scan }
 cooldown_marches  = {}    # { symbole: timestamp_fin_cooldown }
 trades_lock       = None  # initialisé dans boucle_principale()
+taches_trades_actives = set()  # tâches asyncio en cours (executer_trade) — pour un arrêt propre (SIGTERM)
+arret_demande     = False  # passe à True sur SIGTERM/SIGINT — arrête d'ouvrir de NOUVEAUX trades, sans tuer ceux en cours
 PRIX_LIVE           = {}    # { symbole: dernier prix reçu via WebSocket OKX }
 PRIX_LIVE_TS        = {}    # { symbole: timestamp du dernier tick reçu — pour détecter un cache périmé }
 WS_CONNEXION_ACTIVE = None  # référence à la connexion WebSocket en cours (pour forcer une resynchro)
@@ -595,7 +599,41 @@ async def okx_position_existe_deja(session, inst_id):
         log.error(f"  [ANTI-DOUBLON] Exception vérification position {inst_id} : {e}")
         return None
 
-async def okx_diag_position(session, inst_id):
+async def okx_lister_toutes_positions_ouvertes(session):
+    """Interroge /api/v5/account/positions SANS filtre d'instrument, pour
+    lister TOUTES les positions réellement ouvertes sur le compte. Sert à
+    synchroniser trades_ouverts au démarrage du bot — corrige l'angle mort
+    suivant : trades_ouverts n'existe qu'en RAM (jamais persisté), donc un
+    redémarrage de conteneur (crash, redéploiement Railway) le vide
+    complètement, même si de vraies positions restent ouvertes sur OKX. Un
+    bot qui redémarre ainsi 'amnésique' pourrait tenter d'ouvrir un nouveau
+    trade sur un marché où une position tourne déjà réellement — le
+    garde-fou okx_position_existe_deja le bloquerait à l'ouverture, mais
+    autant synchroniser dès le départ plutôt que de compter uniquement sur
+    ce filet de sécurité.
+    Retourne la liste des instId avec une position non-nulle."""
+    path = "/api/v5/account/positions"
+    try:
+        async with session.get(
+            OKX_BASE_URL + path,
+            headers=_okx_headers("GET", path, ""),
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+            if data.get("code") != "0":
+                log.error(f"  [SYNC-DÉMARRAGE] Erreur lecture positions ouvertes : {data}")
+                return []
+            instIds = []
+            for p in data.get("data", []):
+                pos_size = float(p.get("pos", 0) or 0)
+                if pos_size != 0:
+                    instIds.append(p.get("instId"))
+            return instIds
+    except Exception as e:
+        log.error(f"  [SYNC-DÉMARRAGE] Exception lecture positions ouvertes : {e}")
+        return []
+
+
     """[DIAGNOSTIC UNIQUEMENT] Interroge /api/v5/account/positions pour voir
     si OKX considère qu'une position existe réellement sur cet instrument,
     juste avant une tentative de fermeture — but : confirmer si l'erreur
@@ -628,14 +666,23 @@ async def okx_placer_ordre_marche(session, inst_id, side, taille_contrats):
     """Place un ordre au marché. side = 'buy' ou 'sell'. Retourne l'ordId si
     succès, sinon None. taille_contrats est en nombre de contrats OKX (PAS en
     USD ni en quantité de crypto brute) — voir le TODO de conversion ctVal
-    dans executer_trade avant tout usage réel."""
+    dans executer_trade avant tout usage réel.
+
+    Utilise un clOrdId unique par tentative (bonne pratique OKX standard).
+    En cas d'exception réseau (ex: timeout sur la RÉPONSE alors que l'ordre
+    a pu être réellement traité côté OKX), on vérifie l'état réel de
+    l'ordre via ce clOrdId avant de conclure à un échec — pour ne jamais
+    annoncer 'TRADE ANNULÉ' à tort alors qu'une position a bel et bien été
+    ouverte, ce qui mènerait plus tard à un doublon sur un nouveau signal."""
     path = "/api/v5/trade/order"
+    cl_ord_id = f"b{int(time.time())}{uuid.uuid4().hex[:16]}"
     body = json.dumps({
         "instId": inst_id,
         "tdMode": "isolated",
         "side": side,
         "ordType": "market",
         "sz": str(taille_contrats),
+        "clOrdId": cl_ord_id,
     })
     try:
         async with session.post(
@@ -648,10 +695,44 @@ async def okx_placer_ordre_marche(session, inst_id, side, taille_contrats):
                 log.error(f"  ❌ Erreur ordre {inst_id} {side} : {data}")
                 return None
             ord_id = data.get("data", [{}])[0].get("ordId")
-            log.warning(f"  💰 ORDRE RÉEL PLACÉ : {inst_id} {side} {taille_contrats} contrats (ordId={ord_id})")
+            log.warning(f"  💰 ORDRE RÉEL PLACÉ : {inst_id} {side} {taille_contrats} contrats "
+                        f"(ordId={ord_id}, clOrdId={cl_ord_id})")
             return ord_id
     except Exception as e:
-        log.error(f"  ❌ Exception ordre {inst_id} : {e}")
+        log.error(f"  ❌ Exception ordre {inst_id} (clOrdId={cl_ord_id}) : {e} "
+                  f"— vérification via clOrdId avant de conclure à un échec...")
+        ord_id_recupere = await okx_verifier_ordre_par_clordid(session, inst_id, cl_ord_id)
+        if ord_id_recupere:
+            log.warning(f"  ⚠️ Ordre RÉELLEMENT PASSÉ malgré l'exception réseau : "
+                        f"{inst_id} ordId={ord_id_recupere} (récupéré via clOrdId)")
+            return ord_id_recupere
+        return None
+
+async def okx_verifier_ordre_par_clordid(session, inst_id, cl_ord_id):
+    """Interroge OKX pour savoir si un ordre avec ce clOrdId a réellement été
+    traité, malgré une exception réseau côté client (timeout sur la réponse
+    par exemple). Retourne l'ordId si l'ordre existe et a été rempli/accepté,
+    sinon None. Évite de déclarer à tort un 'TRADE ANNULÉ' alors que
+    l'ordre est réellement passé côté OKX — la cause la plus concrète
+    identifiée pour expliquer un doublon de position sans double instance
+    ni bug de verrou."""
+    path  = "/api/v5/trade/order"
+    query = f"?instId={inst_id}&clOrdId={cl_ord_id}"
+    try:
+        async with session.get(
+            OKX_BASE_URL + path + query,
+            headers=_okx_headers("GET", path + query, ""),
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+            if data.get("code") != "0" or not data.get("data"):
+                return None
+            o = data["data"][0]
+            if o.get("state") in ("filled", "live", "partially_filled"):
+                return o.get("ordId")
+            return None
+    except Exception as e:
+        log.error(f"  [VÉRIF-CLORDID] Exception vérification {cl_ord_id} : {e}")
         return None
 
 async def okx_fermer_position(session, inst_id):
@@ -1199,18 +1280,28 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
         # stop n'est pas atteint, sinon on serait déjà sorti ci-dessus)
         if lock_actuel > 0 and pnl < lock_actuel:
             frais    = calc_frais(position)
-            gain_net = round(lock_actuel - frais["total"], 4)
-            log.info(f"\n  SORTIE LOCK [{symbole}] +{lock_actuel}€ (max={pnl_max_atteint:.2f}€) | {duree}min")
+            # On rapporte le PnL RÉEL du moment (pnl), pas le palier lock_actuel.
+            # Par construction, pnl < lock_actuel à cet instant précis (c'est la
+            # condition même du déclenchement) — rapporter lock_actuel comme
+            # "gain net" était donc SYSTÉMATIQUEMENT optimiste, pas juste du
+            # bruit de marché. Le palier reste la garantie plancher (le trade
+            # ne peut pas closer plus bas que ça côté logique), mais le
+            # résultat affiché doit refléter la réalité du moment, pas la
+            # garantie théorique.
+            gain_net = round(pnl - frais["total"], 4)
+            log.info(f"\n  SORTIE LOCK [{symbole}] pnl={pnl:.2f}€ (lock garanti={lock_actuel}€, "
+                     f"max={pnl_max_atteint:.2f}€) | {duree}min")
             await telegram(session,
                 f"🔒 <b>SORTIE LOCK</b>\n"
                 f"{symbole} | {direction}\n"
-                f"Gain brut verrouillé : +{lock_actuel}€\n"
+                f"Gain garanti (palier) : +{lock_actuel}€\n"
+                f"PnL réel au moment de la sortie : {'+' if pnl>=0 else ''}{pnl:.2f}€\n"
                 f"Frais (ouv+ferm) : -{frais['total']}€\n"
-                f"Gain net : +{gain_net}€\n"
+                f"Gain net : {'+' if gain_net>=0 else ''}{gain_net}€\n"
                 f"PnL max : +{pnl_max_atteint:.2f}€\n"
                 f"Durée : {duree} min"
             )
-            resultat_final = "GAGNE"
+            resultat_final = "GAGNE" if gain_net > 0 else "PERDU"
             gain_final     = gain_net
             break
 
@@ -1317,10 +1408,11 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
         etat_global["pnl_jour"]  = round(etat_global.get("pnl_jour", 0) + gain_final, 2)
 
         # Alerte perte cumulée — se déclenche une seule fois au franchissement
-        # du seuil, se réarme si le capital remonte au-dessus (pour pouvoir
-        # réalerter en cas de nouvelle chute plus tard)
+        # du seuil (en % du capital initial), se réarme si le capital remonte
+        # au-dessus (pour pouvoir réalerter en cas de nouvelle chute plus tard)
         alerte_perte_a_envoyer = False
-        if etat_global["capital"] <= CAPITAL_INITIAL - SEUIL_ALERTE_PERTE:
+        seuil_alerte_eur = round(CAPITAL_INITIAL * SEUIL_ALERTE_PERTE_PCT / 100, 2)
+        if etat_global["capital"] <= CAPITAL_INITIAL - seuil_alerte_eur:
             if not etat_global.get("alerte_perte_envoyee", False):
                 alerte_perte_a_envoyer = True
                 etat_global["alerte_perte_envoyee"] = True
@@ -1357,7 +1449,7 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
             f"Capital actuel : {etat_global['capital']}€\n"
             f"Capital de départ : {CAPITAL_INITIAL}€\n"
             f"Perte cumulée : {round(etat_global['capital'] - CAPITAL_INITIAL, 2)}€\n"
-            f"Seuil d'alerte (-{SEUIL_ALERTE_PERTE}€) franchi."
+            f"Seuil d'alerte (-{SEUIL_ALERTE_PERTE_PCT:.0f}% = -{seuil_alerte_eur}€) franchi."
         )
 
     enregistrer_trade({
@@ -1816,8 +1908,32 @@ def afficher_tableau_de_bord(etat):
 #  BOUCLE PRINCIPALE
 # ═══════════════════════════════════════════════════════════════
 async def boucle_principale():
-    global trades_lock
+    global trades_lock, CAPITAL_INITIAL, arret_demande
     trades_lock = asyncio.Lock()
+
+    # ── Arrêt propre (Graceful Shutdown) sur SIGTERM/SIGINT — Railway envoie
+    # SIGTERM lors d'un redéploiement ou d'un arrêt manuel. Sans gestion
+    # explicite, une tâche executer_trade en plein appel HTTP OKX pourrait
+    # être interrompue à mi-chemin (requête envoyée, réponse jamais
+    # traitée), créant la même ambiguïté qu'un timeout réseau — mais cette
+    # fois sans aucune chance de rattrapage. On se contente de LEVER un
+    # drapeau : la boucle de scan arrête d'ouvrir de NOUVEAUX trades, et on
+    # laisse les tâches déjà en cours se terminer naturellement (avec un
+    # délai raisonnable) avant de laisser le process s'arrêter.
+    def _gestionnaire_arret(signum, frame):
+        global arret_demande
+        if not arret_demande:
+            log.warning(f"  🛑 Signal d'arrêt reçu ({signum}) — arrêt de l'ouverture de nouveaux "
+                        f"trades, les trades en cours se terminent normalement...")
+            arret_demande = True
+
+    try:
+        signal.signal(signal.SIGTERM, _gestionnaire_arret)
+        signal.signal(signal.SIGINT, _gestionnaire_arret)
+    except (ValueError, OSError) as e:
+        # Peut échouer si on n'est pas dans le thread principal — non bloquant,
+        # le bot continue sans cette protection plutôt que de planter au démarrage.
+        log.warning(f"  ⚠️ Impossible d'enregistrer les gestionnaires de signal : {e}")
 
     init_database()
     etat = charger_etat()
@@ -1859,6 +1975,34 @@ async def boucle_principale():
     connector = aiohttp.TCPConnector(limit=50)
     async with aiohttp.ClientSession(connector=connector) as session:
 
+        # ── Récupération automatique du vrai capital OKX au démarrage —
+        # UNIQUEMENT lors d'un RESET_TOUT explicite en MODE_REEL (un vrai
+        # nouveau départ voulu). Sur un simple redémarrage normal, on garde
+        # le capital déjà suivi en base (déjà tenu à jour par la
+        # resynchronisation post-trade) plutôt que de le réécraser.
+        if MODE_REEL and RESET_TOUT:
+            log.info("  RESET_TOUT + MODE_REEL : récupération automatique du capital réel OKX...")
+            solde_reel_demarrage = await okx_recuperer_solde_reel(session, "USDC")
+            if solde_reel_demarrage is not None:
+                # Même garde-fou que la resynchronisation post-trade : rejette
+                # un solde qui s'écarte de plus de 50% de la dernière valeur
+                # connue (protection contre le solde démo par défaut ~100 000
+                # USDC sans rapport avec les fonds réellement alloués).
+                ecart_relatif = abs(solde_reel_demarrage - CAPITAL_INITIAL) / CAPITAL_INITIAL if CAPITAL_INITIAL > 0 else 0
+                if ecart_relatif > 0.5:
+                    log.error(f"  ⚠️ Solde OKX invraisemblable au démarrage rejeté : "
+                              f"{solde_reel_demarrage:.2f} USDC vs référence {CAPITAL_INITIAL}€ "
+                              f"(écart {ecart_relatif*100:.0f}%) — valeur codée en dur conservée")
+                else:
+                    CAPITAL_INITIAL = round(solde_reel_demarrage, 2)
+                    etat["capital"] = CAPITAL_INITIAL
+                    sauvegarder_etat(etat)
+                    log.info(f"  ✅ Capital initial fixé automatiquement sur le vrai solde OKX : "
+                             f"{CAPITAL_INITIAL} USDC")
+            else:
+                log.warning("  ⚠️ Impossible de récupérer le vrai solde OKX au démarrage — "
+                            "valeur codée en dur conservée")
+
         # ── Chargement initial des marchés x10 depuis l'API OKX
         log.info("  Chargement des marchés x10 depuis l'API OKX...")
         await charger_marches_x10(session)
@@ -1890,6 +2034,36 @@ async def boucle_principale():
         # simulation pure (MODE_REEL=0).
         await filtrer_marches_selon_compte(session)
 
+        # ── Synchronisation trades_ouverts avec les vraies positions OKX —
+        # protège contre un redémarrage 'amnésique' qui tenterait de rouvrir
+        # un marché déjà en position réelle. Attention : ces positions
+        # retrouvées n'ont PAS de tâche de surveillance stop/lock active
+        # (celle-ci tournait dans le process précédent, tuée au redémarrage)
+        # — elles sont juste protégées contre une double ouverture, pas
+        # activement suivies. Alerte explicite pour que ce soit visible.
+        if MODE_REEL:
+            instids_ouverts = await okx_lister_toutes_positions_ouvertes(session)
+            if instids_ouverts:
+                reverse_map = {v: k for k, v in OKX_SYMBOLS_EXEC.items()}
+                symboles_orphelins = []
+                for inst_id_ouvert in instids_ouverts:
+                    symb = reverse_map.get(inst_id_ouvert)
+                    if symb:
+                        trades_ouverts[symb] = True
+                        symboles_orphelins.append(symb)
+                if symboles_orphelins:
+                    log.warning(f"  ⚠️ Positions réelles déjà ouvertes détectées au démarrage : "
+                                f"{symboles_orphelins} — protégées contre un doublon, mais SANS "
+                                f"surveillance stop/lock active (à vérifier manuellement sur OKX).")
+                    await telegram(session,
+                        f"⚠️ <b>POSITIONS ORPHELINES DÉTECTÉES AU DÉMARRAGE</b>\n"
+                        f"Marchés concernés : {', '.join(symboles_orphelins)}\n"
+                        f"Ces positions existent réellement sur OKX (probablement ouvertes avant "
+                        f"un redémarrage) mais n'ont plus de suivi stop/lock actif dans ce process.\n"
+                        f"Elles sont protégées contre une double ouverture, mais vérifie-les "
+                        f"manuellement sur OKX — aucun stop automatique ne les surveille pour l'instant."
+                    )
+
         await telegram(session,
             (f"🔄 <b>RESET COMPLET EFFECTUÉ</b>\nCapital, PnL, compteurs et historique remis à zéro.\n\n" if RESET_TOUT else "")
             + f"🚀 <b>BOT DÉMARRÉ</b>\n"
@@ -1914,6 +2088,10 @@ async def boucle_principale():
 
         while True:
             try:
+                if arret_demande and not taches_trades_actives:
+                    log.info("  ✅ Arrêt propre : plus aucun trade en cours, fermeture du bot.")
+                    break
+
                 if reset_pnl_jour_si_nouveau_jour(etat):
                     sauvegarder_etat(etat)
 
@@ -2013,6 +2191,11 @@ async def boucle_principale():
                     reverse=True
                 )[:slots_libres]
 
+                if arret_demande:
+                    log.info("  Arrêt demandé — aucun nouveau trade ne sera ouvert.")
+                    await asyncio.sleep(PAUSE_SCAN)
+                    continue
+
                 for symbole, sig in meilleurs:
                     async with trades_lock:
                         if symbole in trades_ouverts:
@@ -2024,13 +2207,15 @@ async def boucle_principale():
                     log.info(f"  {symbole} ({sig['direction']}) "
                              f"Variation={sig['details'].get('variation_pct', 0):.2f}%")
 
-                    asyncio.create_task(
+                    tache = asyncio.create_task(
                         executer_trade(
                             session, symbole, sig["direction"],
                             etat["capital"],
                             sig["details"], etat
                         )
                     )
+                    taches_trades_actives.add(tache)
+                    tache.add_done_callback(taches_trades_actives.discard)
 
                 await asyncio.sleep(PAUSE_SCAN)
 
