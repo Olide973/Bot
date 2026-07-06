@@ -434,6 +434,36 @@ async def okx_definir_levier(session, inst_id, levier):
         log.error(f"  ❌ Exception set-leverage {inst_id} : {e}")
         return False
 
+async def okx_recuperer_position_reelle(session, inst_id):
+    """Interroge /api/v5/account/positions-history pour récupérer le résultat
+    RÉEL (PnL réalisé et frais) de la dernière position fermée sur cet
+    instrument. Sert à comparer directement, dans le rapport Telegram, ce
+    que le bot calcule en interne vs ce qu'OKX a réellement enregistré —
+    pour repérer immédiatement tout écart sans avoir à aller chercher
+    manuellement dans l'app OKX à chaque fois."""
+    path  = "/api/v5/account/positions-history"
+    query = f"?instId={inst_id}&limit=1"
+    try:
+        async with session.get(
+            OKX_BASE_URL + path + query,
+            headers=_okx_headers("GET", path + query, ""),
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+            if data.get("code") != "0" or not data.get("data"):
+                log.warning(f"  [VÉRIF-RÉELLE] Aucune position-history pour {inst_id} : {data}")
+                return None
+            p = data["data"][0]
+            return {
+                "pnl":      float(p.get("pnl", 0) or 0),
+                "fee":      float(p.get("fee", 0) or 0),
+                "open_px":  p.get("openAvgPx"),
+                "close_px": p.get("closeAvgPx"),
+            }
+    except Exception as e:
+        log.error(f"  [VÉRIF-RÉELLE] Exception position-history {inst_id} : {e}")
+        return None
+
 async def okx_recuperer_solde_reel(session, ccy="USDC"):
     """Récupère l'équité RÉELLE du compte OKX pour la devise donnée
     (par défaut USDC, la devise de marge de tous les contrats X-Perp
@@ -1159,6 +1189,7 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
     # gain_final) sert de solution de secours seulement si cette lecture
     # échoue (ex: coupure réseau), jamais comme source principale.
     solde_reel = None
+    verif_reelle = None
     if MODE_REEL:
         await asyncio.sleep(1)  # laisse le temps à OKX de refléter la fermeture
         solde_reel = await okx_recuperer_solde_reel(session, "USDC")
@@ -1167,6 +1198,13 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
                      f"(vs calcul interne : {round(etat_global['capital'] + gain_final, 2)}€)")
         else:
             log.warning(f"  [SOLDE-RÉEL] Échec de lecture — repli sur le calcul interne pour ce trade")
+
+        if inst_id:
+            verif_reelle = await okx_recuperer_position_reelle(session, inst_id)
+            if verif_reelle:
+                net_reel = round(verif_reelle["pnl"] - abs(verif_reelle["fee"]), 4)
+                log.info(f"  [VÉRIF-RÉELLE] {symbole} — OKX: pnl={verif_reelle['pnl']} "
+                         f"frais={verif_reelle['fee']} net={net_reel} | Bot interne: {gain_final}")
 
     # ── Libérer le marché + mise à jour état global dans un seul lock
     async with trades_lock:
@@ -1247,6 +1285,23 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
     })
     sauvegarder_etat(etat_global)
     afficher_tableau_de_bord(etat_global)
+
+    # Vérification réelle OKX vs calcul interne — copiable/envoyable tel quel
+    if verif_reelle is not None:
+        net_reel  = round(verif_reelle["pnl"] - abs(verif_reelle["fee"]), 4)
+        ecart     = round(net_reel - gain_final, 4)
+        flag      = "✅ Cohérent" if abs(ecart) < 0.05 else "⚠️ ÉCART DÉTECTÉ"
+        msg_verif = (
+            f"🔍 <b>VÉRIFICATION RÉELLE OKX</b> — {symbole}\n"
+            f"PnL réel OKX : {verif_reelle['pnl']:+.4f} USDC\n"
+            f"Frais réels OKX : -{abs(verif_reelle['fee']):.4f} USDC\n"
+            f"Net réel OKX : {net_reel:+.4f} USDC\n"
+            f"Calcul interne bot : {gain_final:+.4f}€\n"
+            f"Écart : {ecart:+.4f} — {flag}"
+        )
+        if solde_reel is not None:
+            msg_verif += f"\nSolde compte réel : {solde_reel:.2f} USDC"
+        await telegram(session, msg_verif)
 
     # Rapport Telegram après chaque trade
     nb_trades_total = etat_global.get("nb_trades", 0)
