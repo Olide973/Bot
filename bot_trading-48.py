@@ -1478,7 +1478,13 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
         if MODE_REEL and inst_id:
             prix_actuel = await get_prix_reel_instid(session, inst_id)
             if prix_actuel is None:
-                prix_actuel = await get_prix_actuel(session, symbole)  # repli si REST indisponible
+                # Repli — LOGGÉ explicitement : sans cette ligne, impossible
+                # de savoir a posteriori si le prix utilisé pour une
+                # décision stop/lock venait du contrat réel (REST) ou du
+                # flux public (repli) à un instant donné.
+                log.warning(f"  ⚠️ [PRIX-REPLI] {symbole} : get_prix_reel_instid indisponible, "
+                            f"repli sur le prix du flux public pour ce tick.")
+                prix_actuel = await get_prix_actuel(session, symbole)
         else:
             prix_actuel = await get_prix_actuel(session, symbole)
         if prix_actuel is None:
