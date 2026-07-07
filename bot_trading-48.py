@@ -1322,8 +1322,9 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
         # c'est le cas, la position réelle et le WebSocket de prix suivent
         # DEUX contrats différents — alerte immédiate, même si la boucle de
         # surveillance interroge désormais toujours inst_id directement
-        # (voir get_prix_reel_instid) et n'est donc plus affectée par cet
-        # écart, quel qu'il soit.
+        # (protection réelle : stop natif OKX + vérification upl avant tout
+        # LOCK, toutes deux confirmées fonctionnelles) et n'est donc plus
+        # affectée par cet écart, quel qu'il soit.
         inst_id_feed = OKX_SYMBOLS.get(symbole)
         if inst_id_feed and inst_id_feed != inst_id:
             log.error(f"  🚨 [INCOHÉRENCE INSTID] {symbole} : feed={inst_id_feed} "
@@ -1334,8 +1335,10 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
                 f"{symbole} : le contrat de prix (WebSocket) et le contrat d'exécution "
                 f"(position réelle) sont DIFFÉRENTS.\n"
                 f"Feed : {inst_id_feed}\nExécution : {inst_id}\n"
-                f"La surveillance de ce trade utilisera le prix du contrat réellement "
-                f"détenu (sécurisé), mais ceci mérite une vérification manuelle."
+                f"La surveillance continue sur le prix du flux public (seule source "
+                f"fonctionnelle pour les données de marché) — protégée par le stop natif "
+                f"OKX (posé sur le vrai contrat) et la vérification du PnL réel avant tout "
+                f"LOCK. Pas d'action requise, juste une confirmation."
             )
 
         taille_contrats = round(position / (prix_entree * ct_val), 0)
@@ -1852,21 +1855,23 @@ async def reprendre_surveillance_position_orpheline(session, symbole, inst_id, e
     laisser ouverte et sans filet indéfiniment."""
     # ── Vérification de cohérence instId feed vs exécution — même garde-fou
     # qu'à l'ouverture normale (executer_trade). Une position orpheline
-    # utilise déjà get_prix_reel_instid (ancré sur inst_id) via
-    # surveiller_et_fermer_trade, donc cette incohérence ne l'affecte pas
-    # fonctionnellement — mais l'alerte manquait ici pour la visibilité :
-    # confirmé en conditions réelles que ce catalogue diverge (ex: ETHUSD
-    # feed=...-310404 vs exécution=...-310328 le 07/07 à 03:51).
+    # utilise le prix du flux public (seule source fonctionnelle pour les
+    # données de marché — voir surveiller_et_fermer_trade), protégée par le
+    # stop natif OKX et la vérification upl avant tout LOCK. Alerte gardée
+    # pour la visibilité : confirmé en conditions réelles que ce catalogue
+    # diverge (ex: ETHUSD feed=...-310404 vs exécution=...-310328 le 07/07
+    # à 03:51).
     inst_id_feed = OKX_SYMBOLS.get(symbole)
     if inst_id_feed and inst_id_feed != inst_id:
         log.error(f"  🚨 [INCOHÉRENCE INSTID] {symbole} (reprise orpheline) : "
                   f"feed={inst_id_feed} vs exécution={inst_id} — DIFFÉRENTS. "
-                  f"Sans impact fonctionnel ici (get_prix_reel_instid ancré sur "
-                  f"l'exécution), mais confirme la divergence des catalogues OKX.")
+                  f"Surveillance sur le flux public, protégée par le stop natif "
+                  f"et la vérification upl — confirme la divergence des catalogues OKX.")
         await telegram(session,
             f"🚨 <b>INCOHÉRENCE INSTID</b> (position reprise)\n"
             f"{symbole} : feed={inst_id_feed} vs exécution={inst_id}.\n"
-            f"Sans risque pour ce trade (prix ancré sur le bon contrat), simple confirmation."
+            f"Surveillance sur le flux public — protégée par le stop natif OKX et la "
+            f"vérification du PnL réel avant tout LOCK. Pas d'action requise."
         )
 
     path  = "/api/v5/account/positions"
