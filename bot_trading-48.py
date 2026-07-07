@@ -73,11 +73,21 @@ SEUIL_RUINE             = 300.0
 SEUIL_CAPITAL_BTC       = 6000.0  # capital mini pour que BTCUSD soit inclus dans le scan — sous ce seuil, 1 seul contrat BTC (ctVal=1 ≈ 1 BTC) coûte plus cher que toute la position ; BTC est retiré des marchés actifs jusqu'à ce que le capital dépasse ce seuil
 
 # ── Lock profits par paliers proportionnels au capital
-# Premier palier : 0.18% ≈ 0.98€ à 543.65€ (capital actuel) — s'ajustera
-# automatiquement si le capital change, puisque exprimé en % et non en €
-# fixes.
+# Palier 0.16% ≈ 0.87€ à 543.65€ — calibré pour couvrir les frais totaux
+# (0.10% du capital, fixes et connus) PLUS une marge de glissement
+# d'exécution (~0.06%, estimée à partir du glissement observé en réel sur
+# cette nuit — ex: ouverture visée à 1807.07, exécutée à 1808.73 sur
+# ETHUSD, soit ~0.09% ; deux exécutions au marché par trade — ouverture et
+# fermeture — d'où la marge). Ce n'est PAS une garantie exacte (le
+# glissement varie selon la volatilité du moment), juste une marge
+# raisonnée plutôt qu'un seuil pile sur les frais théoriques. Un seul
+# palier ajouté ici, pas plusieurs : un trade qui l'atteint puis se
+# retourne sort proche de l'équilibre réel (frais + glissement absorbés)
+# au lieu de redonner tout jusqu'au stop complet. Premier palier
+# "officiel" (gain net réel) : 0.18% ≈ 0.98€, inchangé, ainsi que tous les
+# paliers suivants — un trade qui continue de monter n'est jamais plafonné.
 LOCK_PALIERS_PCT = [
-    0.18, 0.22, 0.30, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
+    0.16, 0.18, 0.22, 0.30, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
     1.80, 2.20, 2.60, 3.20, 3.80, 4.60, 5.50, 6.50, 7.50, 9.00,
     10.00, 12.50, 15.00, 17.50, 20.00, 25.00, 30.00, 45.00, 60.00,
 ]
@@ -881,7 +891,14 @@ async def telegram(session, message):
 #  DONNÉES MARCHÉ — OKX
 # ═══════════════════════════════════════════════════════════════
 async def get_klines(session, symbole, interval=15, limite=50):
-    okx_symbol = OKX_SYMBOLS.get(symbole, symbole)
+    # Priorité au catalogue d'EXÉCUTION (compte réel) — c'est sur CET
+    # instrument que le trade sera réellement passé. Le catalogue public
+    # (OKX_SYMBOLS) n'est qu'un repli pour les marchés dont l'instId compte
+    # n'est pas encore résolu (rare, avant le premier filtrage). Sans ça, le
+    # RSI et le volume — donc le SIGNAL lui-même — pouvaient être calculés
+    # sur un contrat différent de celui réellement tradé (confirmé le
+    # 07/07 : mêmes bases, instId feed vs exécution différents).
+    okx_symbol = OKX_SYMBOLS_EXEC.get(symbole) or OKX_SYMBOLS.get(symbole, symbole)
     bar = {15: "15m", 60: "1H"}.get(interval, "15m")
     try:
         async with session.get(
@@ -911,8 +928,9 @@ async def get_klines(session, symbole, interval=15, limite=50):
 
 async def get_prix_rest(session, symbole):
     """Prix via l'API REST OKX (fallback tant que le WebSocket n'a pas encore
-    poussé de tick, ou si le cache est périmé)."""
-    okx_symbol = OKX_SYMBOLS.get(symbole, symbole)
+    poussé de tick, ou si le cache est périmé). Même priorité EXEC>feed que
+    get_klines — voir son commentaire pour la raison."""
+    okx_symbol = OKX_SYMBOLS_EXEC.get(symbole) or OKX_SYMBOLS.get(symbole, symbole)
     try:
         async with session.get(
             "https://www.okx.com/api/v5/market/ticker",
@@ -1028,7 +1046,14 @@ async def websocket_prix(session):
         if not MARCHES:
             await asyncio.sleep(5)
             continue
-        args = [{"channel": "tickers", "instId": OKX_SYMBOLS[m]} for m in MARCHES if m in OKX_SYMBOLS]
+        # Même priorité EXEC>feed que get_klines/get_prix_rest — le
+        # WebSocket doit pousser les ticks du contrat réellement tradé, pas
+        # du catalogue public qui peut diverger (confirmé en conditions
+        # réelles le 07/07).
+        args = [
+            {"channel": "tickers", "instId": OKX_SYMBOLS_EXEC.get(m) or OKX_SYMBOLS.get(m)}
+            for m in MARCHES if OKX_SYMBOLS_EXEC.get(m) or OKX_SYMBOLS.get(m)
+        ]
         try:
             async with session.ws_connect(url, heartbeat=25) as ws:
                 WS_CONNEXION_ACTIVE = ws
@@ -1051,10 +1076,21 @@ async def websocket_prix(session):
                         if "data" in data and "arg" in data:
                             inst_id = data["arg"].get("instId")
                             symbole = None
-                            for s, i in OKX_SYMBOLS.items():
+                            # Cherche d'abord dans le catalogue d'exécution
+                            # (celui utilisé pour l'abonnement désormais),
+                            # puis dans le catalogue public en repli — sans
+                            # ça, les ticks reçus avec un instId d'exécution
+                            # ne matchaient plus rien dans OKX_SYMBOLS seul,
+                            # et étaient silencieusement ignorés.
+                            for s, i in OKX_SYMBOLS_EXEC.items():
                                 if i == inst_id:
                                     symbole = s
                                     break
+                            if symbole is None:
+                                for s, i in OKX_SYMBOLS.items():
+                                    if i == inst_id:
+                                        symbole = s
+                                        break
                             ticks = data.get("data", [])
                             if symbole and ticks:
                                 try:
