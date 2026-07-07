@@ -669,6 +669,46 @@ async def okx_position_existe_deja(session, inst_id, contexte="anti-doublon"):
         log.error(f"  [{contexte.upper()}] Exception vérification position {inst_id} : {e}")
         return None
 
+async def okx_algo_order_est_actif(session, inst_id, algo_id):
+    """Vérifie que l'ordre algo (stop fixe OU trailing) est bien encore VIVANT
+    côté OKX — GET /api/v5/trade/orders-algo-pending (confirmé via la doc
+    officielle : 'Retrieve a list of untriggered Algo orders'). Angle mort
+    identifié le 07/07 (soir 2) : jusqu'ici, le bot vérifiait seulement si la
+    POSITION existait encore (okx_position_existe_deja), jamais si l'ordre de
+    PROTECTION lui-même était toujours actif. Si cet ordre disparaissait
+    silencieusement côté OKX (annulation, expiration, rejet après coup —
+    comportement possible sur l'environnement démo) SANS que la position ne
+    se ferme, le bot continuait de suivre les paliers normalement (son
+    propre calcul de PnL reste indépendant) tout en n'ayant PLUS AUCUNE
+    protection réelle — jusqu'à ce que le prix s'effondre sans qu'aucun stop
+    ne se déclenche. Exactement le symptôme rapporté : paliers 1, 2, 3
+    franchis normalement puis chute brutale en négatif, sans fermeture.
+    Retourne True si l'ordre est bien dans la liste des ordres en attente,
+    False s'il n'y est plus (danger : protection disparue), None si la
+    vérification a échoué (repli : ne pas déclencher une fausse alerte sur
+    un simple aléa réseau)."""
+    if not algo_id:
+        return None
+    path  = "/api/v5/trade/orders-algo-pending"
+    query = f"?instId={inst_id}&algoId={algo_id}"
+    try:
+        async with session.get(
+            OKX_BASE_URL + path + query,
+            headers=_okx_headers("GET", path + query, ""),
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+            if data.get("code") != "0":
+                log.error(f"  [ALGO-VIVANT] Erreur lecture ordres pendants {inst_id} : {data}")
+                return None
+            for o in data.get("data", []):
+                if o.get("algoId") == algo_id:
+                    return True
+            return False
+    except Exception as e:
+        log.error(f"  [ALGO-VIVANT] Exception vérification {inst_id} algoId={algo_id} : {e}")
+        return None
+
 async def okx_lister_toutes_positions_ouvertes(session):
     """Interroge /api/v5/account/positions SANS filtre d'instrument, pour
     lister TOUTES les positions réellement ouvertes sur le compte. Sert à
@@ -1689,6 +1729,10 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                                      # (bruit de prix normal) déclenchait ce check à CHAQUE tick de
                                      # 1s — spam de logs + risque réel de dépasser le rate limit
                                      # OKX (10 req/2s par compte, confirmé via la doc officielle).
+    dernier_check_algo_vivant = 0.0  # 07/07 (relecture 2) — throttling du nouveau check
+                                       # "l'ordre de protection est-il encore vivant chez OKX ?"
+                                       # (voir okx_algo_order_est_actif) — même fréquence que les
+                                       # autres checks, pour rester sous le rate limit.
 
     # ── Boucle de surveillance — jusqu'au stop, au lock, ou 6h max
     while True:
@@ -1750,7 +1794,54 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
         if pnl > pnl_max_atteint:
             pnl_max_atteint = pnl
 
-        # Lock paliers
+        # ── GARDE-FOU CRITIQUE (07/07, relecture complète #2) — vérifier que
+        # la protection native (fixe ou trailing) est encore VIVANTE chez
+        # OKX, pas seulement que la position existe encore. Angle mort
+        # identifié : si l'ordre de protection disparaissait silencieusement
+        # côté OKX (annulation/expiration/rejet après coup, plausible en
+        # démo) SANS fermer la position, le bot continuait de suivre les
+        # paliers normalement (son propre calcul de PnL est indépendant) en
+        # croyant être protégé — jusqu'à un effondrement de prix qu'aucun
+        # stop ne rattrapait plus. Exactement le symptôme rapporté : paliers
+        # 1, 2, 3 franchis puis chute brutale en négatif, sans fermeture.
+        # PRIORITÉ ABSOLUE : vérifié avant toute autre logique stop/lock.
+        if MODE_REEL and inst_id and algo_id:
+            maintenant_algo = time.time()
+            if maintenant_algo - dernier_check_algo_vivant >= INTERVALLE_CHECK_UPL_SEC:
+                dernier_check_algo_vivant = maintenant_algo
+                algo_vivant = await okx_algo_order_est_actif(session, inst_id, algo_id)
+                if algo_vivant is False:
+                    # Ordre introuvable dans les ordres en attente : soit il
+                    # a déclenché (position fermée), soit il a disparu sans
+                    # fermer (danger). On distingue les deux cas.
+                    position_encore_ouverte = await okx_position_existe_deja(
+                        session, inst_id, contexte="trailing"
+                    )
+                    if position_encore_ouverte is True:
+                        log.error(f"  🚨 [ALGO-VIVANT] {symbole} : la protection native "
+                                  f"(algoId={algo_id}, type={algo_type}) a DISPARU sans "
+                                  f"fermer la position — fermeture de sécurité immédiate.")
+                        await telegram(session,
+                            f"🚨 <b>ALERTE — PROTECTION DISPARUE</b>\n"
+                            f"{symbole} : l'ordre de protection natif OKX n'existe plus, "
+                            f"mais la position est toujours ouverte.\n"
+                            f"Fermeture de sécurité immédiate au PnL connu actuel "
+                            f"({'+' if pnl>=0 else ''}{pnl:.2f}€) plutôt que de rester "
+                            f"exposé sans aucune protection."
+                        )
+                        frais   = calc_frais(position)
+                        pnl_net = round(pnl - frais["total"], 4)
+                        resultat_final = "GAGNE" if pnl_net > 0 else "PERDU"
+                        gain_final     = pnl_net
+                        algo_id        = None  # déjà disparu, rien à annuler plus bas
+                        break
+                    # Sinon : position_encore_ouverte est False (fermée
+                    # normalement par la protection avant de disparaître de
+                    # la liste) ou None (échec réseau) — rien à faire ici,
+                    # les branches stop/lock plus bas gèrent déjà la
+                    # fermeture normale via leur propre détection.
+
+
         nouveau_lock = get_palier_lock(pnl_max_atteint, capital)
         if nouveau_lock > lock_actuel:
             etait_zero_avant = (lock_actuel == 0.0)  # vrai seulement au tout premier palier franchi
