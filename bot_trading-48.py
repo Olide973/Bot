@@ -67,9 +67,11 @@ SEUIL_RUINE             = 300.0
 SEUIL_CAPITAL_BTC       = 6000.0  # capital mini pour que BTCUSD soit inclus dans le scan — sous ce seuil, 1 seul contrat BTC (ctVal=1 ≈ 1 BTC) coûte plus cher que toute la position ; BTC est retiré des marchés actifs jusqu'à ce que le capital dépasse ce seuil
 
 # ── Lock profits par paliers proportionnels au capital
-# Premier palier : 0.20% = 1.00€ à 500€
+# Premier palier : 0.18% ≈ 0.98€ à 543.65€ (capital actuel) — s'ajustera
+# automatiquement si le capital change, puisque exprimé en % et non en €
+# fixes.
 LOCK_PALIERS_PCT = [
-    0.20, 0.22, 0.30, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
+    0.18, 0.22, 0.30, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
     1.80, 2.20, 2.60, 3.20, 3.80, 4.60, 5.50, 6.50, 7.50, 9.00,
     10.00, 12.50, 15.00, 17.50, 20.00, 25.00, 30.00, 45.00, 60.00,
 ]
@@ -633,7 +635,7 @@ async def okx_lister_toutes_positions_ouvertes(session):
         log.error(f"  [SYNC-DÉMARRAGE] Exception lecture positions ouvertes : {e}")
         return []
 
-
+async def okx_diag_position(session, inst_id):
     """[DIAGNOSTIC UNIQUEMENT] Interroge /api/v5/account/positions pour voir
     si OKX considère qu'une position existe réellement sur cet instrument,
     juste avant une tentative de fermeture — but : confirmer si l'erreur
