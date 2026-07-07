@@ -55,6 +55,12 @@ SEUIL_MOUVEMENT_PCT     = 0.50   # dès que le prix bouge de 0.50% → signal
 VOLUME_MINI             = 0.25   # volume min vs moyenne 24h
 STOP_LOSS_PCT           = 0.006  # stop = 0.6% du prix d'entrée (≈ -4€ au capital/mise actuels) — évolue avec la taille de position, contrairement à un stop fixe en €
 DUREE_MAX_MINUTES       = 360    # 6h — fermeture forcée si ni stop ni lock atteint avant
+TOLERANCE_LOCK_UPL_EUR  = 0.10   # tolérance sur la vérification du PnL réel OKX avant une
+                                  # sortie LOCK — absorbe le bruit de sync normal entre le
+                                  # tick WebSocket et l'API positions (quelques ms d'écart),
+                                  # bien en-deçà des frais type d'un trade (~0.54€). Ne bloque
+                                  # que les écarts réellement significatifs (le problème
+                                  # observé était de l'ordre de -14€ à -27€, pas de -0.05€).
 
 # ── Filtre RSI 1h
 RSI_SEUIL_BAS           = 45     # RSI < 45 → marché baissier → inverser ACHAT en VENTE
@@ -940,6 +946,62 @@ async def get_prix_actuel(session, symbole):
         return prix_rest
     return prix_ws  # REST a échoué mais on a quand même un prix WS (même périmé) → mieux que rien
 
+async def okx_pnl_reel_upl(session, inst_id):
+    """Interroge /api/v5/account/positions pour lire le PnL non réalisé (upl)
+    tel que calculé par OKX LUI-MÊME — utilisé comme garde-fou de
+    confirmation avant de déclarer une SORTIE LOCK (jamais pour un STOP, déjà
+    backé par le stop natif OKX qui, lui, se déclenche côté serveur sur la
+    base du vrai prix, indépendamment de tout calcul interne).
+    Retourne le upl en USDC (traité comme équivalent €, comme partout
+    ailleurs dans ce fichier — pas de conversion FX explicite), ou None si
+    indisponible. None doit être traité par l'appelant comme 'impossible à
+    confirmer', pas comme une confirmation positive ou négative."""
+    path  = "/api/v5/account/positions"
+    query = f"?instId={inst_id}"
+    try:
+        async with session.get(
+            OKX_BASE_URL + path + query,
+            headers=_okx_headers("GET", path + query, ""),
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+            if data.get("code") != "0" or not data.get("data"):
+                return None
+            return float(data["data"][0].get("upl", 0) or 0)
+    except Exception as e:
+        log.error(f"  [PNL-RÉEL] Exception lecture upl {inst_id} : {e}")
+        return None
+
+async def get_prix_reel_instid(session, inst_id):
+    """Prix REST directement ancré sur l'instId RÉELLEMENT détenu (celui de
+    OKX_SYMBOLS_EXEC), sans passer par le dictionnaire symbole→instId de
+    price-feed (OKX_SYMBOLS). Existe pour une raison précise : OKX_SYMBOLS
+    (catalogue PUBLIC, utilisé pour le WebSocket) et OKX_SYMBOLS_EXEC
+    (catalogue scopé au COMPTE, utilisé pour la position réelle) sont
+    résolus séparément et JAMAIS comparés — si OKX renvoie un instId
+    différent entre les deux catalogues pour la même base (cas documenté :
+    les comptes sont classés en catégories régionales avec des résultats
+    parfois différents), le bot pourrait suivre le prix d'un contrat tout
+    en détenant réellement une position sur un autre, avec un écart de prix
+    non détecté. Utilisée pour la surveillance d'une position déjà ouverte,
+    où la garantie de regarder le bon contrat prime sur la latence."""
+    try:
+        async with session.get(
+            "https://www.okx.com/api/v5/market/ticker",
+            params={"instId": inst_id},
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+            if data.get("code") != "0":
+                return None
+            result = data.get("data", [])
+            if not result:
+                return None
+            return float(result[0]["last"])
+    except Exception as e:
+        log.error(f"Erreur prix REST (instId réel) {inst_id} : {e}")
+        return None
+
 async def _ws_keepalive(ws):
     """Envoie un 'ping' applicatif toutes les 20s — requis par OKX pour garder
     la connexion WebSocket ouverte (sinon fermeture après ~30s d'inactivité)."""
@@ -1222,6 +1284,28 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
                 trades_ouverts.pop(symbole, None)
             return
 
+        # ── Vérification de cohérence instId feed vs exécution — les deux
+        # catalogues (public pour le prix, scopé compte pour l'exécution)
+        # sont résolus séparément et pourraient théoriquement diverger. Si
+        # c'est le cas, la position réelle et le WebSocket de prix suivent
+        # DEUX contrats différents — alerte immédiate, même si la boucle de
+        # surveillance interroge désormais toujours inst_id directement
+        # (voir get_prix_reel_instid) et n'est donc plus affectée par cet
+        # écart, quel qu'il soit.
+        inst_id_feed = OKX_SYMBOLS.get(symbole)
+        if inst_id_feed and inst_id_feed != inst_id:
+            log.error(f"  🚨 [INCOHÉRENCE INSTID] {symbole} : feed={inst_id_feed} "
+                      f"vs exécution={inst_id} — DIFFÉRENTS. La position réelle et le "
+                      f"prix suivi par WebSocket ne portent pas sur le même contrat.")
+            await telegram(session,
+                f"🚨 <b>ALERTE — INCOHÉRENCE INSTID</b>\n"
+                f"{symbole} : le contrat de prix (WebSocket) et le contrat d'exécution "
+                f"(position réelle) sont DIFFÉRENTS.\n"
+                f"Feed : {inst_id_feed}\nExécution : {inst_id}\n"
+                f"La surveillance de ce trade utilisera le prix du contrat réellement "
+                f"détenu (sécurisé), mais ceci mérite une vérification manuelle."
+            )
+
         taille_contrats = round(position / (prix_entree * ct_val), 0)
         if taille_contrats < 1:
             log.error(f"  ❌ MODE_REEL actif mais taille calculée < 1 contrat pour {symbole} — trade annulé")
@@ -1354,7 +1438,17 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
     while True:
         await asyncio.sleep(CHECK_INTERVAL)
 
-        prix_actuel = await get_prix_actuel(session, symbole)
+        # Priorité au prix ancré sur l'instId RÉELLEMENT détenu (MODE_REEL) —
+        # garantit qu'on surveille exactement le contrat sur lequel la
+        # position existe, et non celui que le dictionnaire de price-feed
+        # symbole→instId pourrait pointer par erreur. En simulation pure
+        # (inst_id absent), on garde l'ancienne méthode (cache WebSocket).
+        if MODE_REEL and inst_id:
+            prix_actuel = await get_prix_reel_instid(session, inst_id)
+            if prix_actuel is None:
+                prix_actuel = await get_prix_actuel(session, symbole)  # repli si REST indisponible
+        else:
+            prix_actuel = await get_prix_actuel(session, symbole)
         if prix_actuel is None:
             continue
 
@@ -1421,31 +1515,61 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
         # Sortie lock : PnL redescend sous le palier verrouillé (mais le
         # stop n'est pas atteint, sinon on serait déjà sorti ci-dessus)
         if lock_actuel > 0 and pnl < lock_actuel:
-            frais    = calc_frais(position)
-            # On rapporte le PnL RÉEL du moment (pnl), pas le palier lock_actuel.
-            # Par construction, pnl < lock_actuel à cet instant précis (c'est la
-            # condition même du déclenchement) — rapporter lock_actuel comme
-            # "gain net" était donc SYSTÉMATIQUEMENT optimiste, pas juste du
-            # bruit de marché. Le palier reste la garantie plancher (le trade
-            # ne peut pas closer plus bas que ça côté logique), mais le
-            # résultat affiché doit refléter la réalité du moment, pas la
-            # garantie théorique.
-            gain_net = round(pnl - frais["total"], 4)
-            log.info(f"\n  SORTIE LOCK [{symbole}] pnl={pnl:.2f}€ (lock garanti={lock_actuel}€, "
-                     f"max={pnl_max_atteint:.2f}€) | {duree}min")
-            await telegram(session,
-                f"🔒 <b>SORTIE LOCK</b>\n"
-                f"{symbole} | {direction}\n"
-                f"Gain garanti (palier) : +{lock_actuel}€\n"
-                f"PnL réel au moment de la sortie : {'+' if pnl>=0 else ''}{pnl:.2f}€\n"
-                f"Frais (ouv+ferm) : -{frais['total']}€\n"
-                f"Gain net : {'+' if gain_net>=0 else ''}{gain_net}€\n"
-                f"PnL max : +{pnl_max_atteint:.2f}€\n"
-                f"Durée : {duree} min"
-            )
-            resultat_final = "GAGNE" if gain_net > 0 else "PERDU"
-            gain_final     = gain_net
-            break
+            # ── Garde-fou de confirmation — AVANT toute déclaration de
+            # succès : contrairement au STOP (backé par le stop natif OKX,
+            # qui se déclenche côté serveur sur le vrai prix), une sortie
+            # LOCK est une décision purement interne du bot, sans filet
+            # équivalent côté OKX. On vérifie donc le PnL RÉEL (upl) auprès
+            # d'OKX avant de fermer "en pensant gagner" — si OKX indique un
+            # PnL réel négatif, on annule cette sortie : le prix interne
+            # est probablement désynchronisé, et fermer maintenant
+            # figerait une perte réelle sous une étiquette de gain. Le stop
+            # natif OKX reste actif entre-temps (on ne l'annule pas ici).
+            # Si la vérification est indisponible (None), on ne bloque pas
+            # indéfiniment une sortie par ailleurs légitime — on accepte le
+            # risque résiduel plutôt que de ne jamais pouvoir sortir en cas
+            # de panne API passagère.
+            lock_confirme = True
+            if MODE_REEL and inst_id:
+                upl_reel = await okx_pnl_reel_upl(session, inst_id)
+                if upl_reel is not None and upl_reel < -TOLERANCE_LOCK_UPL_EUR:
+                    lock_confirme = False
+                    log.warning(f"  ⚠️ [LOCK-BLOQUÉ] {symbole} : PnL interne={pnl:.2f}€ mais "
+                                f"upl RÉEL OKX={upl_reel:.2f} (négatif) — sortie LOCK annulée, "
+                                f"prix interne probablement désynchronisé. Stop natif toujours actif.")
+                    await telegram(session,
+                        f"⚠️ <b>LOCK BLOQUÉ PAR VÉRIFICATION</b>\n"
+                        f"{symbole} : sortie LOCK à +{lock_actuel}€ envisagée, mais OKX indique "
+                        f"un PnL réel négatif ({upl_reel:.2f}). Fermeture annulée par précaution — "
+                        f"le stop natif OKX reste actif en attendant."
+                    )
+
+            if lock_confirme:
+                frais    = calc_frais(position)
+                # On rapporte le PnL RÉEL du moment (pnl), pas le palier lock_actuel.
+                # Par construction, pnl < lock_actuel à cet instant précis (c'est la
+                # condition même du déclenchement) — rapporter lock_actuel comme
+                # "gain net" était donc SYSTÉMATIQUEMENT optimiste, pas juste du
+                # bruit de marché. Le palier reste la garantie plancher (le trade
+                # ne peut pas closer plus bas que ça côté logique), mais le
+                # résultat affiché doit refléter la réalité du moment, pas la
+                # garantie théorique.
+                gain_net = round(pnl - frais["total"], 4)
+                log.info(f"\n  SORTIE LOCK [{symbole}] pnl={pnl:.2f}€ (lock garanti={lock_actuel}€, "
+                         f"max={pnl_max_atteint:.2f}€) | {duree}min")
+                await telegram(session,
+                    f"🔒 <b>SORTIE LOCK</b>\n"
+                    f"{symbole} | {direction}\n"
+                    f"Gain garanti (palier) : +{lock_actuel}€\n"
+                    f"PnL réel au moment de la sortie : {'+' if pnl>=0 else ''}{pnl:.2f}€\n"
+                    f"Frais (ouv+ferm) : -{frais['total']}€\n"
+                    f"Gain net : {'+' if gain_net>=0 else ''}{gain_net}€\n"
+                    f"PnL max : +{pnl_max_atteint:.2f}€\n"
+                    f"Durée : {duree} min"
+                )
+                resultat_final = "GAGNE" if gain_net > 0 else "PERDU"
+                gain_final     = gain_net
+                break
 
         # Durée maximale : fermeture forcée à 6h si ni stop ni lock atteint
         if duree >= DUREE_MAX_MINUTES:
