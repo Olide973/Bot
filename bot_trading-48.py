@@ -629,20 +629,20 @@ async def okx_diag_statut_ordre(session, inst_id, ord_id):
         log.error(f"  [DIAG-ORDRE] Exception lecture statut ordre {ord_id} : {e}")
         return None
 
-async def okx_position_existe_deja(session, inst_id):
+async def okx_position_existe_deja(session, inst_id, contexte="anti-doublon"):
     """Vérifie auprès d'OKX (source de vérité externe, pas juste l'état
     interne Python) si une position non-nulle existe déjà sur cet
-    instrument. Sert de garde-fou avant d'ouvrir un nouveau trade réel —
-    protège contre les doublons qui peuvent survenir si plusieurs
-    instances du bot tournent en parallèle (ex: ancien déploiement
-    Railway pas complètement arrêté avant qu'un nouveau démarre), un cas
-    que le verrou interne (trades_lock/trades_ouverts) ne peut pas
-    détecter puisqu'il ne connaît que l'état de SA PROPRE instance.
-    Retourne True si une position existe déjà (trade à annuler), False
-    si la voie est libre, None si la vérification a échoué (dans ce cas,
-    on laisse passer plutôt que de bloquer indéfiniment sur une panne
-    réseau — le risque de doublon reste plus rare que celui de blocage
-    permanent)."""
+    instrument. Deux usages désormais : (1) garde-fou anti-doublon avant
+    d'ouvrir un nouveau trade réel (usage d'origine), et (2) détecter si un
+    trailing natif a DÉJÀ fermé une position, dans surveiller_et_fermer_trade
+    (07/07, 15:58). Le paramètre contexte adapte le message loggé — dans le
+    cas (2), trouver une position existante est le résultat ATTENDU la
+    plupart du temps (le trailing n'a pas encore fermé), donc pas la peine
+    de le logger comme un warning à chaque tick.
+    Retourne True si une position existe déjà, False si la voie est libre
+    (ou si le trailing a déjà fermé, selon le contexte), None si la
+    vérification a échoué (repli : ne pas bloquer indéfiniment sur une
+    panne réseau)."""
     path  = "/api/v5/account/positions"
     query = f"?instId={inst_id}"
     try:
@@ -653,17 +653,20 @@ async def okx_position_existe_deja(session, inst_id):
         ) as resp:
             data = await resp.json()
             if data.get("code") != "0":
-                log.error(f"  [ANTI-DOUBLON] Erreur lecture position {inst_id} : {data}")
+                log.error(f"  [{contexte.upper()}] Erreur lecture position {inst_id} : {data}")
                 return None
             for p in data.get("data", []):
                 pos_size = float(p.get("pos", 0) or 0)
                 if pos_size != 0:
-                    log.warning(f"  [ANTI-DOUBLON] Position déjà existante sur {inst_id} "
-                                f"(pos={pos_size}) — nouvelle ouverture bloquée")
+                    if contexte == "anti-doublon":
+                        log.warning(f"  [ANTI-DOUBLON] Position déjà existante sur {inst_id} "
+                                    f"(pos={pos_size}) — nouvelle ouverture bloquée")
+                    # Sinon (contexte="trailing") : silencieux, c'est le cas
+                    # normal/attendu tant que le trailing n'a pas encore fermé.
                     return True
             return False
     except Exception as e:
-        log.error(f"  [ANTI-DOUBLON] Exception vérification position {inst_id} : {e}")
+        log.error(f"  [{contexte.upper()}] Exception vérification position {inst_id} : {e}")
         return None
 
 async def okx_lister_toutes_positions_ouvertes(session):
@@ -1680,6 +1683,12 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
     duree           = 0
     dernier_check_upl = 0.0   # timestamp du dernier appel réussi à okx_pnl_reel_upl
     dernier_upl_connu = None  # dernière valeur upl obtenue, réutilisée entre deux checks
+    dernier_check_existence = 0.0  # 07/07 (16:42) — throttling du check "trailing a-t-il déjà
+                                     # fermé ?" : même limite que le check upl (INTERVALLE_CHECK_UPL_SEC),
+                                     # sinon un pnl qui oscille autour du palier verrouillé
+                                     # (bruit de prix normal) déclenchait ce check à CHAQUE tick de
+                                     # 1s — spam de logs + risque réel de dépasser le rate limit
+                                     # OKX (10 req/2s par compte, confirmé via la doc officielle).
 
     # ── Boucle de surveillance — jusqu'au stop, au lock, ou 6h max
     while True:
@@ -1805,23 +1814,60 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
             dernier_log = time.time()
 
         if atteint_stop:
-            frais   = calc_frais(position)
-            pnl_net = round(pnl - frais["total"], 4)
-            if pnl_net > 0:
-                resultat_final = "GAGNE"
+            # ── CORRECTIF (07/07, relecture complète) — exactement le même
+            # principe que le correctif de la branche LOCK ci-dessous,
+            # appliqué ici : atteint_stop se base sur prix_actuel, qui vient
+            # du flux PUBLIC (get_prix_actuel), potentiellement divergent du
+            # vrai prix que la protection native (fixe ou trailing) surveille
+            # réellement. Sans ce garde-fou, un flux public qui s'effondre à
+            # tort (la divergence confirmée cette nuit) aurait pu déclencher
+            # une fermeture manuelle qui ANNULE une protection native saine
+            # et clôture un trade qui allait très bien réellement. Comme pour
+            # le LOCK : si un ordre natif est actif, on ne l'annule jamais
+            # pour agir à sa place — on vérifie seulement s'il a déjà fermé.
+            if algo_id and MODE_REEL and inst_id:
+                maintenant_existence = time.time()
+                if maintenant_existence - dernier_check_existence >= INTERVALLE_CHECK_UPL_SEC:
+                    position_existe = await okx_position_existe_deja(session, inst_id, contexte="trailing")
+                    dernier_check_existence = maintenant_existence
+                    if position_existe is False:
+                        frais   = calc_frais(position)
+                        pnl_net = round(pnl - frais["total"], 4)
+                        resultat_final = "GAGNE" if pnl_net > 0 else "PERDU"
+                        log.info(f"\n  STOP [{symbole}] (natif, détecté) {'+' if pnl>=0 else ''}"
+                                 f"{pnl:.2f}€ | net={pnl_net:+.4f}€ | {duree}min")
+                        await telegram(session,
+                            f"🛑 <b>STOP (natif)</b>\n"
+                            f"{symbole} {direction}\n"
+                            f"Fermée automatiquement par la protection native OKX.\n"
+                            f"Dernier PnL connu : {'+' if pnl>=0 else ''}{pnl:.2f}€\n"
+                            f"Frais (ouv+ferm) : -{frais['total']}€\n"
+                            f"Résultat net (estimation) : {'+' if pnl_net>=0 else ''}{pnl_net}€\n"
+                            f"Durée : {duree} min"
+                        )
+                        gain_final = pnl_net
+                        break
+                # Position toujours ouverte (ou check pas encore dû) : la
+                # protection native n'a pas encore fermé — on ne fait RIEN,
+                # on ne l'annule jamais, on continue la boucle.
             else:
-                resultat_final = "PERDU"
-            log.info(f"\n  STOP [{symbole}] {'+' if pnl>=0 else ''}{pnl:.2f}€ | net={pnl_net:+.4f}€ | {duree}min")
-            await telegram(session,
-                f"🛑 <b>STOP</b>\n"
-                f"{symbole} {direction}\n"
-                f"PnL brut : {'+' if pnl>=0 else ''}{pnl:.2f}€\n"
-                f"Frais (ouv+ferm) : -{frais['total']}€\n"
-                f"Résultat net : {'+' if pnl_net>=0 else ''}{pnl_net}€\n"
-                f"Durée : {duree} min"
-            )
-            gain_final = pnl_net
-            break
+                # Pas de protection native active (les deux poses ont
+                # échoué) — fermeture manuelle interne, seul filet
+                # disponible dans ce cas précis.
+                frais   = calc_frais(position)
+                pnl_net = round(pnl - frais["total"], 4)
+                resultat_final = "GAGNE" if pnl_net > 0 else "PERDU"
+                log.info(f"\n  STOP [{symbole}] {'+' if pnl>=0 else ''}{pnl:.2f}€ | net={pnl_net:+.4f}€ | {duree}min")
+                await telegram(session,
+                    f"🛑 <b>STOP</b>\n"
+                    f"{symbole} {direction}\n"
+                    f"PnL brut : {'+' if pnl>=0 else ''}{pnl:.2f}€\n"
+                    f"Frais (ouv+ferm) : -{frais['total']}€\n"
+                    f"Résultat net : {'+' if pnl_net>=0 else ''}{pnl_net}€\n"
+                    f"Durée : {duree} min"
+                )
+                gain_final = pnl_net
+                break
 
         # Sortie lock : PnL redescend sous le palier verrouillé (mais le
         # stop n'est pas atteint, sinon on serait déjà sorti ci-dessus)
@@ -1845,29 +1891,33 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
             # où la fermeture manuelle interne garde son utilité — sans
             # trailing actif, rien d'autre ne protège les paliers.
             if algo_type == "trailing" and MODE_REEL and inst_id:
-                position_existe = await okx_position_existe_deja(session, inst_id)
-                if position_existe is False:
-                    log.info(f"  ℹ️ [TRAILING] {symbole} déjà fermé par le trailing natif — "
-                             f"réconciliation à partir du dernier PnL connu ({pnl:.2f}€).")
-                    frais    = calc_frais(position)
-                    gain_net = round(pnl - frais["total"], 4)
-                    await telegram(session,
-                        f"🔒 <b>SORTIE (trailing natif)</b>\n"
-                        f"{symbole} | {direction}\n"
-                        f"Fermée automatiquement par le trailing stop natif.\n"
-                        f"Dernier PnL connu avant fermeture : {'+' if pnl>=0 else ''}{pnl:.2f}€\n"
-                        f"Frais (ouv+ferm) : -{frais['total']}€\n"
-                        f"Estimation avant vérification OKX : {'+' if gain_net>=0 else ''}{gain_net}€\n"
-                        f"PnL max : +{pnl_max_atteint:.2f}€\n"
-                        f"Durée : {duree} min"
-                    )
-                    resultat_final = "GAGNE" if gain_net > 0 else "PERDU"
-                    gain_final     = gain_net
-                    break
-                # Position toujours ouverte : le trailing n'a pas encore
-                # déclenché — on ne fait RIEN, on continue simplement la
-                # boucle au prochain tick, sans jamais l'annuler ni le
-                # remplacer par une fermeture manuelle.
+                maintenant_existence = time.time()
+                if maintenant_existence - dernier_check_existence >= INTERVALLE_CHECK_UPL_SEC:
+                    position_existe = await okx_position_existe_deja(session, inst_id, contexte="trailing")
+                    dernier_check_existence = maintenant_existence
+                    if position_existe is False:
+                        log.info(f"  ℹ️ [TRAILING] {symbole} déjà fermé par le trailing natif — "
+                                 f"réconciliation à partir du dernier PnL connu ({pnl:.2f}€).")
+                        frais    = calc_frais(position)
+                        gain_net = round(pnl - frais["total"], 4)
+                        await telegram(session,
+                            f"🔒 <b>SORTIE (trailing natif)</b>\n"
+                            f"{symbole} | {direction}\n"
+                            f"Fermée automatiquement par le trailing stop natif.\n"
+                            f"Dernier PnL connu avant fermeture : {'+' if pnl>=0 else ''}{pnl:.2f}€\n"
+                            f"Frais (ouv+ferm) : -{frais['total']}€\n"
+                            f"Estimation avant vérification OKX : {'+' if gain_net>=0 else ''}{gain_net}€\n"
+                            f"PnL max : +{pnl_max_atteint:.2f}€\n"
+                            f"Durée : {duree} min"
+                        )
+                        resultat_final = "GAGNE" if gain_net > 0 else "PERDU"
+                        gain_final     = gain_net
+                        break
+                # Position toujours ouverte (ou check pas encore dû à cause
+                # du throttle) : le trailing n'a pas encore déclenché — on
+                # ne fait RIEN, on continue simplement la boucle au
+                # prochain tick, sans jamais l'annuler ni le remplacer par
+                # une fermeture manuelle.
             elif lock_actuel > 0:
                 # ── Pas de trailing actif ici (bascule échouée, ou stop
                 # fixe encore en place) — fermeture manuelle interne, seul
@@ -2019,6 +2069,13 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                         f"(prix d'ouverture {open_px_dossier} vs {prix_entree} attendu).\n"
                         f"Calcul interne conservé par précaution."
                     )
+                    # ── CORRECTIF (relecture complète) — sans cette ligne, le
+                    # dossier REJETÉ restait quand même dans verif_reelle, et
+                    # le rapport "VÉRIFICATION RÉELLE OKX" plus bas (basé
+                    # uniquement sur "if verif_reelle is not None") l'aurait
+                    # quand même affiché — montrant les chiffres d'un AUTRE
+                    # trade juste après avoir dit qu'on les ignorait.
+                    verif_reelle = None
                 else:
                     net_reel = round(verif_reelle["pnl"] - abs(verif_reelle["fee"])
                                       - abs(verif_reelle["funding_fee"]), 4)
