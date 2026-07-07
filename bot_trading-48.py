@@ -1810,6 +1810,25 @@ async def reprendre_surveillance_position_orpheline(session, symbole, inst_id, e
     espacées, elle FERME la position par sécurité (impossible de la
     surveiller correctement sans ses vraies données) plutôt que de la
     laisser ouverte et sans filet indéfiniment."""
+    # ── Vérification de cohérence instId feed vs exécution — même garde-fou
+    # qu'à l'ouverture normale (executer_trade). Une position orpheline
+    # utilise déjà get_prix_reel_instid (ancré sur inst_id) via
+    # surveiller_et_fermer_trade, donc cette incohérence ne l'affecte pas
+    # fonctionnellement — mais l'alerte manquait ici pour la visibilité :
+    # confirmé en conditions réelles que ce catalogue diverge (ex: ETHUSD
+    # feed=...-310404 vs exécution=...-310328 le 07/07 à 03:51).
+    inst_id_feed = OKX_SYMBOLS.get(symbole)
+    if inst_id_feed and inst_id_feed != inst_id:
+        log.error(f"  🚨 [INCOHÉRENCE INSTID] {symbole} (reprise orpheline) : "
+                  f"feed={inst_id_feed} vs exécution={inst_id} — DIFFÉRENTS. "
+                  f"Sans impact fonctionnel ici (get_prix_reel_instid ancré sur "
+                  f"l'exécution), mais confirme la divergence des catalogues OKX.")
+        await telegram(session,
+            f"🚨 <b>INCOHÉRENCE INSTID</b> (position reprise)\n"
+            f"{symbole} : feed={inst_id_feed} vs exécution={inst_id}.\n"
+            f"Sans risque pour ce trade (prix ancré sur le bon contrat), simple confirmation."
+        )
+
     path  = "/api/v5/account/positions"
     query = f"?instId={inst_id}"
     data = None
