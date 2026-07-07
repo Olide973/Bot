@@ -100,7 +100,7 @@ SEUIL_CAPITAL_BTC       = 6000.0  # capital mini pour que BTCUSD soit inclus dan
 # sont inchangés — un trade qui continue de monter n'est jamais plafonné.
 # Palier 0.36% ajouté le 07/07 (12:50), entre 0.30% et 0.40%.
 LOCK_PALIERS_PCT = [
-    0.30, 0.36, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
+    0.20, 0.30, 0.36, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
     1.80, 2.20, 2.60, 3.20, 3.80, 4.60, 5.50, 6.50, 7.50, 9.00,
     10.00, 12.50, 15.00, 17.50, 20.00, 25.00, 30.00, 45.00, 60.00,
 ]
