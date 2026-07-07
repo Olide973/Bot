@@ -1475,18 +1475,20 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
         # position existe, et non celui que le dictionnaire de price-feed
         # symbole→instId pourrait pointer par erreur. En simulation pure
         # (inst_id absent), on garde l'ancienne méthode (cache WebSocket).
-        if MODE_REEL and inst_id:
-            prix_actuel = await get_prix_reel_instid(session, inst_id)
-            if prix_actuel is None:
-                # Repli — LOGGÉ explicitement : sans cette ligne, impossible
-                # de savoir a posteriori si le prix utilisé pour une
-                # décision stop/lock venait du contrat réel (REST) ou du
-                # flux public (repli) à un instant donné.
-                log.warning(f"  ⚠️ [PRIX-REPLI] {symbole} : get_prix_reel_instid indisponible, "
-                            f"repli sur le prix du flux public pour ce tick.")
-                prix_actuel = await get_prix_actuel(session, symbole)
-        else:
-            prix_actuel = await get_prix_actuel(session, symbole)
+        # get_prix_reel_instid a été RETIRÉE d'ici (07/07, 09:55) : confirmé
+        # par les logs qu'elle échoue SYSTÉMATIQUEMENT pour l'instId
+        # d'exécution (rejet propre de l'API, code != "0", pas une
+        # exception réseau) — même symptôme que le rejet WebSocket (60018,
+        # "doesn't exist"). L'instId d'exécution fonctionne pour les
+        # endpoints privés (ordres, positions, stop natif) mais pas pour
+        # les endpoints de marché publics (WS tickers ET REST ticker). La
+        # tentative ne faisait que retomber sur le prix du flux public à
+        # chaque tick, en ajoutant une requête inutile et du bruit dans les
+        # logs. Protection réelle contre une éventuelle divergence de prix :
+        # le stop natif OKX (server-side, ne dépend pas de notre prix) et
+        # la vérification upl avant tout LOCK (endpoint privé, confirmé
+        # fonctionnel toute la nuit) — toutes deux intactes, inchangées.
+        prix_actuel = await get_prix_actuel(session, symbole)
         if prix_actuel is None:
             continue
 
