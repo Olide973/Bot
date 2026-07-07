@@ -461,18 +461,30 @@ async def okx_definir_levier(session, inst_id, levier):
         log.error(f"  ❌ Exception set-leverage {inst_id} : {e}")
         return False
 
-async def okx_recuperer_position_reelle(session, inst_id):
+async def okx_recuperer_position_reelle(session, inst_id, pos_id_attendu=None):
     """Interroge /api/v5/account/positions-history pour récupérer le résultat
     RÉEL (PnL réalisé, frais de transaction ET frais de financement séparés)
-    de la dernière position fermée sur cet instrument. Sert à comparer
-    directement, dans le rapport Telegram, ce que le bot calcule en interne
-    vs ce qu'OKX a réellement enregistré — et à distinguer clairement les
-    frais d'ouverture/fermeture (0.05%+0.05% attendus) des frais de
-    financement (funding fee, prélevés périodiquement sur les positions
-    tenues assez longtemps, jamais pris en compte dans le calcul interne
-    du bot)."""
-    path  = "/api/v5/account/positions-history"
-    query = f"?instId={inst_id}&limit=1"
+    de la position fermée sur cet instrument. Sert à comparer directement,
+    dans le rapport Telegram, ce que le bot calcule en interne vs ce qu'OKX
+    a réellement enregistré — et à distinguer clairement les frais
+    d'ouverture/fermeture (0.05%+0.05% attendus) des frais de financement
+    (funding fee, prélevés périodiquement sur les positions tenues assez
+    longtemps, jamais pris en compte dans le calcul interne du bot).
+
+    pos_id_attendu (07/07, 14:20 — confirmé via la doc officielle OKX, qui
+    liste 'posId' comme identifiant UNIQUE de chaque position dans la
+    réponse) : si fourni, on interroge plusieurs dossiers récents
+    (limit=5, pas juste le plus récent) et on cherche celui dont le posId
+    correspond EXACTEMENT — élimine tout risque de récupérer par erreur le
+    dossier d'un AUTRE trade sur le même instrument (ce qu'une simple
+    comparaison de prix d'entrée ne peut que suspecter approximativement).
+    Si pos_id_attendu est absent (positions ouvertes avant ce correctif,
+    ou échec de capture à l'ouverture), on garde le comportement précédent
+    (dossier le plus récent, à valider ensuite par comparaison de prix côté
+    appelant)."""
+    path = "/api/v5/account/positions-history"
+    limite = 5 if pos_id_attendu else 1
+    query = f"?instId={inst_id}&limit={limite}"
     try:
         async with session.get(
             OKX_BASE_URL + path + query,
@@ -483,13 +495,27 @@ async def okx_recuperer_position_reelle(session, inst_id):
             if data.get("code") != "0" or not data.get("data"):
                 log.warning(f"  [VÉRIF-RÉELLE] Aucune position-history pour {inst_id} : {data}")
                 return None
-            p = data["data"][0]
+            enregistrements = data["data"]
+            p = None
+            if pos_id_attendu:
+                for candidat in enregistrements:
+                    if candidat.get("posId") == pos_id_attendu:
+                        p = candidat
+                        break
+                if p is None:
+                    log.error(f"  [VÉRIF-RÉELLE] ⚠️ Aucun dossier avec posId={pos_id_attendu} "
+                              f"trouvé parmi les {len(enregistrements)} plus récents pour {inst_id} — "
+                              f"probablement pas encore synchronisé côté OKX.")
+                    return None
+            else:
+                p = enregistrements[0]
             return {
                 "pnl":         float(p.get("pnl", 0) or 0),
                 "fee":         float(p.get("fee", 0) or 0),           # frais de transaction (ouv+ferm)
                 "funding_fee": float(p.get("fundingFee", 0) or 0),    # frais de financement séparés
                 "open_px":     p.get("openAvgPx"),
                 "close_px":    p.get("closeAvgPx"),
+                "pos_id":      p.get("posId"),
             }
     except Exception as e:
         log.error(f"  [VÉRIF-RÉELLE] Exception position-history {inst_id} : {e}")
@@ -1096,6 +1122,32 @@ async def okx_pnl_reel_upl(session, inst_id):
         log.error(f"  [PNL-RÉEL] Exception lecture upl {inst_id} : {e}")
         return None
 
+async def okx_recuperer_pos_id(session, inst_id):
+    """Interroge /api/v5/account/positions pour capturer le posId — identifiant
+    UNIQUE de la position (confirmé le 07/07 via la doc officielle OKX,
+    présent dans la réponse de positions-history). Appelée une fois juste
+    après l'ouverture réelle d'un trade, pour permettre ensuite à
+    okx_recuperer_position_reelle de retrouver EXACTEMENT le bon dossier à
+    la fermeture, plutôt que de deviner via une comparaison de prix
+    approximative. Retourne le posId (str) si trouvé, sinon None — dans ce
+    cas, la vérification à la fermeture retombe sur l'ancienne méthode
+    (comparaison de prix, moins fiable mais fonctionnelle)."""
+    path  = "/api/v5/account/positions"
+    query = f"?instId={inst_id}"
+    try:
+        async with session.get(
+            OKX_BASE_URL + path + query,
+            headers=_okx_headers("GET", path + query, ""),
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+            if data.get("code") != "0" or not data.get("data"):
+                return None
+            return data["data"][0].get("posId")
+    except Exception as e:
+        log.error(f"  [POS-ID] Exception lecture posId {inst_id} : {e}")
+        return None
+
 async def get_prix_reel_instid(session, inst_id):
     """Prix REST directement ancré sur l'instId RÉELLEMENT détenu (celui de
     OKX_SYMBOLS_EXEC), sans passer par le dictionnaire symbole→instId de
@@ -1496,6 +1548,7 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
     # ── Exécution réelle — INACTIF tant que MODE_REEL=0 (comportement simulé
     # inchangé dans ce cas). instId/taille déjà validés ci-dessus.
     algo_id_stop = None
+    pos_id       = None
     if MODE_REEL:
         log.info(f"  [DIAG-SOLDE] Avant ordre {symbole} — état du compte :")
         await okx_diag_solde(session)
@@ -1574,17 +1627,23 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
                 f"{STOP_LOSS_PCT*100:.2f}% depuis le meilleur niveau atteint."
             )
 
+        # ── Capture du posId — identifiant unique de la position (voir
+        # okx_recuperer_pos_id) — permettra à la fermeture de retrouver EXACTEMENT
+        # le bon dossier position-history, plutôt que de deviner via une
+        # comparaison de prix approximative (voir surveiller_et_fermer_trade).
+        pos_id = await okx_recuperer_pos_id(session, inst_id)
+
     await surveiller_et_fermer_trade(
         session, symbole, direction, mise, capital, position,
         prix_entree, stop_initial, objectif_final, stop_loss_eur,
         rsi_1h, details, inst_id, etat_global, algo_id=algo_id_stop,
-        taille_contrats=taille_contrats
+        taille_contrats=taille_contrats, pos_id=pos_id
     )
 
 async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital, position,
                                       prix_entree, stop_initial, objectif_final, stop_loss_eur,
                                       rsi_1h, details, inst_id, etat_global, debut_override=None,
-                                      algo_id=None, taille_contrats=None):
+                                      algo_id=None, taille_contrats=None, pos_id=None):
     """Boucle de surveillance stop/lock/durée + fermeture réelle + resynchronisation
     capital + bookkeeping. Extrait de executer_trade pour être réutilisable aussi bien
     après une ouverture normale (executer_trade) qu'après une REPRISE de surveillance
@@ -1862,25 +1921,55 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
             log.warning(f"  [SOLDE-RÉEL] Échec de lecture — repli sur le calcul interne pour ce trade")
 
         if inst_id:
-            verif_reelle = await okx_recuperer_position_reelle(session, inst_id)
+            verif_reelle = await okx_recuperer_position_reelle(session, inst_id, pos_id_attendu=pos_id)
             if verif_reelle:
-                net_reel = round(verif_reelle["pnl"] - abs(verif_reelle["fee"])
-                                  - abs(verif_reelle["funding_fee"]), 4)
-                gain_interne_original = gain_final  # conservé pour le message de comparaison, avant écrasement
-                log.info(f"  [VÉRIF-RÉELLE] {symbole} — OKX: pnl={verif_reelle['pnl']} "
-                         f"frais_transaction={verif_reelle['fee']} "
-                         f"frais_financement={verif_reelle['funding_fee']} "
-                         f"net={net_reel} | Bot interne: {gain_final}")
-                # Le résultat RÉEL OKX devient le résultat OFFICIEL du trade —
-                # élimine l'écart à la source plutôt que de juste le signaler.
-                # Garde-fou : rejeté si manifestement aberrant (gain plus grand
-                # que la position elle-même ne peut jamais arriver légitimement).
-                if abs(net_reel) <= position:
-                    gain_final     = net_reel
-                    resultat_final = "GAGNE" if net_reel > 0 else "PERDU"
+                # ── Garde-fou : okx_recuperer_position_reelle vérifie déjà EXACTEMENT
+                # via posId quand il a été capturé à l'ouverture (voir
+                # okx_recuperer_pos_id) — si le posId ne correspond à aucun dossier
+                # récent, la fonction renvoie déjà None et ce bloc n'est jamais atteint.
+                # Cette comparaison de prix reste un second filet, utile uniquement
+                # si pos_id n'a pas pu être capturé (échec réseau à l'ouverture, ou
+                # position antérieure à ce correctif) — sinon redondante mais inoffensive.
+                open_px_dossier = verif_reelle.get("open_px")
+                dossier_correspond = True
+                if open_px_dossier:
+                    try:
+                        ecart_open_px = abs(float(open_px_dossier) - prix_entree) / prix_entree
+                        if ecart_open_px > 0.005:
+                            dossier_correspond = False
+                    except (ValueError, TypeError, ZeroDivisionError):
+                        dossier_correspond = False
+
+                if not dossier_correspond:
+                    log.error(f"  [VÉRIF-RÉELLE] ⚠️ Dossier position-history REJETÉ pour {symbole} : "
+                              f"prix d'ouverture du dossier ({open_px_dossier}) ne correspond pas au "
+                              f"prix d'entrée réel de ce trade ({prix_entree}) — probablement le "
+                              f"dossier d'un AUTRE trade sur ce marché. Calcul interne conservé, "
+                              f"funding fee ignoré.")
+                    await telegram(session,
+                        f"⚠️ <b>VÉRIFICATION OKX IGNORÉE</b>\n"
+                        f"{symbole} : le dossier récupéré ne correspond pas à ce trade "
+                        f"(prix d'ouverture {open_px_dossier} vs {prix_entree} attendu).\n"
+                        f"Calcul interne conservé par précaution."
+                    )
                 else:
-                    log.error(f"  [VÉRIF-RÉELLE] ⚠️ net_reel={net_reel} invraisemblable "
-                              f"(position={position}) — calcul interne conservé")
+                    net_reel = round(verif_reelle["pnl"] - abs(verif_reelle["fee"])
+                                      - abs(verif_reelle["funding_fee"]), 4)
+                    gain_interne_original = gain_final  # conservé pour le message de comparaison, avant écrasement
+                    log.info(f"  [VÉRIF-RÉELLE] {symbole} — OKX: pnl={verif_reelle['pnl']} "
+                             f"frais_transaction={verif_reelle['fee']} "
+                             f"frais_financement={verif_reelle['funding_fee']} "
+                             f"net={net_reel} | Bot interne: {gain_final}")
+                    # Le résultat RÉEL OKX devient le résultat OFFICIEL du trade —
+                    # élimine l'écart à la source plutôt que de juste le signaler.
+                    # Garde-fou : rejeté si manifestement aberrant (gain plus grand
+                    # que la position elle-même ne peut jamais arriver légitimement).
+                    if abs(net_reel) <= position:
+                        gain_final     = net_reel
+                        resultat_final = "GAGNE" if net_reel > 0 else "PERDU"
+                    else:
+                        log.error(f"  [VÉRIF-RÉELLE] ⚠️ net_reel={net_reel} invraisemblable "
+                                  f"(position={position}) — calcul interne conservé")
 
     # ── Libérer le marché + mise à jour état global dans un seul lock
     async with trades_lock:
@@ -2100,6 +2189,7 @@ async def reprendre_surveillance_position_orpheline(session, symbole, inst_id, e
     pos_size = float(p.get("pos", 0) or 0)
     avg_px   = float(p.get("avgPx", 0) or 0)
     pos_side = (p.get("posSide") or "").lower()
+    pos_id   = p.get("posId")  # déjà présent dans cette réponse — aucun appel API en plus
 
     if pos_size == 0 or avg_px <= 0:
         log.warning(f"  [REPRISE-ORPHELINE] {symbole} : position déjà nulle ou prix d'entrée "
@@ -2194,7 +2284,7 @@ async def reprendre_surveillance_position_orpheline(session, symbole, inst_id, e
         prix_entree, stop_initial, objectif_final, stop_loss_eur,
         50.0, details_reconstruits, inst_id, etat_global,
         debut_override=debut_override, algo_id=algo_id,
-        taille_contrats=taille_contrats_reelle
+        taille_contrats=taille_contrats_reelle, pos_id=pos_id
     )
 
 
