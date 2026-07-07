@@ -1198,7 +1198,25 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
         await asyncio.sleep(1)  # laisse le temps au matching engine de remplir avant de vérifier
         await okx_diag_statut_ordre(session, inst_id, ord_id)
 
-    debut           = time.time()
+    await surveiller_et_fermer_trade(
+        session, symbole, direction, mise, capital, position,
+        prix_entree, stop_initial, objectif_final, stop_loss_eur,
+        rsi_1h, details, inst_id, etat_global
+    )
+
+async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital, position,
+                                      prix_entree, stop_initial, objectif_final, stop_loss_eur,
+                                      rsi_1h, details, inst_id, etat_global, debut_override=None):
+    """Boucle de surveillance stop/lock/durée + fermeture réelle + resynchronisation
+    capital + bookkeeping. Extrait de executer_trade pour être réutilisable aussi bien
+    après une ouverture normale (executer_trade) qu'après une REPRISE de surveillance
+    sur une position orpheline retrouvée ouverte au démarrage (voir
+    reprendre_surveillance_position_orpheline) — même logique stop/lock/durée dans les
+    deux cas, pas de code dupliqué ni de comportement différent selon l'origine du trade.
+    debut_override permet, pour une position orpheline, de faire partir la durée max (6h)
+    depuis l'ouverture RÉELLE de la position (cTime OKX) plutôt que depuis l'instant de
+    la reprise — sinon une position déjà ouverte depuis 5h se verrait accorder 6h de plus."""
+    debut           = debut_override if debut_override is not None else time.time()
     dernier_log     = 0
     pnl_max_atteint = 0.0
     lock_actuel     = 0.0
@@ -1511,6 +1529,162 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
         f"<b>NET : {'+' if etat_global.get('cumul_net',0)>=0 else ''}"
         f"{round(etat_global.get('cumul_net',0),2)}€</b>"
     )
+
+async def reprendre_surveillance_position_orpheline(session, symbole, inst_id, etat_global):
+    """Relance une surveillance stop/lock/durée COMPLÈTE pour une position réelle
+    retrouvée ouverte sur OKX au démarrage du bot (ex: crash ou redéploiement
+    Railway alors qu'un trade était en cours). Avant ce correctif, ces positions
+    étaient seulement protégées contre une double ouverture (trades_ouverts) mais
+    plus aucune tâche ne surveillait leur stop, leur lock de profit ou leur durée
+    max — elles restaient ouvertes indéfiniment sans filet de sécurité jusqu'à
+    une intervention manuelle.
+
+    Reconstruit direction, prix d'entrée et marge engagée depuis OKX (source de
+    vérité — /api/v5/account/positions), recalcule stop/objectif avec la même
+    formule que executer_trade, puis délègue à surveiller_et_fermer_trade : la
+    position bénéficie exactement de la même logique stop/lock/durée qu'un
+    trade normalement ouvert par le bot, sans code dupliqué.
+
+    Autonomie : Damien n'est pas toujours devant son téléphone pour réagir à
+    une alerte. En cas d'échec de lecture persistant chez OKX, cette fonction
+    ne se contente donc plus d'alerter et d'attendre — après 3 tentatives
+    espacées, elle FERME la position par sécurité (impossible de la
+    surveiller correctement sans ses vraies données) plutôt que de la
+    laisser ouverte et sans filet indéfiniment."""
+    path  = "/api/v5/account/positions"
+    query = f"?instId={inst_id}"
+    data = None
+
+    # 3 tentatives espacées (5s, 15s, 30s) avant de considérer l'échec comme
+    # persistant — tolère un simple aléa réseau/API sans déclencher tout de
+    # suite la fermeture de sécurité.
+    delais_retry = [5, 15, 30]
+    for tentative, delai in enumerate([0] + delais_retry, start=1):
+        if delai:
+            await asyncio.sleep(delai)
+        try:
+            async with session.get(
+                OKX_BASE_URL + path + query,
+                headers=_okx_headers("GET", path + query, ""),
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                data = await resp.json()
+        except Exception as e:
+            log.error(f"  [REPRISE-ORPHELINE] Exception lecture position {inst_id} "
+                      f"(tentative {tentative}/4) : {e}")
+            data = None
+
+        if data and data.get("code") == "0" and data.get("data"):
+            break
+        log.warning(f"  [REPRISE-ORPHELINE] {symbole} : lecture position échouée "
+                    f"(tentative {tentative}/4)")
+
+    if not data or data.get("code") != "0" or not data.get("data"):
+        log.error(f"  [REPRISE-ORPHELINE] ❌ Lecture de {symbole} ({inst_id}) impossible après "
+                  f"4 tentatives — fermeture de sécurité de la position (pas de surveillance "
+                  f"possible sans ses données réelles).")
+        succes_fermeture = await okx_fermer_position(session, inst_id)
+        async with trades_lock:
+            trades_ouverts.pop(symbole, None)
+        if succes_fermeture:
+            await telegram(session,
+                f"🛡️ <b>FERMETURE DE SÉCURITÉ</b>\n"
+                f"{symbole} : impossible de lire les données réelles de cette position sur OKX "
+                f"après plusieurs tentatives, donc impossible de la surveiller correctement.\n"
+                f"Position fermée par précaution pour éviter qu'elle reste exposée sans stop."
+            )
+        else:
+            await telegram(session,
+                f"🚨 <b>ALERTE — ACTION MANUELLE REQUISE</b>\n"
+                f"{symbole} : impossible de lire ET impossible de fermer cette position "
+                f"automatiquement après plusieurs tentatives.\n"
+                f"Elle reste ouverte SANS aucune surveillance — vérifie sur OKX dès que possible."
+            )
+        return
+
+    p        = data["data"][0]
+    pos_size = float(p.get("pos", 0) or 0)
+    avg_px   = float(p.get("avgPx", 0) or 0)
+    pos_side = (p.get("posSide") or "").lower()
+
+    if pos_size == 0 or avg_px <= 0:
+        log.warning(f"  [REPRISE-ORPHELINE] {symbole} : position déjà nulle ou prix d'entrée "
+                    f"invalide au moment de la reprise — rien à surveiller, marché libéré.")
+        async with trades_lock:
+            trades_ouverts.pop(symbole, None)
+        return
+
+
+    # Direction : en mode long/short explicite, posSide le donne directement ;
+    # en mode net, le signe de pos donne le sens.
+    if pos_side == "long":
+        direction = "ACHAT"
+    elif pos_side == "short":
+        direction = "VENTE"
+    else:
+        direction = "ACHAT" if pos_size > 0 else "VENTE"
+
+    prix_entree = avg_px
+    ratio_prix  = STOP_LOSS_PCT
+    if direction == "ACHAT":
+        stop_initial   = round(prix_entree * (1 - ratio_prix), 8)
+        objectif_final = round(prix_entree * (1 + ratio_prix * 2), 8)
+    else:
+        stop_initial   = round(prix_entree * (1 + ratio_prix), 8)
+        objectif_final = round(prix_entree * (1 - ratio_prix * 2), 8)
+
+    capital = etat_global.get("capital", CAPITAL_INITIAL)
+
+    # Marge réellement engagée sur OKX (isolé) — sert de base au calcul du
+    # PnL dans la boucle de surveillance. Plusieurs libellés possibles selon
+    # la version de l'API OKX ; on prend le premier disponible et non nul.
+    marge_reelle = 0.0
+    for champ in ("margin", "imr", "mmr"):
+        val = float(p.get(champ, 0) or 0)
+        if val > 0:
+            marge_reelle = val
+            break
+    mise     = round(marge_reelle, 2) if marge_reelle > 0 else round(capital * 0.1, 2)
+    position = round(mise * LEVIER, 2)
+    stop_loss_eur = round(position * ratio_prix, 2)
+
+    # Durée déjà écoulée depuis l'ouverture RÉELLE (cTime OKX, en ms) — pour
+    # que la fermeture forcée à 6h parte du vrai début du trade, pas de
+    # l'instant de la reprise (sinon une position ouverte depuis 5h se
+    # verrait accorder 6h de plus après chaque redémarrage).
+    debut_override = None
+    c_time_ms = p.get("cTime")
+    if c_time_ms:
+        try:
+            # cTime est un timestamp epoch en millisecondes (comme time.time()*1000,
+            # mais en secondes) — simple conversion, pas un calcul de durée.
+            debut_override = float(c_time_ms) / 1000.0
+        except (ValueError, TypeError):
+            debut_override = None
+
+    log.warning(f"  [REPRISE-ORPHELINE] {symbole} ({direction}) — prix entrée OKX={prix_entree}, "
+                f"stop={stop_initial}, marge≈{mise}€ — surveillance stop/lock/durée relancée.")
+    await telegram(session,
+        f"🔄 <b>SURVEILLANCE REPRISE</b>\n"
+        f"{symbole} ({'🟢 ACHAT' if direction == 'ACHAT' else '🔴 VENTE'})\n"
+        f"Prix d'entrée (OKX) : {prix_entree} | Stop : {stop_initial}\n"
+        f"Marge engagée (estimée) : {mise}€\n"
+        f"Cette position, retrouvée ouverte au démarrage, est de nouveau "
+        f"activement surveillée (stop / lock de profit / durée max)."
+    )
+
+    details_reconstruits = {
+        "rsi_1h": 50.0, "vol_ratio": 0.0, "variation_pct": 0.0,
+        "prix_ref": prix_entree, "prix_actuel": prix_entree, "atr": None,
+    }
+
+    await surveiller_et_fermer_trade(
+        session, symbole, direction, mise, capital, position,
+        prix_entree, stop_initial, objectif_final, stop_loss_eur,
+        50.0, details_reconstruits, inst_id, etat_global,
+        debut_override=debut_override
+    )
+
 
 # ═══════════════════════════════════════════════════════════════
 #  PROTECTIONS
@@ -2036,11 +2210,13 @@ async def boucle_principale():
 
         # ── Synchronisation trades_ouverts avec les vraies positions OKX —
         # protège contre un redémarrage 'amnésique' qui tenterait de rouvrir
-        # un marché déjà en position réelle. Attention : ces positions
-        # retrouvées n'ont PAS de tâche de surveillance stop/lock active
-        # (celle-ci tournait dans le process précédent, tuée au redémarrage)
-        # — elles sont juste protégées contre une double ouverture, pas
-        # activement suivies. Alerte explicite pour que ce soit visible.
+        # un marché déjà en position réelle. Ces positions retrouvées n'ont
+        # PAS de tâche de surveillance stop/lock active au moment où elles
+        # sont détectées (celle-ci tournait dans le process précédent, tuée
+        # au redémarrage) — trades_ouverts les protège immédiatement contre
+        # une double ouverture, puis reprendre_surveillance_position_orpheline
+        # est lancée pour chacune afin de leur relancer une VRAIE tâche de
+        # surveillance stop/lock/durée (voir cette fonction plus haut).
         if MODE_REEL:
             instids_ouverts = await okx_lister_toutes_positions_ouvertes(session)
             if instids_ouverts:
@@ -2050,19 +2226,23 @@ async def boucle_principale():
                     symb = reverse_map.get(inst_id_ouvert)
                     if symb:
                         trades_ouverts[symb] = True
-                        symboles_orphelins.append(symb)
+                        symboles_orphelins.append((symb, inst_id_ouvert))
                 if symboles_orphelins:
+                    noms = [s for s, _ in symboles_orphelins]
                     log.warning(f"  ⚠️ Positions réelles déjà ouvertes détectées au démarrage : "
-                                f"{symboles_orphelins} — protégées contre un doublon, mais SANS "
-                                f"surveillance stop/lock active (à vérifier manuellement sur OKX).")
+                                f"{noms} — protégées contre un doublon, reprise de la "
+                                f"surveillance stop/lock/durée en cours pour chacune.")
                     await telegram(session,
                         f"⚠️ <b>POSITIONS ORPHELINES DÉTECTÉES AU DÉMARRAGE</b>\n"
-                        f"Marchés concernés : {', '.join(symboles_orphelins)}\n"
+                        f"Marchés concernés : {', '.join(noms)}\n"
                         f"Ces positions existent réellement sur OKX (probablement ouvertes avant "
-                        f"un redémarrage) mais n'ont plus de suivi stop/lock actif dans ce process.\n"
-                        f"Elles sont protégées contre une double ouverture, mais vérifie-les "
-                        f"manuellement sur OKX — aucun stop automatique ne les surveille pour l'instant."
+                        f"un redémarrage). Reprise automatique de la surveillance stop/lock/durée "
+                        f"en cours pour chacune — un message de confirmation suit pour chaque marché."
                     )
+                    for symb, inst_id_ouvert in symboles_orphelins:
+                        asyncio.create_task(
+                            reprendre_surveillance_position_orpheline(session, symb, inst_id_ouvert, etat)
+                        )
 
         await telegram(session,
             (f"🔄 <b>RESET COMPLET EFFECTUÉ</b>\nCapital, PnL, compteurs et historique remis à zéro.\n\n" if RESET_TOUT else "")
