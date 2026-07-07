@@ -891,14 +891,15 @@ async def telegram(session, message):
 #  DONNÉES MARCHÉ — OKX
 # ═══════════════════════════════════════════════════════════════
 async def get_klines(session, symbole, interval=15, limite=50):
-    # Priorité au catalogue d'EXÉCUTION (compte réel) — c'est sur CET
-    # instrument que le trade sera réellement passé. Le catalogue public
-    # (OKX_SYMBOLS) n'est qu'un repli pour les marchés dont l'instId compte
-    # n'est pas encore résolu (rare, avant le premier filtrage). Sans ça, le
-    # RSI et le volume — donc le SIGNAL lui-même — pouvaient être calculés
-    # sur un contrat différent de celui réellement tradé (confirmé le
-    # 07/07 : mêmes bases, instId feed vs exécution différents).
-    okx_symbol = OKX_SYMBOLS_EXEC.get(symbole) or OKX_SYMBOLS.get(symbole, symbole)
+    # REVENU au catalogue public (feed) après incident confirmé : OKX
+    # rejette l'instId d'exécution sur le WebSocket public ("doesn't
+    # exist", code 60018) — preuve que seul OKX_SYMBOLS est un instrument
+    # public reconnu de bout en bout. Utiliser l'EXEC ici créerait une
+    # incohérence : le cache WS (alimenté en feed) et les klines (en exec)
+    # ne parleraient plus du même prix pendant le scan. La correction du
+    # bug de PnL reste dans get_prix_reel_instid (dédiée à la surveillance
+    # d'une position déjà ouverte, en REST, confirmée fonctionnelle).
+    okx_symbol = OKX_SYMBOLS.get(symbole, symbole)
     bar = {15: "15m", 60: "1H"}.get(interval, "15m")
     try:
         async with session.get(
@@ -928,9 +929,9 @@ async def get_klines(session, symbole, interval=15, limite=50):
 
 async def get_prix_rest(session, symbole):
     """Prix via l'API REST OKX (fallback tant que le WebSocket n'a pas encore
-    poussé de tick, ou si le cache est périmé). Même priorité EXEC>feed que
-    get_klines — voir son commentaire pour la raison."""
-    okx_symbol = OKX_SYMBOLS_EXEC.get(symbole) or OKX_SYMBOLS.get(symbole, symbole)
+    poussé de tick, ou si le cache est périmé). Catalogue public (feed) —
+    voir get_klines pour la raison du retour en arrière depuis l'exec."""
+    okx_symbol = OKX_SYMBOLS.get(symbole, symbole)
     try:
         async with session.get(
             "https://www.okx.com/api/v5/market/ticker",
@@ -1046,13 +1047,16 @@ async def websocket_prix(session):
         if not MARCHES:
             await asyncio.sleep(5)
             continue
-        # Même priorité EXEC>feed que get_klines/get_prix_rest — le
-        # WebSocket doit pousser les ticks du contrat réellement tradé, pas
-        # du catalogue public qui peut diverger (confirmé en conditions
-        # réelles le 07/07).
+        # REVENU au catalogue public (feed) seul — incident confirmé le
+        # 07/07 08:31 : OKX rejette l'instId d'exécution sur ce canal
+        # ("Wrong URL or channel... doesn't exist", code 60018), pour les 3
+        # marchés simultanément. Le canal WebSocket public 'tickers' ne
+        # reconnaît que les instId du catalogue PUBLIC — l'instId
+        # d'exécution (compte/démo) n'existe pas dans son registre, même
+        # s'il fonctionne très bien en REST (voir get_prix_reel_instid).
         args = [
-            {"channel": "tickers", "instId": OKX_SYMBOLS_EXEC.get(m) or OKX_SYMBOLS.get(m)}
-            for m in MARCHES if OKX_SYMBOLS_EXEC.get(m) or OKX_SYMBOLS.get(m)
+            {"channel": "tickers", "instId": OKX_SYMBOLS[m]}
+            for m in MARCHES if m in OKX_SYMBOLS
         ]
         try:
             async with session.ws_connect(url, heartbeat=25) as ws:
@@ -1076,21 +1080,13 @@ async def websocket_prix(session):
                         if "data" in data and "arg" in data:
                             inst_id = data["arg"].get("instId")
                             symbole = None
-                            # Cherche d'abord dans le catalogue d'exécution
-                            # (celui utilisé pour l'abonnement désormais),
-                            # puis dans le catalogue public en repli — sans
-                            # ça, les ticks reçus avec un instId d'exécution
-                            # ne matchaient plus rien dans OKX_SYMBOLS seul,
-                            # et étaient silencieusement ignorés.
-                            for s, i in OKX_SYMBOLS_EXEC.items():
+                            # Recherche dans le catalogue public uniquement
+                            # — cohérent avec l'abonnement ci-dessus, qui
+                            # n'utilise plus que OKX_SYMBOLS.
+                            for s, i in OKX_SYMBOLS.items():
                                 if i == inst_id:
                                     symbole = s
                                     break
-                            if symbole is None:
-                                for s, i in OKX_SYMBOLS.items():
-                                    if i == inst_id:
-                                        symbole = s
-                                        break
                             ticks = data.get("data", [])
                             if symbole and ticks:
                                 try:
