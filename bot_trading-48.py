@@ -57,6 +57,14 @@ INTERVALLE_CHECK_UPL_SEC = 3   # 07/07 (13:15) — la vérification du vrai PnL 
                                 # (10 trades / 3s ≈ 3.3 req/s ≈ 6.6 par 2s, sous la limite).
 PAUSE_SCAN              = 30         # secondes entre chaque scan de nouveaux marchés
 MAX_TRADES_SIMULTANES   = 10         # 10 marchés max = 1 par marché
+TRAIL_RATIO_POST_PALIER1 = 0.003   # 07/07 (14:35) — hybride demandé : stop fixe classique
+                                     # (STOP_LOSS_PCT=0.6%) jusqu'au premier palier de lock, PUIS
+                                     # bascule UNE SEULE FOIS vers le trailing natif avec cet
+                                     # écart plus serré (0.30%, même valeur que le palier 1 lui-
+                                     # même) — protège le petit gain déjà acquis à ce stade, tout
+                                     # en gardant la fiabilité du trailing natif pour la suite
+                                     # (plus de repositionnement répété = plus de risque de
+                                     # rejet 'SL trigger price cannot be lower than last price').
 
 # ── Détection signal mean reversion — surveillance temps réel
 SEUIL_MOUVEMENT_PCT     = 0.50   # dès que le prix bouge de 0.50% → signal
@@ -1547,8 +1555,9 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
 
     # ── Exécution réelle — INACTIF tant que MODE_REEL=0 (comportement simulé
     # inchangé dans ce cas). instId/taille déjà validés ci-dessus.
-    algo_id_stop = None
-    pos_id       = None
+    algo_id_stop   = None
+    algo_type_stop = None
+    pos_id         = None
     if MODE_REEL:
         log.info(f"  [DIAG-SOLDE] Avant ordre {symbole} — état du compte :")
         await okx_diag_solde(session)
@@ -1596,35 +1605,34 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
                 stop_initial   = round(prix_entree * (1 + ratio_prix), 8)
                 objectif_final = round(prix_entree * (1 - ratio_prix * 2), 8)
 
-        # ── Trailing stop natif OKX (ordType='move_order_stop') — remplace
-        # le stop conditionnel fixe le 07/07 (13:20). Activation immédiate
-        # (active_px=None), écart de suivi = STOP_LOSS_PCT (0.6%, identique
-        # au risque initial qu'on acceptait déjà). OKX recalcule et
-        # resserre le niveau de protection en continu, côté serveur, à
-        # mesure que le prix évolue en notre faveur — plus besoin
-        # d'annuler/reposer nous-mêmes à chaque palier de gain (source de
-        # l'échec réel du 07/07 12:40 : le prix avait bougé entre notre
-        # détection et notre repositionnement). La boucle interne
-        # (surveiller_et_fermer_trade) reste active en parallèle comme
-        # FILET DE SÉCURITÉ si la pose échoue.
-        algo_id_stop = await okx_placer_trailing_stop_natif(
-            session, inst_id, side, taille_contrats, STOP_LOSS_PCT
+        # ── HYBRIDE (07/07, 14:35) : stop FIXE classique à l'ouverture (comme
+        # avant le passage au trailing) — protège large (STOP_LOSS_PCT=0.6%)
+        # pendant que le trade n'a pas encore atteint de vrai gain. Le
+        # basculement vers le trailing natif se fait UNE SEULE FOIS, dans
+        # surveiller_et_fermer_trade, dès que le premier palier de lock est
+        # franchi — voir plus bas. Ce compromis garde la protection rapide
+        # des petits gains (comme l'ancien système de paliers) tout en
+        # gardant la fiabilité du natif pour la suite du trade (un seul
+        # basculement, pas 27 repositionnements répétés).
+        algo_id_stop = await okx_placer_ordre_stop_algo(
+            session, inst_id, side, taille_contrats, stop_initial
         )
+        algo_type_stop = "fixe"
         if algo_id_stop is None:
-            log.warning(f"  ⚠️ [TRAILING] Pose du trailing stop natif échouée pour {symbole} — "
+            log.warning(f"  ⚠️ [STOP-ALGO] Pose du stop natif échouée pour {symbole} — "
                         f"la surveillance interne du bot reste l'unique filet de sécurité.")
             await telegram(session,
-                f"⚠️ <b>TRAILING STOP NON POSÉ</b>\n"
-                f"{symbole} : la pose du trailing stop natif OKX a échoué.\n"
+                f"⚠️ <b>STOP NATIF NON POSÉ</b>\n"
+                f"{symbole} : la pose du stop natif OKX a échoué.\n"
                 f"Pas d'inquiétude — la surveillance interne du bot reste active et "
                 f"fermera la position normalement au niveau {stop_initial}."
             )
         else:
             await telegram(session,
-                f"🛡️ <b>TRAILING STOP ACTIVÉ</b>\n"
-                f"{symbole} : OKX suit désormais le prix en continu et fermera "
-                f"automatiquement si le marché se retourne de plus de "
-                f"{STOP_LOSS_PCT*100:.2f}% depuis le meilleur niveau atteint."
+                f"🛡️ <b>STOP NATIF ACTIVÉ</b>\n"
+                f"{symbole} : OKX exécutera automatiquement la fermeture dès que le prix "
+                f"atteint <b>{stop_initial}</b>. Un trailing stop natif prendra le relais "
+                f"automatiquement dès le premier palier de gain atteint."
             )
 
         # ── Capture du posId — identifiant unique de la position (voir
@@ -1637,13 +1645,13 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
         session, symbole, direction, mise, capital, position,
         prix_entree, stop_initial, objectif_final, stop_loss_eur,
         rsi_1h, details, inst_id, etat_global, algo_id=algo_id_stop,
-        taille_contrats=taille_contrats, pos_id=pos_id
+        taille_contrats=taille_contrats, pos_id=pos_id, algo_type=algo_type_stop
     )
 
 async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital, position,
                                       prix_entree, stop_initial, objectif_final, stop_loss_eur,
                                       rsi_1h, details, inst_id, etat_global, debut_override=None,
-                                      algo_id=None, taille_contrats=None, pos_id=None):
+                                      algo_id=None, taille_contrats=None, pos_id=None, algo_type=None):
     """Boucle de surveillance stop/lock/durée + fermeture réelle + resynchronisation
     capital + bookkeeping. Extrait de executer_trade pour être réutilisable aussi bien
     après une ouverture normale (executer_trade) qu'après une REPRISE de surveillance
@@ -1736,6 +1744,7 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
         # Lock paliers
         nouveau_lock = get_palier_lock(pnl_max_atteint, capital)
         if nouveau_lock > lock_actuel:
+            etait_zero_avant = (lock_actuel == 0.0)  # vrai seulement au tout premier palier franchi
             lock_actuel = nouveau_lock
             log.info(f"  LOCK {lock_actuel}€ GARANTI [{symbole}] (PnL max={pnl_max_atteint:.2f}€)")
             await telegram(session,
@@ -1743,11 +1752,39 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                 f"{symbole} | PnL max : +{pnl_max_atteint:.2f}€\n"
                 f"Gain verrouillé ✅"
             )
-            # Repositionnement manuel RETIRÉ le 07/07 (13:20) : le trailing
-            # stop natif (voir okx_placer_trailing_stop_natif, posé à
-            # l'ouverture) suit déjà le prix en continu côté serveur OKX —
-            # plus besoin d'annuler/reposer nous-mêmes à chaque palier.
-            # Ces messages de palier restent purement informatifs.
+
+            # ── Bascule UNIQUE (07/07, 14:35) : au tout premier palier
+            # franchi seulement (etait_zero_avant), on passe du stop fixe
+            # au trailing natif, avec un écart plus serré
+            # (TRAIL_RATIO_POST_PALIER1) qui protège le petit gain déjà
+            # acquis. Une seule bascule pour tout le trade — pas de
+            # repositionnement à chaque palier suivant, qui restent
+            # purement informatifs désormais. Ordre des opérations
+            # important : on POSE d'abord le nouveau trailing, et on
+            # n'annule l'ancien stop fixe QUE si la pose a réussi — jamais
+            # de fenêtre sans aucune protection active.
+            if etait_zero_avant and MODE_REEL and inst_id and taille_contrats and algo_type == "fixe":
+                side_ouverture = "buy" if direction == "ACHAT" else "sell"
+                nouvel_algo_id = await okx_placer_trailing_stop_natif(
+                    session, inst_id, side_ouverture, taille_contrats, TRAIL_RATIO_POST_PALIER1
+                )
+                if nouvel_algo_id:
+                    if algo_id:
+                        await okx_annuler_ordre_algo(session, inst_id, algo_id)
+                    algo_id   = nouvel_algo_id
+                    algo_type = "trailing"
+                    log.info(f"  🛡️ [BASCULE] Trailing natif activé pour {symbole} après le premier "
+                             f"palier (écart {TRAIL_RATIO_POST_PALIER1*100:.2f}%).")
+                    await telegram(session,
+                        f"🛡️ <b>TRAILING STOP ACTIVÉ</b>\n"
+                        f"{symbole} : premier palier atteint — le stop fixe laisse place au "
+                        f"trailing natif (écart {TRAIL_RATIO_POST_PALIER1*100:.2f}% depuis le "
+                        f"meilleur niveau atteint), qui protège ce gain en continu pour le reste "
+                        f"du trade."
+                    )
+                else:
+                    log.warning(f"  ⚠️ [BASCULE] Échec de la bascule vers le trailing pour {symbole} "
+                                f"— le stop fixe initial reste actif comme filet.")
 
         # Stop loss — calculé et vérifié EN PREMIER, avant toute logique de
         # lock. Priorité absolue : si le prix a franchi le niveau de stop,
@@ -1789,61 +1826,86 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
         # Sortie lock : PnL redescend sous le palier verrouillé (mais le
         # stop n'est pas atteint, sinon on serait déjà sorti ci-dessus)
         if lock_actuel > 0 and pnl < lock_actuel:
-            # ── Garde-fou de confirmation — AVANT toute déclaration de
-            # succès : contrairement au STOP (backé par le stop natif OKX,
-            # qui se déclenche côté serveur sur le vrai prix), une sortie
-            # LOCK est une décision purement interne du bot, sans filet
-            # équivalent côté OKX. On vérifie donc le PnL RÉEL (upl) auprès
-            # d'OKX avant de fermer "en pensant gagner" — si OKX indique un
-            # PnL réel négatif, on annule cette sortie : le prix interne
-            # est probablement désynchronisé, et fermer maintenant
-            # figerait une perte réelle sous une étiquette de gain. Le stop
-            # natif OKX reste actif entre-temps (on ne l'annule pas ici).
-            # Si la vérification est indisponible (None), on ne bloque pas
-            # indéfiniment une sortie par ailleurs légitime — on accepte le
-            # risque résiduel plutôt que de ne jamais pouvoir sortir en cas
-            # de panne API passagère.
-            lock_confirme = True
-            if MODE_REEL and inst_id:
-                upl_reel = await okx_pnl_reel_upl(session, inst_id)
-                if upl_reel is not None and upl_reel < -TOLERANCE_LOCK_UPL_EUR:
-                    lock_confirme = False
-                    log.warning(f"  ⚠️ [LOCK-BLOQUÉ] {symbole} : PnL interne={pnl:.2f}€ mais "
-                                f"upl RÉEL OKX={upl_reel:.2f} (négatif) — sortie LOCK annulée, "
-                                f"prix interne probablement désynchronisé. Stop natif toujours actif.")
+            # ── CORRECTIF CRITIQUE (07/07, 15:58) — confirmé en conditions
+            # réelles : quand un trailing natif protège déjà activement le
+            # trade (côté serveur, sans latence), notre propre code
+            # l'annulait pour fermer "à la main" via un ordre au marché sur
+            # la base d'un pnl déjà vieux de quelques secondes. Pendant
+            # l'annulation + le nouvel ordre, le prix a continué de
+            # s'effondrer — résultat réel : -0,90€ net alors qu'on pensait
+            # sécuriser +3,62€. Le trailing, lui, n'avait pas encore eu le
+            # temps de se déclencher tout seul (son niveau était pourtant
+            # meilleur) : on a désactivé la meilleure protection au pire
+            # moment. Désormais, si un trailing est actif, on ne l'annule
+            # JAMAIS pour agir à sa place — on vérifie seulement s'il a
+            # DÉJÀ fait son travail (position fermée), et on se contente de
+            # réconcilier dans ce cas. S'il n'a pas encore fermé, on ne
+            # fait rien : il reste le seul et meilleur protecteur en
+            # continu. Le stop fixe (avant la bascule) reste le seul cas
+            # où la fermeture manuelle interne garde son utilité — sans
+            # trailing actif, rien d'autre ne protège les paliers.
+            if algo_type == "trailing" and MODE_REEL and inst_id:
+                position_existe = await okx_position_existe_deja(session, inst_id)
+                if position_existe is False:
+                    log.info(f"  ℹ️ [TRAILING] {symbole} déjà fermé par le trailing natif — "
+                             f"réconciliation à partir du dernier PnL connu ({pnl:.2f}€).")
+                    frais    = calc_frais(position)
+                    gain_net = round(pnl - frais["total"], 4)
                     await telegram(session,
-                        f"⚠️ <b>LOCK BLOQUÉ PAR VÉRIFICATION</b>\n"
-                        f"{symbole} : sortie LOCK à +{lock_actuel}€ envisagée, mais OKX indique "
-                        f"un PnL réel négatif ({upl_reel:.2f}). Fermeture annulée par précaution — "
-                        f"le stop natif OKX reste actif en attendant."
+                        f"🔒 <b>SORTIE (trailing natif)</b>\n"
+                        f"{symbole} | {direction}\n"
+                        f"Fermée automatiquement par le trailing stop natif.\n"
+                        f"Dernier PnL connu avant fermeture : {'+' if pnl>=0 else ''}{pnl:.2f}€\n"
+                        f"Frais (ouv+ferm) : -{frais['total']}€\n"
+                        f"Estimation avant vérification OKX : {'+' if gain_net>=0 else ''}{gain_net}€\n"
+                        f"PnL max : +{pnl_max_atteint:.2f}€\n"
+                        f"Durée : {duree} min"
                     )
+                    resultat_final = "GAGNE" if gain_net > 0 else "PERDU"
+                    gain_final     = gain_net
+                    break
+                # Position toujours ouverte : le trailing n'a pas encore
+                # déclenché — on ne fait RIEN, on continue simplement la
+                # boucle au prochain tick, sans jamais l'annuler ni le
+                # remplacer par une fermeture manuelle.
+            elif lock_actuel > 0:
+                # ── Pas de trailing actif ici (bascule échouée, ou stop
+                # fixe encore en place) — fermeture manuelle interne, seul
+                # filet disponible dans ce cas, avec le même garde-fou de
+                # confirmation qu'avant.
+                lock_confirme = True
+                if MODE_REEL and inst_id:
+                    upl_reel = await okx_pnl_reel_upl(session, inst_id)
+                    if upl_reel is not None and upl_reel < -TOLERANCE_LOCK_UPL_EUR:
+                        lock_confirme = False
+                        log.warning(f"  ⚠️ [LOCK-BLOQUÉ] {symbole} : PnL interne={pnl:.2f}€ mais "
+                                    f"upl RÉEL OKX={upl_reel:.2f} (négatif) — sortie LOCK annulée, "
+                                    f"prix interne probablement désynchronisé. Stop toujours actif.")
+                        await telegram(session,
+                            f"⚠️ <b>LOCK BLOQUÉ PAR VÉRIFICATION</b>\n"
+                            f"{symbole} : sortie LOCK à +{lock_actuel}€ envisagée, mais OKX indique "
+                            f"un PnL réel négatif ({upl_reel:.2f}). Fermeture annulée par précaution — "
+                            f"le stop reste actif en attendant."
+                        )
 
-            if lock_confirme:
-                frais    = calc_frais(position)
-                # On rapporte le PnL RÉEL du moment (pnl), pas le palier lock_actuel.
-                # Par construction, pnl < lock_actuel à cet instant précis (c'est la
-                # condition même du déclenchement) — rapporter lock_actuel comme
-                # "gain net" était donc SYSTÉMATIQUEMENT optimiste, pas juste du
-                # bruit de marché. Le palier reste la garantie plancher (le trade
-                # ne peut pas closer plus bas que ça côté logique), mais le
-                # résultat affiché doit refléter la réalité du moment, pas la
-                # garantie théorique.
-                gain_net = round(pnl - frais["total"], 4)
-                log.info(f"\n  SORTIE LOCK [{symbole}] pnl={pnl:.2f}€ (lock garanti={lock_actuel}€, "
-                         f"max={pnl_max_atteint:.2f}€) | {duree}min")
-                await telegram(session,
-                    f"🔒 <b>SORTIE LOCK</b>\n"
-                    f"{symbole} | {direction}\n"
-                    f"Gain garanti (palier) : +{lock_actuel}€\n"
-                    f"PnL réel au moment de la sortie : {'+' if pnl>=0 else ''}{pnl:.2f}€\n"
-                    f"Frais (ouv+ferm) : -{frais['total']}€\n"
-                    f"Gain net : {'+' if gain_net>=0 else ''}{gain_net}€\n"
-                    f"PnL max : +{pnl_max_atteint:.2f}€\n"
-                    f"Durée : {duree} min"
-                )
-                resultat_final = "GAGNE" if gain_net > 0 else "PERDU"
-                gain_final     = gain_net
-                break
+                if lock_confirme:
+                    frais    = calc_frais(position)
+                    gain_net = round(pnl - frais["total"], 4)
+                    log.info(f"\n  SORTIE LOCK [{symbole}] pnl={pnl:.2f}€ (lock garanti={lock_actuel}€, "
+                             f"max={pnl_max_atteint:.2f}€) | {duree}min")
+                    await telegram(session,
+                        f"🔒 <b>SORTIE LOCK</b>\n"
+                        f"{symbole} | {direction}\n"
+                        f"Gain garanti (palier) : +{lock_actuel}€\n"
+                        f"PnL réel au moment de la sortie : {'+' if pnl>=0 else ''}{pnl:.2f}€\n"
+                        f"Frais (ouv+ferm) : -{frais['total']}€\n"
+                        f"Gain net : {'+' if gain_net>=0 else ''}{gain_net}€\n"
+                        f"PnL max : +{pnl_max_atteint:.2f}€\n"
+                        f"Durée : {duree} min"
+                    )
+                    resultat_final = "GAGNE" if gain_net > 0 else "PERDU"
+                    gain_final     = gain_net
+                    break
 
         # Durée maximale : fermeture forcée à 6h si ni stop ni lock atteint
         if duree >= DUREE_MAX_MINUTES:
@@ -1863,15 +1925,20 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
             gain_final = pnl_net
             break
 
-    # ── Annulation du trailing stop natif OKX (s'il en existe un) — AVANT
+    # ── Annulation du stop natif OKX actif (s'il en existe un) — AVANT
     # toute fermeture réelle, quel que soit le chemin de sortie emprunté.
-    # Endpoint DIFFÉRENT du stop classique : la doc OKX précise que
-    # /trade/cancel-algos ne couvre pas les ordres Trailing Stop — il faut
-    # /trade/cancel-advance-algos (voir okx_annuler_trailing_stop). Un échec
-    # ici n'est pas bloquant (l'algo a déjà pu se déclencher tout seul
-    # entre-temps, auquel cas il n'y a de toute façon plus rien à annuler).
+    # HYBRIDE (07/07, 14:35) : le type d'ordre actif dépend de si la bascule
+    # a eu lieu (voir plus haut) — 'fixe' utilise /trade/cancel-algos,
+    # 'trailing' utilise /trade/cancel-advance-algos (endpoints DIFFÉRENTS,
+    # confirmé via la doc officielle OKX : cancel-algos ne couvre pas les
+    # ordres Trailing Stop). Un échec ici n'est pas bloquant (l'algo a déjà
+    # pu se déclencher tout seul entre-temps, auquel cas il n'y a de toute
+    # façon plus rien à annuler).
     if MODE_REEL and inst_id and algo_id:
-        await okx_annuler_trailing_stop(session, inst_id, algo_id)
+        if algo_type == "trailing":
+            await okx_annuler_trailing_stop(session, inst_id, algo_id)
+        else:
+            await okx_annuler_ordre_algo(session, inst_id, algo_id)
 
     # ── Fermeture réelle de la position — INACTIF tant que MODE_REEL=0
     if MODE_REEL and inst_id:
@@ -2250,16 +2317,18 @@ async def reprendre_surveillance_position_orpheline(session, symbole, inst_id, e
                 f"stop={stop_initial}, marge≈{mise}€ — surveillance stop/lock/durée relancée.")
 
     # ── Trailing stop natif OKX pour cette position récupérée — elle n'en
-    # avait AUCUN jusqu'ici. Même mécanisme qu'à une ouverture normale (voir
-    # okx_placer_trailing_stop_natif) — activation immédiate, écart de
-    # suivi = STOP_LOSS_PCT.
+    # avait AUCUN jusqu'ici. HYBRIDE (07/07, 14:35) : stop fixe classique
+    # d'abord (comme à une ouverture normale) — le basculement vers le
+    # trailing natif se fera automatiquement au premier palier franchi,
+    # dans surveiller_et_fermer_trade.
     side_ouverture = "buy" if direction == "ACHAT" else "sell"
     taille_contrats_reelle = abs(pos_size)
-    algo_id = await okx_placer_trailing_stop_natif(
-        session, inst_id, side_ouverture, taille_contrats_reelle, STOP_LOSS_PCT
+    algo_id = await okx_placer_ordre_stop_algo(
+        session, inst_id, side_ouverture, taille_contrats_reelle, stop_initial
     )
+    algo_type = "fixe"
     if algo_id is None:
-        log.warning(f"  ⚠️ [TRAILING] Pose du trailing stop natif échouée pour {symbole} "
+        log.warning(f"  ⚠️ [STOP-ALGO] Pose du stop natif échouée pour {symbole} "
                     f"(position reprise) — la surveillance interne du bot reste l'unique filet.")
 
     await telegram(session,
@@ -2269,9 +2338,10 @@ async def reprendre_surveillance_position_orpheline(session, symbole, inst_id, e
         f"Marge engagée (estimée) : {mise}€\n"
         f"Cette position, retrouvée ouverte au démarrage, est de nouveau "
         f"activement surveillée (stop / lock de profit / durée max).\n"
-        + (f"🛡️ Trailing stop natif OKX activé (écart {STOP_LOSS_PCT*100:.2f}%)."
+        + (f"🛡️ Stop natif OKX activé. Le trailing prendra le relais dès le premier "
+           f"palier de gain atteint."
            if algo_id else
-           f"⚠️ Trailing stop NON posé — la surveillance interne reste l'unique filet.")
+           f"⚠️ Stop natif NON posé — la surveillance interne reste l'unique filet.")
     )
 
     details_reconstruits = {
@@ -2284,7 +2354,7 @@ async def reprendre_surveillance_position_orpheline(session, symbole, inst_id, e
         prix_entree, stop_initial, objectif_final, stop_loss_eur,
         50.0, details_reconstruits, inst_id, etat_global,
         debut_override=debut_override, algo_id=algo_id,
-        taille_contrats=taille_contrats_reelle, pos_id=pos_id
+        taille_contrats=taille_contrats_reelle, pos_id=pos_id, algo_type=algo_type
     )
 
 
