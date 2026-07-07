@@ -73,12 +73,17 @@ SEUIL_RUINE             = 300.0
 SEUIL_CAPITAL_BTC       = 6000.0  # capital mini pour que BTCUSD soit inclus dans le scan — sous ce seuil, 1 seul contrat BTC (ctVal=1 ≈ 1 BTC) coûte plus cher que toute la position ; BTC est retiré des marchés actifs jusqu'à ce que le capital dépasse ce seuil
 
 # ── Lock profits par paliers proportionnels au capital
-# Palier 1 : 0.16% ≈ 0.87€ — couvre frais + marge de glissement (voir plus haut)
-# Palier 2 : 0.20% ≈ 1.09€ — ajusté le 07/07 (était 0.18%)
-# Palier 3 : 0.30% ≈ 1.63€ — ajusté le 07/07 (l'ancien 0.22% a été retiré,
-# les paliers suivants décalés d'un cran)
+# Recalibré le 07/07 (11:54) : les deux plus bas paliers (0.16%, 0.20%)
+# ont été retirés après analyse de TOUTES les sorties LOCK de la soirée —
+# le bot surestimait systématiquement le gain net à chaque fois (jamais
+# l'inverse), à cause du coût réel d'un ordre au marché à la fermeture
+# (spread) qui s'ajoute aux frais. Écarts observés : 0.13€ à 0.54€ selon
+# les trades. Premier palier désormais à 0.30% (~1.63€), qui reste net
+# positif même dans le pire cas observé (0.54€ d'écart) : 1.63 - 0.54
+# (frais) - 0.54 (pire écart) ≈ 0.55€ net. Les paliers suivants (2 à 27)
+# sont inchangés — un trade qui continue de monter n'est jamais plafonné.
 LOCK_PALIERS_PCT = [
-    0.16, 0.20, 0.30, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
+    0.30, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
     1.80, 2.20, 2.60, 3.20, 3.80, 4.60, 5.50, 6.50, 7.50, 9.00,
     10.00, 12.50, 15.00, 17.50, 20.00, 25.00, 30.00, 45.00, 60.00,
 ]
