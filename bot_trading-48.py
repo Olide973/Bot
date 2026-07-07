@@ -737,6 +737,94 @@ async def okx_verifier_ordre_par_clordid(session, inst_id, cl_ord_id):
         log.error(f"  [VÉRIF-CLORDID] Exception vérification {cl_ord_id} : {e}")
         return None
 
+async def okx_placer_ordre_stop_algo(session, inst_id, side_ouverture, taille_contrats, prix_stop):
+    """Pose un ordre STOP CONDITIONNEL natif côté OKX (endpoint /trade/order-algo),
+    déclenché et exécuté par OKX LUI-MÊME dès que le prix atteint prix_stop —
+    sans dépendre du prochain check du bot (CHECK_INTERVAL=3s). Réduit le
+    slippage d'exécution en cas de mouvement brutal entre deux vérifications
+    internes.
+
+    reduceOnly=true : ne peut QUE réduire/fermer une position existante,
+    jamais en ouvrir une nouvelle par erreur (garde-fou) — même si appelé
+    avec une taille ou un side incohérent, OKX rejette plutôt que d'ouvrir
+    une position inattendue.
+
+    side_ouverture = 'buy' ou 'sell' (le sens du trade à sa création) — le
+    stop doit être posé dans le sens INVERSE pour fermer la position.
+    Retourne l'algoId si succès, sinon None (dans ce cas, la surveillance
+    interne du bot — boucle de 3s — reste l'unique filet de sécurité,
+    exactement comme avant ce correctif)."""
+    side_fermeture = "sell" if side_ouverture == "buy" else "buy"
+    path = "/api/v5/trade/order-algo"
+    body = json.dumps({
+        "instId":         inst_id,
+        "tdMode":         "isolated",
+        "side":           side_fermeture,
+        "ordType":        "conditional",
+        "sz":             str(taille_contrats),
+        "reduceOnly":     "true",
+        "slTriggerPx":    str(prix_stop),
+        "slOrdPx":        "-1",             # exécution au marché dès déclenchement
+        "slTriggerPxType": "last",
+    })
+    try:
+        async with session.post(
+            OKX_BASE_URL + path, data=body,
+            headers=_okx_headers("POST", path, body),
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+            if data.get("code") != "0":
+                log.error(f"  ❌ [STOP-ALGO] Échec pose stop natif {inst_id} @ {prix_stop} : {data}")
+                return None
+            algo_id = data.get("data", [{}])[0].get("algoId")
+            log.info(f"  🛡️ [STOP-ALGO] Stop natif OKX posé : {inst_id} {side_fermeture} "
+                     f"{taille_contrats} contrats @ {prix_stop} (algoId={algo_id})")
+            return algo_id
+    except Exception as e:
+        log.error(f"  ❌ [STOP-ALGO] Exception pose stop natif {inst_id} @ {prix_stop} : {e}")
+        return None
+
+async def okx_annuler_ordre_algo(session, inst_id, algo_id):
+    """Annule un ordre algo (stop conditionnel) préalablement posé. Appelée
+    systématiquement dès qu'un trade se termine par un autre chemin que le
+    déclenchement du stop lui-même (lock de profit, durée max, ou même le
+    stop détecté en interne en parallèle) — indispensable pour ne JAMAIS
+    laisser un ordre stop actif traîner sur l'instrument après la fin du
+    trade : un ordre orphelin de ce type pourrait sinon se déclencher plus
+    tard sur un AUTRE trade ouvert ensuite sur le même marché, et le fermer
+    à un moment totalement inattendu.
+    Retourne True si annulé (ou déjà inexistant/déjà déclenché — dans les
+    deux cas, rien à annuler, ce n'est pas un échec), False sinon."""
+    if not algo_id:
+        return True
+    path = "/api/v5/trade/cancel-algos"
+    body = json.dumps([{"instId": inst_id, "algoId": algo_id}])
+    try:
+        async with session.post(
+            OKX_BASE_URL + path, data=body,
+            headers=_okx_headers("POST", path, body),
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+            if data.get("code") != "0":
+                # Code générique OK au niveau requête, mais vérifier le sCode
+                # par ordre : un algo déjà déclenché/annulé n'est pas une
+                # vraie erreur, juste "plus rien à annuler".
+                items = data.get("data", [])
+                sCode = items[0].get("sCode") if items else None
+                if sCode in ("51535", "51536", "51000"):  # déjà inexistant/traité
+                    log.info(f"  ℹ️ [STOP-ALGO] {inst_id} algoId={algo_id} déjà inexistant/traité "
+                             f"— rien à annuler.")
+                    return True
+                log.warning(f"  ⚠️ [STOP-ALGO] Échec annulation {inst_id} algoId={algo_id} : {data}")
+                return False
+            log.info(f"  🛡️ [STOP-ALGO] Stop natif annulé : {inst_id} algoId={algo_id}")
+            return True
+    except Exception as e:
+        log.error(f"  ❌ [STOP-ALGO] Exception annulation {inst_id} algoId={algo_id} : {e}")
+        return False
+
 async def okx_fermer_position(session, inst_id):
     """Ferme intégralement la position ouverte sur cet instrument (marge isolée).
     Retourne True si la position est fermée (ou déjà inexistante), False
@@ -1183,6 +1271,7 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
 
     # ── Exécution réelle — INACTIF tant que MODE_REEL=0 (comportement simulé
     # inchangé dans ce cas). instId/taille déjà validés ci-dessus.
+    algo_id_stop = None
     if MODE_REEL:
         log.info(f"  [DIAG-SOLDE] Avant ordre {symbole} — état du compte :")
         await okx_diag_solde(session)
@@ -1200,15 +1289,44 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
         await asyncio.sleep(1)  # laisse le temps au matching engine de remplir avant de vérifier
         await okx_diag_statut_ordre(session, inst_id, ord_id)
 
+        # ── Stop natif OKX — posé juste après l'ouverture confirmée. OKX
+        # surveille et exécute lui-même dès que le prix touche stop_initial,
+        # sans attendre le prochain check du bot (CHECK_INTERVAL=3s) — réduit
+        # le slippage en cas de mouvement brutal. La boucle interne du bot
+        # (ci-dessous, dans surveiller_et_fermer_trade) reste active en
+        # parallèle comme FILET DE SÉCURITÉ : si la pose échoue (réseau,
+        # panne API) ou si OKX ne déclenche pas pour une raison quelconque,
+        # le bot détecte et ferme quand même via son propre check de prix —
+        # exactement le comportement d'avant ce correctif dans ce cas.
+        algo_id_stop = await okx_placer_ordre_stop_algo(
+            session, inst_id, side, taille_contrats, stop_initial
+        )
+        if algo_id_stop is None:
+            log.warning(f"  ⚠️ [STOP-ALGO] Pose du stop natif échouée pour {symbole} — "
+                        f"la surveillance interne du bot (3s) reste l'unique filet de sécurité.")
+            await telegram(session,
+                f"⚠️ <b>STOP NATIF NON POSÉ</b>\n"
+                f"{symbole} : la pose du stop conditionnel OKX a échoué.\n"
+                f"Pas d'inquiétude — la surveillance interne du bot (check toutes les 3s) "
+                f"reste active et fermera la position normalement au niveau {stop_initial}."
+            )
+        else:
+            await telegram(session,
+                f"🛡️ <b>STOP NATIF ACTIVÉ</b>\n"
+                f"{symbole} : OKX exécutera automatiquement la fermeture dès que le prix "
+                f"atteint <b>{stop_initial}</b> — sans attendre le prochain check du bot."
+            )
+
     await surveiller_et_fermer_trade(
         session, symbole, direction, mise, capital, position,
         prix_entree, stop_initial, objectif_final, stop_loss_eur,
-        rsi_1h, details, inst_id, etat_global
+        rsi_1h, details, inst_id, etat_global, algo_id=algo_id_stop
     )
 
 async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital, position,
                                       prix_entree, stop_initial, objectif_final, stop_loss_eur,
-                                      rsi_1h, details, inst_id, etat_global, debut_override=None):
+                                      rsi_1h, details, inst_id, etat_global, debut_override=None,
+                                      algo_id=None):
     """Boucle de surveillance stop/lock/durée + fermeture réelle + resynchronisation
     capital + bookkeeping. Extrait de executer_trade pour être réutilisable aussi bien
     après une ouverture normale (executer_trade) qu'après une REPRISE de surveillance
@@ -1217,7 +1335,11 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
     deux cas, pas de code dupliqué ni de comportement différent selon l'origine du trade.
     debut_override permet, pour une position orpheline, de faire partir la durée max (6h)
     depuis l'ouverture RÉELLE de la position (cTime OKX) plutôt que depuis l'instant de
-    la reprise — sinon une position déjà ouverte depuis 5h se verrait accorder 6h de plus."""
+    la reprise — sinon une position déjà ouverte depuis 5h se verrait accorder 6h de plus.
+    algo_id (si fourni) est l'identifiant du stop conditionnel natif posé côté OKX à
+    l'ouverture — annulé automatiquement dès que la boucle se termine, quel que soit
+    le chemin de sortie (stop détecté en interne, lock, ou durée max), pour ne jamais
+    laisser un ordre stop actif traîner sur l'instrument après la fin du trade."""
     debut           = debut_override if debut_override is not None else time.time()
     dernier_log     = 0
     pnl_max_atteint = 0.0
@@ -1342,6 +1464,17 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
             )
             gain_final = pnl_net
             break
+
+    # ── Annulation du stop natif OKX (s'il en existe un) — AVANT toute
+    # fermeture réelle, quel que soit le chemin de sortie emprunté (stop
+    # détecté en interne, lock de profit, ou durée max). Indispensable :
+    # sans cette annulation, un stop resté actif sur l'instrument pourrait
+    # se déclencher plus tard sur un AUTRE trade ouvert ensuite sur le même
+    # marché. Un échec d'annulation ici n'est pas bloquant (l'algo a déjà pu
+    # se déclencher tout seul entre-temps, auquel cas il n'y a de toute
+    # façon plus rien à annuler) — voir okx_annuler_ordre_algo.
+    if MODE_REEL and inst_id and algo_id:
+        await okx_annuler_ordre_algo(session, inst_id, algo_id)
 
     # ── Fermeture réelle de la position — INACTIF tant que MODE_REEL=0
     if MODE_REEL and inst_id:
@@ -1666,13 +1799,31 @@ async def reprendre_surveillance_position_orpheline(session, symbole, inst_id, e
 
     log.warning(f"  [REPRISE-ORPHELINE] {symbole} ({direction}) — prix entrée OKX={prix_entree}, "
                 f"stop={stop_initial}, marge≈{mise}€ — surveillance stop/lock/durée relancée.")
+
+    # ── Pose du stop natif OKX pour cette position récupérée — elle n'en
+    # avait AUCUN jusqu'ici (une position orpheline, par définition, n'a
+    # jamais eu de stop posé dans CE process). Même logique et même filet
+    # de sécurité (surveillance interne en parallèle) qu'à une ouverture
+    # normale — voir okx_placer_ordre_stop_algo.
+    side_ouverture = "buy" if direction == "ACHAT" else "sell"
+    taille_contrats_reelle = abs(pos_size)
+    algo_id = await okx_placer_ordre_stop_algo(
+        session, inst_id, side_ouverture, taille_contrats_reelle, stop_initial
+    )
+    if algo_id is None:
+        log.warning(f"  ⚠️ [STOP-ALGO] Pose du stop natif échouée pour {symbole} (position reprise) — "
+                    f"la surveillance interne du bot (3s) reste l'unique filet de sécurité.")
+
     await telegram(session,
         f"🔄 <b>SURVEILLANCE REPRISE</b>\n"
         f"{symbole} ({'🟢 ACHAT' if direction == 'ACHAT' else '🔴 VENTE'})\n"
         f"Prix d'entrée (OKX) : {prix_entree} | Stop : {stop_initial}\n"
         f"Marge engagée (estimée) : {mise}€\n"
         f"Cette position, retrouvée ouverte au démarrage, est de nouveau "
-        f"activement surveillée (stop / lock de profit / durée max)."
+        f"activement surveillée (stop / lock de profit / durée max).\n"
+        + (f"🛡️ Stop natif OKX activé — exécution automatique dès {stop_initial}."
+           if algo_id else
+           f"⚠️ Stop natif NON posé — la surveillance interne (3s) reste l'unique filet de sécurité.")
     )
 
     details_reconstruits = {
@@ -1684,7 +1835,7 @@ async def reprendre_surveillance_position_orpheline(session, symbole, inst_id, e
         session, symbole, direction, mise, capital, position,
         prix_entree, stop_initial, objectif_final, stop_loss_eur,
         50.0, details_reconstruits, inst_id, etat_global,
-        debut_override=debut_override
+        debut_override=debut_override, algo_id=algo_id
     )
 
 
