@@ -46,7 +46,15 @@ LEVIER                  = 10
 MISE_BASE_PCT           = 0.10    # 10% du capital → mise ~50€ → position ~500€ → frais ~0.50€
 MISE_MIN                = 10.0    # mise minimum cohérente avec l'objectif frais 0.50€
 MISE_MAX_PCT            = 0.12    # plafond légèrement au-dessus pour le boost confiance
-CHECK_INTERVAL          = 3          # secondes entre chaque check prix
+CHECK_INTERVAL          = 1          # secondes entre chaque check prix — réduit de 3 à 1 le 07/07 (12:50) pour détecter les franchissements de palier plus vite ; sans surcoût API significatif, le cache WebSocket (SEUIL_FRAICHEUR_PRIX_SEC=2s) reste utilisé la plupart du temps
+INTERVALLE_CHECK_UPL_SEC = 3   # 07/07 (13:15) — la vérification du vrai PnL OKX (upl) ne
+                                # peut PAS suivre le même rythme que CHECK_INTERVAL=1s : la
+                                # doc officielle OKX confirme /account/positions limitée à
+                                # 10 requêtes/2s PAR COMPTE (pas par instrument). Avec
+                                # MAX_TRADES_SIMULTANES=10 trades ouverts en même temps, un
+                                # check upl à chaque tick de 1s dépasserait la limite du
+                                # double. 3s laisse de la marge même dans le pire des cas
+                                # (10 trades / 3s ≈ 3.3 req/s ≈ 6.6 par 2s, sous la limite).
 PAUSE_SCAN              = 30         # secondes entre chaque scan de nouveaux marchés
 MAX_TRADES_SIMULTANES   = 10         # 10 marchés max = 1 par marché
 
@@ -82,8 +90,9 @@ SEUIL_CAPITAL_BTC       = 6000.0  # capital mini pour que BTCUSD soit inclus dan
 # positif même dans le pire cas observé (0.54€ d'écart) : 1.63 - 0.54
 # (frais) - 0.54 (pire écart) ≈ 0.55€ net. Les paliers suivants (2 à 27)
 # sont inchangés — un trade qui continue de monter n'est jamais plafonné.
+# Palier 0.36% ajouté le 07/07 (12:50), entre 0.30% et 0.40%.
 LOCK_PALIERS_PCT = [
-    0.30, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
+    0.30, 0.36, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
     1.80, 2.20, 2.60, 3.20, 3.80, 4.60, 5.50, 6.50, 7.50, 9.00,
     10.00, 12.50, 15.00, 17.50, 20.00, 25.00, 30.00, 45.00, 60.00,
 ]
@@ -847,6 +856,96 @@ async def okx_annuler_ordre_algo(session, inst_id, algo_id):
         log.error(f"  ❌ [STOP-ALGO] Exception annulation {inst_id} algoId={algo_id} : {e}")
         return False
 
+async def okx_placer_trailing_stop_natif(session, inst_id, side_ouverture, taille_contrats,
+                                          callback_ratio, active_px=None):
+    """Pose un TRAILING STOP natif OKX (ordType='move_order_stop') — confirmé
+    le 07/07 via la doc officielle OKX + une librairie de trading tierce qui
+    l'implémente en production (NautilusTrader) : c'est un type d'ordre
+    algo DISTINCT du stop conditionnel classique qu'on utilisait jusqu'ici
+    (ordType='conditional'). Contrairement au stop fixe, celui-ci suit
+    automatiquement le prix côté serveur OKX — plus besoin d'annuler/reposer
+    à chaque nouveau palier de gain, éliminant la fenêtre de risque où le
+    prix peut bouger entre notre détection et notre repositionnement
+    (confirmé responsable d'un échec réel le 07/07 12:40 : 'SL trigger
+    price cannot be lower than the last price').
+
+    callback_ratio : écart de suivi en fraction (ex: 0.006 pour 0.6%) —
+    le stop se recalcule en continu à cette distance du plus haut (ACHAT)
+    ou du plus bas (VENTE) atteint depuis l'activation.
+    active_px : prix à partir duquel le trailing s'active. None = activation
+    immédiate au prix courant (comportement souhaité ici, le trailing doit
+    protéger dès l'ouverture, pas seulement une fois un seuil dépassé).
+
+    side_ouverture = 'buy' ou 'sell' (le sens du trade à l'ouverture) — la
+    fonction déduit le side de fermeture, comme okx_placer_ordre_stop_algo.
+    Retourne l'algoId si succès, sinon None (dans ce cas, le stop fixe
+    classique — voir okx_placer_ordre_stop_algo — reste utilisable comme
+    repli)."""
+    side_fermeture = "sell" if side_ouverture == "buy" else "buy"
+    path = "/api/v5/trade/order-algo"
+    body_dict = {
+        "instId":        inst_id,
+        "tdMode":        "isolated",
+        "side":          side_fermeture,
+        "ordType":       "move_order_stop",
+        "sz":            str(taille_contrats),
+        "reduceOnly":    "true",
+        "callbackRatio": str(callback_ratio),
+    }
+    if active_px is not None:
+        body_dict["activePx"] = str(active_px)
+    body = json.dumps(body_dict)
+    try:
+        async with session.post(
+            OKX_BASE_URL + path, data=body,
+            headers=_okx_headers("POST", path, body),
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+            if data.get("code") != "0":
+                log.error(f"  ❌ [TRAILING] Échec pose trailing stop {inst_id} "
+                          f"(callback={callback_ratio}) : {data}")
+                return None
+            algo_id = data.get("data", [{}])[0].get("algoId")
+            log.info(f"  🛡️ [TRAILING] Trailing stop natif posé : {inst_id} {side_fermeture} "
+                     f"{taille_contrats} contrats, callback={callback_ratio} (algoId={algo_id})")
+            return algo_id
+    except Exception as e:
+        log.error(f"  ❌ [TRAILING] Exception pose trailing stop {inst_id} : {e}")
+        return None
+
+async def okx_annuler_trailing_stop(session, inst_id, algo_id):
+    """Annule un trailing stop natif — endpoint DIFFÉRENT du stop classique.
+    La doc OKX précise explicitement que /trade/cancel-algos NE COUVRE PAS
+    les ordres Trailing Stop (ni Iceberg, ni TWAP) : il faut
+    /trade/cancel-advance-algos. Utiliser le mauvais endpoint laisserait
+    le trailing stop actif sans que le code ne s'en aperçoive."""
+    if not algo_id:
+        return True
+    path = "/api/v5/trade/cancel-advance-algos"
+    body = json.dumps([{"instId": inst_id, "algoId": algo_id}])
+    try:
+        async with session.post(
+            OKX_BASE_URL + path, data=body,
+            headers=_okx_headers("POST", path, body),
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+            if data.get("code") != "0":
+                items = data.get("data", [])
+                sCode = items[0].get("sCode") if items else None
+                if sCode in ("51535", "51536", "51000"):
+                    log.info(f"  ℹ️ [TRAILING] {inst_id} algoId={algo_id} déjà inexistant/traité "
+                             f"— rien à annuler.")
+                    return True
+                log.warning(f"  ⚠️ [TRAILING] Échec annulation {inst_id} algoId={algo_id} : {data}")
+                return False
+            log.info(f"  🛡️ [TRAILING] Trailing stop annulé : {inst_id} algoId={algo_id}")
+            return True
+    except Exception as e:
+        log.error(f"  ❌ [TRAILING] Exception annulation {inst_id} algoId={algo_id} : {e}")
+        return False
+
 async def okx_fermer_position(session, inst_id):
     """Ferme intégralement la position ouverte sur cet instrument (marge isolée).
     Retourne True si la position est fermée (ou déjà inexistante), False
@@ -1444,32 +1543,35 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
                 stop_initial   = round(prix_entree * (1 + ratio_prix), 8)
                 objectif_final = round(prix_entree * (1 - ratio_prix * 2), 8)
 
-        # ── Stop natif OKX — posé juste après l'ouverture confirmée. OKX
-        # surveille et exécute lui-même dès que le prix touche stop_initial,
-        # sans attendre le prochain check du bot (CHECK_INTERVAL=3s) — réduit
-        # le slippage en cas de mouvement brutal. La boucle interne du bot
-        # (ci-dessous, dans surveiller_et_fermer_trade) reste active en
-        # parallèle comme FILET DE SÉCURITÉ : si la pose échoue (réseau,
-        # panne API) ou si OKX ne déclenche pas pour une raison quelconque,
-        # le bot détecte et ferme quand même via son propre check de prix —
-        # exactement le comportement d'avant ce correctif dans ce cas.
-        algo_id_stop = await okx_placer_ordre_stop_algo(
-            session, inst_id, side, taille_contrats, stop_initial
+        # ── Trailing stop natif OKX (ordType='move_order_stop') — remplace
+        # le stop conditionnel fixe le 07/07 (13:20). Activation immédiate
+        # (active_px=None), écart de suivi = STOP_LOSS_PCT (0.6%, identique
+        # au risque initial qu'on acceptait déjà). OKX recalcule et
+        # resserre le niveau de protection en continu, côté serveur, à
+        # mesure que le prix évolue en notre faveur — plus besoin
+        # d'annuler/reposer nous-mêmes à chaque palier de gain (source de
+        # l'échec réel du 07/07 12:40 : le prix avait bougé entre notre
+        # détection et notre repositionnement). La boucle interne
+        # (surveiller_et_fermer_trade) reste active en parallèle comme
+        # FILET DE SÉCURITÉ si la pose échoue.
+        algo_id_stop = await okx_placer_trailing_stop_natif(
+            session, inst_id, side, taille_contrats, STOP_LOSS_PCT
         )
         if algo_id_stop is None:
-            log.warning(f"  ⚠️ [STOP-ALGO] Pose du stop natif échouée pour {symbole} — "
-                        f"la surveillance interne du bot (3s) reste l'unique filet de sécurité.")
+            log.warning(f"  ⚠️ [TRAILING] Pose du trailing stop natif échouée pour {symbole} — "
+                        f"la surveillance interne du bot reste l'unique filet de sécurité.")
             await telegram(session,
-                f"⚠️ <b>STOP NATIF NON POSÉ</b>\n"
-                f"{symbole} : la pose du stop conditionnel OKX a échoué.\n"
-                f"Pas d'inquiétude — la surveillance interne du bot (check toutes les 3s) "
-                f"reste active et fermera la position normalement au niveau {stop_initial}."
+                f"⚠️ <b>TRAILING STOP NON POSÉ</b>\n"
+                f"{symbole} : la pose du trailing stop natif OKX a échoué.\n"
+                f"Pas d'inquiétude — la surveillance interne du bot reste active et "
+                f"fermera la position normalement au niveau {stop_initial}."
             )
         else:
             await telegram(session,
-                f"🛡️ <b>STOP NATIF ACTIVÉ</b>\n"
-                f"{symbole} : OKX exécutera automatiquement la fermeture dès que le prix "
-                f"atteint <b>{stop_initial}</b> — sans attendre le prochain check du bot."
+                f"🛡️ <b>TRAILING STOP ACTIVÉ</b>\n"
+                f"{symbole} : OKX suit désormais le prix en continu et fermera "
+                f"automatiquement si le marché se retourne de plus de "
+                f"{STOP_LOSS_PCT*100:.2f}% depuis le meilleur niveau atteint."
             )
 
     await surveiller_et_fermer_trade(
@@ -1492,13 +1594,14 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
     debut_override permet, pour une position orpheline, de faire partir la durée max (6h)
     depuis l'ouverture RÉELLE de la position (cTime OKX) plutôt que depuis l'instant de
     la reprise — sinon une position déjà ouverte depuis 5h se verrait accorder 6h de plus.
-    algo_id (si fourni) est l'identifiant du stop conditionnel natif posé côté OKX à
-    l'ouverture — repositionné à chaque nouveau palier de lock franchi (voir plus bas),
-    et annulé automatiquement dès que la boucle se termine, quel que soit le chemin de
-    sortie, pour ne jamais laisser un ordre stop actif traîner sur l'instrument après la
-    fin du trade. taille_contrats est nécessaire pour ce repositionnement (sz de l'ordre
-    algo) — sans elle, le lock reste protégé uniquement par la surveillance interne (3s),
-    comme avant ce correctif."""
+    algo_id (si fourni) est l'identifiant du trailing stop natif posé côté OKX à
+    l'ouverture (voir okx_placer_trailing_stop_natif) — suit le prix en continu côté
+    serveur, sans repositionnement manuel de notre part. Annulé automatiquement dès
+    que la boucle se termine, quel que soit le chemin de sortie, pour ne jamais laisser
+    un ordre actif traîner sur l'instrument après la fin du trade (voir
+    okx_annuler_trailing_stop). taille_contrats n'est plus utilisée dans cette boucle
+    depuis le passage au trailing natif (07/07, 13:20) — conservée dans la signature
+    pour compatibilité, sans effet."""
     debut           = debut_override if debut_override is not None else time.time()
     dernier_log     = 0
     pnl_max_atteint = 0.0
@@ -1508,6 +1611,8 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
     prix_sortie     = prix_entree
     pnl             = 0.0
     duree           = 0
+    dernier_check_upl = 0.0   # timestamp du dernier appel réussi à okx_pnl_reel_upl
+    dernier_upl_connu = None  # dernière valeur upl obtenue, réutilisée entre deux checks
 
     # ── Boucle de surveillance — jusqu'au stop, au lock, ou 6h max
     while True:
@@ -1538,11 +1643,33 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
         prix_sortie = prix_actuel
         duree       = int((time.time() - debut) / 60)
 
-        # Calcul PnL brut
-        if direction == "ACHAT":
-            pnl = round((prix_actuel - prix_entree) / prix_entree * mise * LEVIER, 2)
-        else:
-            pnl = round((prix_entree - prix_actuel) / prix_entree * mise * LEVIER, 2)
+        # ── Calcul PnL — PRIORITÉ au vrai PnL OKX (upl), pas au prix du
+        # flux public (07/07, 13:04) : confirmé en conditions réelles que
+        # l'écart entre le flux public et le contrat d'exécution peut être
+        # important et DURABLE (pas juste un glitch d'une seconde) — ex:
+        # ETHUSD, bot voyait -1.90€ pendant que la position réelle était à
+        # +4.83 USDC au même instant. Avec l'ancien calcul (basé sur le
+        # flux public), un trade réellement très profitable pouvait ne
+        # JAMAIS déclencher de LOCK, puisque le suivi interne ne le
+        # croyait jamais gagnant. okx_pnl_reel_upl lit directement
+        # /api/v5/account/positions — la même source que la vérification
+        # existante, mais utilisée ici en direct plutôt qu'en confirmation
+        # a posteriori. Repli sur le calcul basé sur le flux public
+        # uniquement si cette requête échoue (réseau, ou simulation pure).
+        pnl = None
+        if MODE_REEL and inst_id:
+            maintenant_upl = time.time()
+            if maintenant_upl - dernier_check_upl >= INTERVALLE_CHECK_UPL_SEC:
+                upl_reel = await okx_pnl_reel_upl(session, inst_id)
+                if upl_reel is not None:
+                    dernier_upl_connu = round(upl_reel, 2)
+                    dernier_check_upl = maintenant_upl
+            pnl = dernier_upl_connu
+        if pnl is None:
+            if direction == "ACHAT":
+                pnl = round((prix_actuel - prix_entree) / prix_entree * mise * LEVIER, 2)
+            else:
+                pnl = round((prix_entree - prix_actuel) / prix_entree * mise * LEVIER, 2)
 
         if pnl > pnl_max_atteint:
             pnl_max_atteint = pnl
@@ -1557,34 +1684,11 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                 f"{symbole} | PnL max : +{pnl_max_atteint:.2f}€\n"
                 f"Gain verrouillé ✅"
             )
-
-            # ── Repositionnement du stop natif OKX sur ce nouveau palier
-            # (07/07, 11:02) — jusqu'ici, le palier n'était protégé QUE par
-            # la surveillance interne (check toutes les 3s) : entre la
-            # détection du franchissement à la baisse et la fermeture
-            # réelle, le prix continuait de bouger, redonnant une partie du
-            # gain "garanti" (confirmé : palier à +1.2€, sortie réelle à
-            # +0.73€ — 0.47€ de give-back). En repositionnant le stop natif
-            # directement au niveau du palier, OKX défend ce niveau côté
-            # serveur, en continu, exactement comme le stop fixe initial —
-            # élimine ce give-back au lieu de simplement le tolérer.
-            if MODE_REEL and inst_id and taille_contrats:
-                if direction == "ACHAT":
-                    prix_lock = round(prix_entree * (1 + lock_actuel / position), 8)
-                else:
-                    prix_lock = round(prix_entree * (1 - lock_actuel / position), 8)
-                if algo_id:
-                    await okx_annuler_ordre_algo(session, inst_id, algo_id)
-                side_ouverture = "buy" if direction == "ACHAT" else "sell"
-                nouvel_algo_id = await okx_placer_ordre_stop_algo(
-                    session, inst_id, side_ouverture, taille_contrats, prix_lock
-                )
-                if nouvel_algo_id:
-                    algo_id = nouvel_algo_id
-                    log.info(f"  🛡️ [STOP-ALGO] Repositionné sur le palier {lock_actuel}€ @ {prix_lock}")
-                else:
-                    log.warning(f"  ⚠️ [STOP-ALGO] Échec repositionnement sur palier {lock_actuel}€ — "
-                                f"surveillance interne (3s) reste le seul filet pour ce palier.")
+            # Repositionnement manuel RETIRÉ le 07/07 (13:20) : le trailing
+            # stop natif (voir okx_placer_trailing_stop_natif, posé à
+            # l'ouverture) suit déjà le prix en continu côté serveur OKX —
+            # plus besoin d'annuler/reposer nous-mêmes à chaque palier.
+            # Ces messages de palier restent purement informatifs.
 
         # Stop loss — calculé et vérifié EN PREMIER, avant toute logique de
         # lock. Priorité absolue : si le prix a franchi le niveau de stop,
@@ -1700,16 +1804,15 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
             gain_final = pnl_net
             break
 
-    # ── Annulation du stop natif OKX (s'il en existe un) — AVANT toute
-    # fermeture réelle, quel que soit le chemin de sortie emprunté (stop
-    # détecté en interne, lock de profit, ou durée max). Indispensable :
-    # sans cette annulation, un stop resté actif sur l'instrument pourrait
-    # se déclencher plus tard sur un AUTRE trade ouvert ensuite sur le même
-    # marché. Un échec d'annulation ici n'est pas bloquant (l'algo a déjà pu
-    # se déclencher tout seul entre-temps, auquel cas il n'y a de toute
-    # façon plus rien à annuler) — voir okx_annuler_ordre_algo.
+    # ── Annulation du trailing stop natif OKX (s'il en existe un) — AVANT
+    # toute fermeture réelle, quel que soit le chemin de sortie emprunté.
+    # Endpoint DIFFÉRENT du stop classique : la doc OKX précise que
+    # /trade/cancel-algos ne couvre pas les ordres Trailing Stop — il faut
+    # /trade/cancel-advance-algos (voir okx_annuler_trailing_stop). Un échec
+    # ici n'est pas bloquant (l'algo a déjà pu se déclencher tout seul
+    # entre-temps, auquel cas il n'y a de toute façon plus rien à annuler).
     if MODE_REEL and inst_id and algo_id:
-        await okx_annuler_ordre_algo(session, inst_id, algo_id)
+        await okx_annuler_trailing_stop(session, inst_id, algo_id)
 
     # ── Fermeture réelle de la position — INACTIF tant que MODE_REEL=0
     if MODE_REEL and inst_id:
@@ -2056,19 +2159,18 @@ async def reprendre_surveillance_position_orpheline(session, symbole, inst_id, e
     log.warning(f"  [REPRISE-ORPHELINE] {symbole} ({direction}) — prix entrée OKX={prix_entree}, "
                 f"stop={stop_initial}, marge≈{mise}€ — surveillance stop/lock/durée relancée.")
 
-    # ── Pose du stop natif OKX pour cette position récupérée — elle n'en
-    # avait AUCUN jusqu'ici (une position orpheline, par définition, n'a
-    # jamais eu de stop posé dans CE process). Même logique et même filet
-    # de sécurité (surveillance interne en parallèle) qu'à une ouverture
-    # normale — voir okx_placer_ordre_stop_algo.
+    # ── Trailing stop natif OKX pour cette position récupérée — elle n'en
+    # avait AUCUN jusqu'ici. Même mécanisme qu'à une ouverture normale (voir
+    # okx_placer_trailing_stop_natif) — activation immédiate, écart de
+    # suivi = STOP_LOSS_PCT.
     side_ouverture = "buy" if direction == "ACHAT" else "sell"
     taille_contrats_reelle = abs(pos_size)
-    algo_id = await okx_placer_ordre_stop_algo(
-        session, inst_id, side_ouverture, taille_contrats_reelle, stop_initial
+    algo_id = await okx_placer_trailing_stop_natif(
+        session, inst_id, side_ouverture, taille_contrats_reelle, STOP_LOSS_PCT
     )
     if algo_id is None:
-        log.warning(f"  ⚠️ [STOP-ALGO] Pose du stop natif échouée pour {symbole} (position reprise) — "
-                    f"la surveillance interne du bot (3s) reste l'unique filet de sécurité.")
+        log.warning(f"  ⚠️ [TRAILING] Pose du trailing stop natif échouée pour {symbole} "
+                    f"(position reprise) — la surveillance interne du bot reste l'unique filet.")
 
     await telegram(session,
         f"🔄 <b>SURVEILLANCE REPRISE</b>\n"
@@ -2077,9 +2179,9 @@ async def reprendre_surveillance_position_orpheline(session, symbole, inst_id, e
         f"Marge engagée (estimée) : {mise}€\n"
         f"Cette position, retrouvée ouverte au démarrage, est de nouveau "
         f"activement surveillée (stop / lock de profit / durée max).\n"
-        + (f"🛡️ Stop natif OKX activé — exécution automatique dès {stop_initial}."
+        + (f"🛡️ Trailing stop natif OKX activé (écart {STOP_LOSS_PCT*100:.2f}%)."
            if algo_id else
-           f"⚠️ Stop natif NON posé — la surveillance interne (3s) reste l'unique filet de sécurité.")
+           f"⚠️ Trailing stop NON posé — la surveillance interne reste l'unique filet.")
     )
 
     details_reconstruits = {
