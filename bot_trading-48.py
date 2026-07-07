@@ -73,21 +73,12 @@ SEUIL_RUINE             = 300.0
 SEUIL_CAPITAL_BTC       = 6000.0  # capital mini pour que BTCUSD soit inclus dans le scan — sous ce seuil, 1 seul contrat BTC (ctVal=1 ≈ 1 BTC) coûte plus cher que toute la position ; BTC est retiré des marchés actifs jusqu'à ce que le capital dépasse ce seuil
 
 # ── Lock profits par paliers proportionnels au capital
-# Palier 0.16% ≈ 0.87€ à 543.65€ — calibré pour couvrir les frais totaux
-# (0.10% du capital, fixes et connus) PLUS une marge de glissement
-# d'exécution (~0.06%, estimée à partir du glissement observé en réel sur
-# cette nuit — ex: ouverture visée à 1807.07, exécutée à 1808.73 sur
-# ETHUSD, soit ~0.09% ; deux exécutions au marché par trade — ouverture et
-# fermeture — d'où la marge). Ce n'est PAS une garantie exacte (le
-# glissement varie selon la volatilité du moment), juste une marge
-# raisonnée plutôt qu'un seuil pile sur les frais théoriques. Un seul
-# palier ajouté ici, pas plusieurs : un trade qui l'atteint puis se
-# retourne sort proche de l'équilibre réel (frais + glissement absorbés)
-# au lieu de redonner tout jusqu'au stop complet. Premier palier
-# "officiel" (gain net réel) : 0.18% ≈ 0.98€, inchangé, ainsi que tous les
-# paliers suivants — un trade qui continue de monter n'est jamais plafonné.
+# Palier 1 : 0.16% ≈ 0.87€ — couvre frais + marge de glissement (voir plus haut)
+# Palier 2 : 0.20% ≈ 1.09€ — ajusté le 07/07 (était 0.18%)
+# Palier 3 : 0.30% ≈ 1.63€ — ajusté le 07/07 (l'ancien 0.22% a été retiré,
+# les paliers suivants décalés d'un cran)
 LOCK_PALIERS_PCT = [
-    0.16, 0.18, 0.22, 0.30, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
+    0.16, 0.20, 0.30, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
     1.80, 2.20, 2.60, 3.20, 3.80, 4.60, 5.50, 6.50, 7.50, 9.00,
     10.00, 12.50, 15.00, 17.50, 20.00, 25.00, 30.00, 45.00, 60.00,
 ]
@@ -555,12 +546,17 @@ async def okx_diag_solde(session, ccy_attendue=None):
         log.error(f"  [DIAG-SOLDE] Exception lecture solde : {e}")
 
 async def okx_diag_statut_ordre(session, inst_id, ord_id):
-    """[DIAGNOSTIC UNIQUEMENT] Interroge /api/v5/trade/order pour connaître
-    l'état réel de l'ordre d'ouverture (state: filled/canceled/live/
-    partially_filled) et la quantité effectivement remplie (accFillSz).
-    But : vérifier si un ordre annoncé 'placé' avec succès (code=0 à la
-    soumission) a réellement été REMPLI, ce qui n'est pas garanti par le
-    seul code=0 (qui signifie juste 'accepté par le moteur de matching')."""
+    """Interroge /api/v5/trade/order pour connaître l'état réel de l'ordre
+    d'ouverture (state: filled/canceled/live/partially_filled) et le prix
+    RÉELLEMENT rempli (avgPx) — pas seulement un diagnostic : ce prix réel
+    est désormais RENVOYÉ à l'appelant, qui doit impérativement l'utiliser
+    comme véritable prix d'entrée. Avant ce correctif, un ordre au marché
+    pouvait se remplir avec un glissement important (confirmé en conditions
+    réelles : ordre visé à 1777.0, rempli à 1696.39, écart de 80 points)
+    sans que le reste du trade — stop, lock, PnL affiché — ne le sache
+    jamais, puisque tout continuait à se baser sur le prix visé avant
+    l'ordre plutôt que sur le prix réellement obtenu.
+    Retourne le avgPx réel (float) si l'ordre est rempli, sinon None."""
     path  = "/api/v5/trade/order"
     query = f"?instId={inst_id}&ordId={ord_id}"
     try:
@@ -572,13 +568,18 @@ async def okx_diag_statut_ordre(session, inst_id, ord_id):
             data = await resp.json()
             if data.get("code") != "0" or not data.get("data"):
                 log.error(f"  [DIAG-ORDRE] Erreur lecture statut ordre {ord_id} : {data}")
-                return
+                return None
             o = data["data"][0]
             log.info(f"  [DIAG-ORDRE] {inst_id} ordId={ord_id} state={o.get('state')} "
                      f"sz={o.get('sz')} accFillSz={o.get('accFillSz')} "
                      f"avgPx={o.get('avgPx')} px={o.get('px')}")
+            avg_px = o.get("avgPx")
+            if avg_px and float(avg_px) > 0:
+                return float(avg_px)
+            return None
     except Exception as e:
         log.error(f"  [DIAG-ORDRE] Exception lecture statut ordre {ord_id} : {e}")
+        return None
 
 async def okx_position_existe_deja(session, inst_id):
     """Vérifie auprès d'OKX (source de vérité externe, pas juste l'état
@@ -1406,7 +1407,37 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
             return
 
         await asyncio.sleep(1)  # laisse le temps au matching engine de remplir avant de vérifier
-        await okx_diag_statut_ordre(session, inst_id, ord_id)
+        avg_px_reel = await okx_diag_statut_ordre(session, inst_id, ord_id)
+
+        # ── CORRECTIF CRITIQUE (07/07, 10:51) — un ordre au marché peut se
+        # remplir à un prix différent du prix visé (glissement), parfois
+        # significatif (confirmé en conditions réelles : visé 1777.0,
+        # rempli 1696.39, écart de 80 points). Avant ce correctif, ce
+        # glissement n'était JAMAIS répercuté : le stop, l'objectif, et
+        # tout le calcul de PnL affiché continuaient à se baser sur le prix
+        # visé avant l'ordre — le bot pouvait croire un trade équilibré ou
+        # gagnant alors qu'il était réellement très en perte (ou l'inverse).
+        # On recalcule donc TOUT (prix d'entrée, stop, objectif) à partir
+        # du prix RÉELLEMENT rempli, avant de poser le stop natif — pour
+        # que la protection elle-même se base sur la réalité, pas sur une
+        # estimation périmée dès la première seconde du trade.
+        if avg_px_reel and abs(avg_px_reel - prix_entree) / prix_entree > 0.0005:
+            log.warning(f"  ⚠️ [GLISSEMENT] {symbole} : prix visé {prix_entree} → rempli "
+                        f"{avg_px_reel} (écart {(avg_px_reel-prix_entree)/prix_entree*100:.3f}%) — "
+                        f"recalcul du stop/objectif sur le prix réel.")
+            await telegram(session,
+                f"⚠️ <b>GLISSEMENT D'EXÉCUTION</b>\n{symbole} : prix visé {prix_entree}, "
+                f"rempli à {avg_px_reel} (écart {(avg_px_reel-prix_entree)/prix_entree*100:.3f}%).\n"
+                f"Stop et objectif recalculés sur le prix réel."
+            )
+        if avg_px_reel:
+            prix_entree = avg_px_reel
+            if direction == "ACHAT":
+                stop_initial   = round(prix_entree * (1 - ratio_prix), 8)
+                objectif_final = round(prix_entree * (1 + ratio_prix * 2), 8)
+            else:
+                stop_initial   = round(prix_entree * (1 + ratio_prix), 8)
+                objectif_final = round(prix_entree * (1 - ratio_prix * 2), 8)
 
         # ── Stop natif OKX — posé juste après l'ouverture confirmée. OKX
         # surveille et exécute lui-même dès que le prix touche stop_initial,
@@ -1439,13 +1470,14 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
     await surveiller_et_fermer_trade(
         session, symbole, direction, mise, capital, position,
         prix_entree, stop_initial, objectif_final, stop_loss_eur,
-        rsi_1h, details, inst_id, etat_global, algo_id=algo_id_stop
+        rsi_1h, details, inst_id, etat_global, algo_id=algo_id_stop,
+        taille_contrats=taille_contrats
     )
 
 async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital, position,
                                       prix_entree, stop_initial, objectif_final, stop_loss_eur,
                                       rsi_1h, details, inst_id, etat_global, debut_override=None,
-                                      algo_id=None):
+                                      algo_id=None, taille_contrats=None):
     """Boucle de surveillance stop/lock/durée + fermeture réelle + resynchronisation
     capital + bookkeeping. Extrait de executer_trade pour être réutilisable aussi bien
     après une ouverture normale (executer_trade) qu'après une REPRISE de surveillance
@@ -1456,9 +1488,12 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
     depuis l'ouverture RÉELLE de la position (cTime OKX) plutôt que depuis l'instant de
     la reprise — sinon une position déjà ouverte depuis 5h se verrait accorder 6h de plus.
     algo_id (si fourni) est l'identifiant du stop conditionnel natif posé côté OKX à
-    l'ouverture — annulé automatiquement dès que la boucle se termine, quel que soit
-    le chemin de sortie (stop détecté en interne, lock, ou durée max), pour ne jamais
-    laisser un ordre stop actif traîner sur l'instrument après la fin du trade."""
+    l'ouverture — repositionné à chaque nouveau palier de lock franchi (voir plus bas),
+    et annulé automatiquement dès que la boucle se termine, quel que soit le chemin de
+    sortie, pour ne jamais laisser un ordre stop actif traîner sur l'instrument après la
+    fin du trade. taille_contrats est nécessaire pour ce repositionnement (sz de l'ordre
+    algo) — sans elle, le lock reste protégé uniquement par la surveillance interne (3s),
+    comme avant ce correctif."""
     debut           = debut_override if debut_override is not None else time.time()
     dernier_log     = 0
     pnl_max_atteint = 0.0
@@ -1517,6 +1552,34 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                 f"{symbole} | PnL max : +{pnl_max_atteint:.2f}€\n"
                 f"Gain verrouillé ✅"
             )
+
+            # ── Repositionnement du stop natif OKX sur ce nouveau palier
+            # (07/07, 11:02) — jusqu'ici, le palier n'était protégé QUE par
+            # la surveillance interne (check toutes les 3s) : entre la
+            # détection du franchissement à la baisse et la fermeture
+            # réelle, le prix continuait de bouger, redonnant une partie du
+            # gain "garanti" (confirmé : palier à +1.2€, sortie réelle à
+            # +0.73€ — 0.47€ de give-back). En repositionnant le stop natif
+            # directement au niveau du palier, OKX défend ce niveau côté
+            # serveur, en continu, exactement comme le stop fixe initial —
+            # élimine ce give-back au lieu de simplement le tolérer.
+            if MODE_REEL and inst_id and taille_contrats:
+                if direction == "ACHAT":
+                    prix_lock = round(prix_entree * (1 + lock_actuel / position), 8)
+                else:
+                    prix_lock = round(prix_entree * (1 - lock_actuel / position), 8)
+                if algo_id:
+                    await okx_annuler_ordre_algo(session, inst_id, algo_id)
+                side_ouverture = "buy" if direction == "ACHAT" else "sell"
+                nouvel_algo_id = await okx_placer_ordre_stop_algo(
+                    session, inst_id, side_ouverture, taille_contrats, prix_lock
+                )
+                if nouvel_algo_id:
+                    algo_id = nouvel_algo_id
+                    log.info(f"  🛡️ [STOP-ALGO] Repositionné sur le palier {lock_actuel}€ @ {prix_lock}")
+                else:
+                    log.warning(f"  ⚠️ [STOP-ALGO] Échec repositionnement sur palier {lock_actuel}€ — "
+                                f"surveillance interne (3s) reste le seul filet pour ce palier.")
 
         # Stop loss — calculé et vérifié EN PREMIER, avant toute logique de
         # lock. Priorité absolue : si le prix a franchi le niveau de stop,
@@ -2023,7 +2086,8 @@ async def reprendre_surveillance_position_orpheline(session, symbole, inst_id, e
         session, symbole, direction, mise, capital, position,
         prix_entree, stop_initial, objectif_final, stop_loss_eur,
         50.0, details_reconstruits, inst_id, etat_global,
-        debut_override=debut_override, algo_id=algo_id
+        debut_override=debut_override, algo_id=algo_id,
+        taille_contrats=taille_contrats_reelle
     )
 
 
