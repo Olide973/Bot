@@ -2316,20 +2316,51 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                     and MODE_REEL and inst_id and taille_contrats):
                 if direction == "ACHAT":
                     prix_plancher = round(prix_entree * (1 + lock_actuel / position), 8)
-                    # ── CORRECTIF (08/07) — incident réel confirmé sur INJUSD : si le
-                    # prix retrace SOUS ce niveau avant que la pose n'ait lieu, OKX
-                    # rejette (sCode 51304, "SL trigger price cannot be higher than
-                    # the mark price") — et comme ce niveau est figé (calculé depuis
-                    # prix_entree, pas depuis le prix actuel), CHAQUE retry automatique
-                    # échouait à l'identique, indéfiniment. On plafonne désormais le
-                    # niveau visé pour qu'il reste toujours valide par rapport au prix
-                    # ACTUEL — au prix d'un plancher légèrement inférieur à la cible
-                    # d'origine dans ce cas précis, mais qui a enfin une chance réelle
-                    # de se poser plutôt que de retenter éternellement en vain.
-                    prix_plancher = min(prix_plancher, round(prix_actuel * (1 - STOP_BUFFER_SLIPPAGE_PCT), 8))
+                    niveau_deja_depasse = prix_actuel <= prix_plancher
                 else:
                     prix_plancher = round(prix_entree * (1 - lock_actuel / position), 8)
-                    prix_plancher = max(prix_plancher, round(prix_actuel * (1 + STOP_BUFFER_SLIPPAGE_PCT), 8))
+                    niveau_deja_depasse = prix_actuel >= prix_plancher
+
+                # ── CHANGEMENT DE CAP (08/07, demandé explicitement par Damien,
+                # suite à l'incident HYPEUSD) : l'ancienne version plafonnait
+                # discrètement le niveau visé quand il devenait injoignable (prix
+                # déjà passé de l'autre côté), et annonçait quand même le montant
+                # NOMINAL du palier — un plancher "5,45€" qui n'en garantissait
+                # en réalité qu'une partie, jamais signalé clairement. Un
+                # plancher qui peut être silencieusement réduit n'est pas un
+                # vrai plancher. Nouvelle règle : si le niveau visé n'est plus
+                # atteignable au moment de la pose, on ne pose PAS un plancher
+                # affaibli — on ferme IMMÉDIATEMENT la position au marché, pour
+                # capturer le meilleur prix encore disponible tout de suite,
+                # plutôt que de laisser un ordre affaibli exposé à une
+                # dégradation supplémentaire pendant qu'on attend son
+                # déclenchement. Le nettoyage commun après la boucle (plus bas)
+                # s'occupe de la fermeture réelle et de la vérification posId —
+                # aucune duplication de logique de fermeture ici.
+                if niveau_deja_depasse:
+                    log.error(f"  🚨 [PLANCHER-DUR] {symbole} : niveau du palier #{index_lock} "
+                              f"({lock_actuel}€, prix cible={prix_plancher}) déjà dépassé par le "
+                              f"prix actuel ({prix_actuel}) — fermeture immédiate au marché plutôt "
+                              f"que de poser un plancher affaibli.")
+                    frais_urgence   = calc_frais(position)
+                    gain_final      = round(pnl - frais_urgence["total"], 4)
+                    resultat_final  = "GAGNE" if gain_final > 0 else "PERDU"
+                    await telegram(session,
+                        f"🚨 <b>FERMETURE IMMÉDIATE — PALIER NON TENABLE</b>\n"
+                        f"{symbole} : le niveau du palier #{index_lock} ({lock_actuel}€) n'était "
+                        f"déjà plus atteignable au moment de la pose (prix trop rapide).\n"
+                        f"Plutôt que de poser un plancher affaibli, fermeture immédiate pour "
+                        f"capturer le meilleur prix encore disponible.\n"
+                        f"PnL au moment de la décision : {'+' if pnl>=0 else ''}{pnl:.2f}€"
+                    )
+                    break
+
+                # ── Le gain réellement garanti correspond maintenant TOUJOURS à
+                # la cible nominale du palier (lock_actuel), puisqu'on ne pose
+                # plus jamais un plancher affaibli — plus besoin de distinguer
+                # "réel" vs "cible", ils sont désormais identiques par construction.
+                gain_reel_plancher = lock_actuel
+                plancher_reduit    = False
 
                 # ── Amendement en place EN PRIORITÉ (08/07) : si un plancher
                 # existe déjà (pas le tout premier), on tente de modifier son
@@ -2364,12 +2395,19 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                     dernier_index_plancher_dur = index_lock
                     etat_global["nb_plancher_amende"] = etat_global.get("nb_plancher_amende", 0) + 1
                     log.info(f"  🧱 [PLANCHER-DUR] {symbole} : plancher amendé ET confirmé actif "
-                             f"à {lock_actuel}€ (palier #{index_lock}, prix={prix_plancher})")
+                             f"à {gain_reel_plancher}€ (cible palier #{index_lock}: {lock_actuel}€, "
+                             f"prix={prix_plancher})")
+                    avertissement_reduit = (
+                        f"\n⚠️ <i>Réduit depuis la cible du palier ({lock_actuel}€) car le prix a "
+                        f"bougé avant la pose — niveau plafonné pour rester valide.</i>"
+                        if plancher_reduit else ""
+                    )
                     await telegram(session,
-                        f"🧱 <b>PLANCHER VERROUILLÉ : {lock_actuel}€</b>\n"
+                        f"🧱 <b>PLANCHER VERROUILLÉ : {gain_reel_plancher}€</b>\n"
                         f"{symbole} : ce niveau ne peut plus être franchi vers le bas, quoi qu'il "
                         f"arrive au trailing au-dessus.\n"
                         f"<i>Méthode : amendement en place, confirmé actif côté OKX</i>"
+                        f"{avertissement_reduit}"
                     )
                 else:
                     side_ouverture_plancher = "buy" if direction == "ACHAT" else "sell"
@@ -2416,14 +2454,20 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                             etat_global.get("nb_plancher_repositionne", 0) + 1
                         )
                         log.info(f"  🧱 [PLANCHER-DUR] {symbole} : plancher repositionné ET "
-                                 f"confirmé actif (pose+annulation) à {lock_actuel}€ "
-                                 f"(palier #{index_lock}, prix={prix_plancher})")
+                                 f"confirmé actif (pose+annulation) à {gain_reel_plancher}€ "
+                                 f"(cible palier #{index_lock}: {lock_actuel}€, prix={prix_plancher})")
+                        avertissement_reduit = (
+                            f"\n⚠️ <i>Réduit depuis la cible du palier ({lock_actuel}€) car le prix a "
+                            f"bougé avant la pose — niveau plafonné pour rester valide.</i>"
+                            if plancher_reduit else ""
+                        )
                         await telegram(session,
-                            f"🧱 <b>PLANCHER VERROUILLÉ : {lock_actuel}€</b>\n"
+                            f"🧱 <b>PLANCHER VERROUILLÉ : {gain_reel_plancher}€</b>\n"
                             f"{symbole} : ce niveau ne peut plus être franchi vers le bas, quoi "
                             f"qu'il arrive au trailing au-dessus.\n"
                             f"<i>Méthode : repositionnement classique, confirmé actif côté OKX "
                             f"(l'amendement direct n'était pas possible ici)</i>"
+                            f"{avertissement_reduit}"
                         )
                     else:
                         # ── Nettoyage (08/07) : si l'ordre a bien été accepté par OKX
