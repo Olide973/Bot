@@ -85,13 +85,60 @@ INTERVALLE_STATUT_TELEGRAM_SEC = 900  # 08/07 — statut de position envoyé sur
 INTERVALLE_CHECK_UPL_SEC = 3   # 07/07 (13:15) — la vérification du vrai PnL OKX (upl) ne
                                 # peut PAS suivre le même rythme que CHECK_INTERVAL=1s : la
                                 # doc officielle OKX confirme /account/positions limitée à
-                                # 10 requêtes/2s PAR COMPTE (pas par instrument). Avec
-                                # MAX_TRADES_SIMULTANES=10 trades ouverts en même temps, un
-                                # check upl à chaque tick de 1s dépasserait la limite du
-                                # double. 3s laisse de la marge même dans le pire des cas
-                                # (10 trades / 3s ≈ 3.3 req/s ≈ 6.6 par 2s, sous la limite).
+                                # 10 requêtes/2s PAR COMPTE (pas par instrument). Même réduit
+                                # à MAX_TRADES_SIMULTANES=4 (voir plus bas), un check upl à
+                                # chaque tick de 1s resterait risqué en cas de sursaut ; 3s
+                                # laisse une bonne marge (4 trades / 3s ≈ 1.3 req/s, largement
+                                # sous la limite).
 PAUSE_SCAN              = 30         # secondes entre chaque scan de nouveaux marchés
-MAX_TRADES_SIMULTANES   = 10         # 10 marchés max = 1 par marché
+# ── RÉDUIT de 10 à 4 le 08/07 (dernière chance accordée par Damien après une
+# première journée réelle difficile, -3,3%) : la session du jour a montré
+# jusqu'à 6 trades ouverts EN MÊME TEMPS, très majoritairement des VENTES sur
+# des cryptos différentes — c'est-à-dire une diversification en apparence,
+# mais en réalité une exposition corrélée (les cryptos bougent souvent
+# ensemble). Un vrai mouvement de marché défavorable touche alors plusieurs
+# positions à la fois, comme observé (ADAUSD, XRPUSD, AAVEUSD tous perdants
+# le même après-midi, dépassant chacun leur stop max prévu). Réduire le
+# nombre de trades simultanés réduit directement l'ampleur d'un tel épisode
+# sur le capital réel, au prix d'un volume de trades plus faible.
+MAX_TRADES_SIMULTANES   = 4
+# ── NOUVEAU (08/07, carte blanche accordée par Damien après la première
+# journée réelle) : un compteur de pertes consécutives existait déjà
+# (pertes_consecutives) mais n'était utilisé nulle part pour agir — juste
+# affiché dans les logs. Ajout d'une vraie pause automatique : après
+# plusieurs pertes d'affilée, le bot arrête d'OUVRIR de nouveaux trades
+# pendant un temps donné (les trades déjà ouverts continuent d'être
+# surveillés normalement, stops/planchers actifs comme toujours). Objectif :
+# éviter d'insister avec la même stratégie pendant un épisode de marché qui
+# lui est défavorable (exactement le schéma du 08/07 : plusieurs pertes
+# d'affilée sur des marchés corrélés, tous perdants dans la même fenêtre).
+SEUIL_PERTES_CONSECUTIVES_PAUSE = 3    # nombre de pertes d'affilée déclenchant la pause
+DUREE_PAUSE_APRES_PERTES_MIN    = 45   # minutes de pause avant de reprendre le scan
+
+# ── Fenêtre anti-funding (08/07, carte blanche) : les frais de financement
+# des X-Perps sont prélevés aux horaires de règlement standards des
+# perpétuels (00h/08h/16h UTC). Confirmé en conditions réelles le 08/07 :
+# un trade ETHUSD de seulement 53 minutes, ouvert juste avant 16h UTC, a
+# payé -2,8629 USDC de funding — soit ~2x le gain du premier palier, un
+# coût invisible qui à lui seul transforme un petit gagnant en perdant.
+# Règle : aucune NOUVELLE ouverture dans les X minutes précédant un horaire
+# de règlement (les positions déjà ouvertes ne sont pas touchées — les
+# fermer de force coûterait des frais certains pour éviter un funding
+# incertain, mauvais échange).
+FENETRE_PRE_FUNDING_MIN = 20   # minutes avant 00h/08h/16h UTC sans nouvelle ouverture
+
+def dans_fenetre_pre_funding():
+    """True si on est à moins de FENETRE_PRE_FUNDING_MIN minutes du prochain
+    horaire de règlement du funding (00h/08h/16h UTC)."""
+    maintenant = datetime.utcnow()
+    prochains = []
+    for h in (0, 8, 16):
+        t = maintenant.replace(hour=h, minute=0, second=0, microsecond=0)
+        if t <= maintenant:
+            t += timedelta(days=1)
+        prochains.append(t)
+    prochain = min(prochains)
+    return (prochain - maintenant).total_seconds() <= FENETRE_PRE_FUNDING_MIN * 60
 TRAIL_RATIO_POST_PALIER1 = 0.002   # 08/07 (05:34) — ajusté à 0.20% suite au retrait du
                                      # palier 0.20% (retour à 28 paliers, premier à 0.30%).
                                      # Historique : 0.30% d'origine jugé trop large (give-back
@@ -116,7 +163,23 @@ RSI_SEUIL_HAUT          = 55     # RSI > 55 → marché haussier → inverser VE
 RSI_PERIODE             = 14
 
 # ── Protections
-KILL_SWITCH_JOUR        = -100.0
+# ── KILL SWITCH — refondu le 08/07 (carte blanche accordée par Damien) :
+# l'ancien seuil FIXE de -100€/jour représentait ~19% du capital actuel
+# (~530€) — un niveau de perte quotidienne qu'aucun gestionnaire de risque
+# professionnel n'accepterait avant de couper. Les standards du métier se
+# situent entre -2% et -5% par jour. Le seuil devient PROPORTIONNEL au
+# capital : -4% du capital du jour (≈ -21€ actuellement), avec l'ancien
+# -100€ conservé uniquement comme plafond absolu de sécurité si le capital
+# grossissait beaucoup. La journée du 08/07 (-13€, -2.4%) serait passée
+# JUSTE sous ce nouveau seuil — c'est voulu : une journée comme celle-là
+# doit pouvoir se produire sans tout couper, mais pas beaucoup pire.
+KILL_SWITCH_PCT         = 0.04     # perte max par jour en % du capital
+KILL_SWITCH_JOUR        = -100.0   # plafond absolu (ne sert que si capital > 2500€)
+
+def seuil_kill_switch(capital):
+    """Seuil de perte quotidienne déclenchant l'arrêt : -4% du capital,
+    borné par le plafond absolu KILL_SWITCH_JOUR."""
+    return max(-abs(capital) * KILL_SWITCH_PCT, KILL_SWITCH_JOUR)
 SEUIL_RUINE             = 300.0
 SEUIL_CAPITAL_BTC       = 6000.0  # capital mini pour que BTCUSD soit inclus dans le scan — sous ce seuil, 1 seul contrat BTC (ctVal=1 ≈ 1 BTC) coûte plus cher que toute la position ; BTC est retiré des marchés actifs jusqu'à ce que le capital dépasse ce seuil
 
@@ -126,18 +189,17 @@ SEUIL_CAPITAL_BTC       = 6000.0  # capital mini pour que BTCUSD soit inclus dan
 # soirée — le bot surestimait systématiquement le gain net, à cause du
 # coût réel d'un ordre au marché à la fermeture (spread) qui s'ajoute aux
 # frais. Écarts observés à l'époque : 0.13€ à 0.54€ selon les trades.
-# RÉTABLI le 08/07 à la demande explicite de Damien : le palier 0.20%
-# (~1,09€) revient en première position. À noter pour rester honnête sur
-# le risque : au pire écart historiquement observé (0.54€), ce palier ne
-# laisse quasiment aucune marge nette (1.09 - 0.54 frais - 0.54 écart ≈
-# 0.01€, potentiellement négatif). Deux protections ajoutées DEPUIS cette
-# première analyse réduisent ce risque sans l'annuler : le stop/plancher
-# utilise désormais un prix limite plafonné (STOP_BUFFER_SLIPPAGE_PCT, pas
-# un ordre au marché pur) et sa pose est activement validée avant d'être
-# considérée effective (voir okx_placer_ordre_stop_algo /
-# okx_amender_stop_floor). Palier 0.36% ajouté le 07/07 (12:50), conservé.
+# RÉTABLI le 08/07 à la demande explicite de Damien à 0.20%, puis RELEVÉ À
+# 0.28% le même jour (dernière chance accordée par Damien, "fais comme tu le
+# sens") après confirmation en conditions RÉELLES sur la première journée de
+# trading réel : plusieurs trades verrouillés autour de 1,06-1,09€ ne sont
+# ressortis qu'à 0,20-0,56€ net après frais — exactement le risque de marge
+# quasi nulle identifié en théorie, désormais confirmé par des trades
+# réels. 0.28% (~1,48€ sur 530€) laisse une marge nette raisonnable même
+# dans le pire cas observé, sans revenir aux 0.30% d'avant la demande de
+# Damien. Palier 0.36% ajouté le 07/07 (12:50), conservé.
 LOCK_PALIERS_PCT = [
-    0.20, 0.36, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
+    0.28, 0.36, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
     1.80, 2.20, 2.60, 3.20, 3.80, 4.60, 5.50, 6.50, 7.50, 9.00,
     10.00, 12.50, 15.00, 17.50, 20.00, 25.00, 30.00, 45.00, 60.00,
 ]
@@ -208,7 +270,15 @@ OKX_TAKER_FEE            = 0.0005  # 0.05% par exécution (ouverture OU fermetur
 # extrême qui saute par-dessus ce prix limite lui-même, l'ordre pourrait ne
 # pas se remplir immédiatement — la surveillance interne du bot (boucle de
 # CHECK_INTERVAL) reste alors le filet de secours pour fermer au marché.
-STOP_BUFFER_SLIPPAGE_PCT = 0.0015  # 0.15% au-delà du niveau de déclenchement
+# ── ÉLARGI de 0.15% à 0.25% le 08/07 (dernière chance accordée par Damien,
+# "fais comme tu le sens") : la première journée réelle a montré 3 stops
+# (ADAUSD, AAVEUSD, HYPEUSD) dépassant leur "stop max" annoncé de 0,28€ à
+# 0,73€ — signe qu'une marge de 0,15% était par moments trop juste pour que
+# l'ordre limite se remplisse immédiatement lors d'un mouvement rapide,
+# repoussant la fermeture réelle plus loin que prévu. Élargir la marge
+# augmente la fiabilité de remplissage immédiat, au prix d'un pire cas
+# théorique très légèrement plus large mais bien plus rarement atteint.
+STOP_BUFFER_SLIPPAGE_PCT = 0.0025  # 0.25% au-delà du niveau de déclenchement
 
 TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
@@ -272,7 +342,7 @@ log.info(f"  Signal : mouvement >= {SEUIL_MOUVEMENT_PCT}% depuis le prix de réf
 log.info(f"  RSI 1h : seuil bas={RSI_SEUIL_BAS} | seuil haut={RSI_SEUIL_HAUT}")
 log.info(f"  Stop : {STOP_LOSS_PCT*100:.2f}% du prix d'entrée par trade")
 log.info(f"  Frais OKX : {OKX_TAKER_FEE*100:.2f}% ouv + {OKX_TAKER_FEE*100:.2f}% ferm (taker)")
-log.info(f"  Kill switch : {KILL_SWITCH_JOUR}€/jour | Ruine : {SEUIL_RUINE}€")
+log.info(f"  Kill switch : -{KILL_SWITCH_PCT*100:.0f}%/jour du capital (plafond {KILL_SWITCH_JOUR}€) | Ruine : {SEUIL_RUINE}€")
 log.info(f"  Durée max par trade : {DUREE_MAX_MINUTES//60}h — fermeture forcée si ni stop ni lock atteint avant")
 log.info(f"  Telegram : {'ON' if TELEGRAM_TOKEN else 'OFF'}")
 log.info(f"  Mode : {'REEL' if MODE_REEL else 'SIMULATION'}")
@@ -2980,6 +3050,20 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
             etat_global["pertes_consecutives"] = etat_global.get("pertes_consecutives", 0) + 1
             etat_global["wins_consecutifs"]    = 0
 
+            if etat_global["pertes_consecutives"] >= SEUIL_PERTES_CONSECUTIVES_PAUSE:
+                etat_global["pause_ouverture_jusqua_ts"] = time.time() + DUREE_PAUSE_APRES_PERTES_MIN * 60
+                log.warning(f"  ⏸️ [PAUSE-PERTES] {etat_global['pertes_consecutives']} pertes "
+                            f"consécutives — pause de {DUREE_PAUSE_APRES_PERTES_MIN} min avant "
+                            f"toute nouvelle ouverture. Les trades déjà ouverts continuent d'être "
+                            f"surveillés normalement.")
+                await telegram(session,
+                    f"⏸️ <b>PAUSE AUTOMATIQUE — {etat_global['pertes_consecutives']} PERTES D'AFFILÉE</b>\n"
+                    f"Le bot arrête d'ouvrir de nouveaux trades pendant {DUREE_PAUSE_APRES_PERTES_MIN} "
+                    f"minutes.\n"
+                    f"Les positions déjà ouvertes restent surveillées normalement (stops/planchers "
+                    f"actifs). Reprise automatique du scan ensuite."
+                )
+
         etat_global.setdefault("historique", []).append({
             'heure':         (datetime.utcnow() - timedelta(hours=3)).strftime('%Y-%m-%d %H:%M'),
             'marche':        symbole,
@@ -3387,8 +3471,10 @@ def verifier_protections(etat, capital):
     if capital < SEUIL_RUINE:
         log.critical(f"SEUIL RUINE ! Capital {capital}€ → ARRET")
         return "RUINE"
-    if etat.get("pnl_jour", 0.0) <= KILL_SWITCH_JOUR:
-        log.warning(f"KILL SWITCH — PnL jour {etat.get('pnl_jour', 0)}€")
+    seuil_jour = seuil_kill_switch(capital)
+    if etat.get("pnl_jour", 0.0) <= seuil_jour:
+        log.warning(f"KILL SWITCH — PnL jour {etat.get('pnl_jour', 0)}€ "
+                    f"(seuil : {seuil_jour:.2f}€, soit -{KILL_SWITCH_PCT*100:.0f}% du capital)")
         return "KILL_SWITCH"
     return "OK"
 
@@ -3842,6 +3928,7 @@ async def boucle_principale():
         ("total_perdu", 0.0),
         ("cumul_net", 0.0),
         ("pertes_consecutives", 0),
+        ("pause_ouverture_jusqua_ts", 0),
         ("historique", []),
         ("dernier_maj_marches", ""),
     ]:
@@ -3992,7 +4079,7 @@ async def boucle_principale():
             + (f"{', '.join(MARCHES)}\n\n" if MARCHES else "\n")
             + f"Signal : mouvement >= {SEUIL_MOUVEMENT_PCT}%\n"
             f"Frais OKX : {OKX_TAKER_FEE*100:.2f}% ouv + {OKX_TAKER_FEE*100:.2f}% ferm (taker)\n"
-            f"Kill switch : {KILL_SWITCH_JOUR}€/jour\n"
+            f"Kill switch : -{KILL_SWITCH_PCT*100:.0f}%/jour du capital\n"
             f"Mode : {'REEL' if MODE_REEL else 'SIMULATION'}\n"
             + (f"Compte ordres : {'DÉMO (fictif)' if OKX_COMPTE_DEMO else '🚨 RÉEL — ARGENT VÉRITABLE 🚨'}\n" if MODE_REEL else "")
             + f"{(datetime.utcnow() - timedelta(hours=3)).strftime('%Y-%m-%d %H:%M:%S')}"
@@ -4074,6 +4161,30 @@ async def boucle_principale():
                 if statut == "KILL_SWITCH":
                     await asyncio.sleep(60)
                     etat = charger_etat()
+                    continue
+
+                # ── Pause après pertes consécutives (08/07) — voir
+                # SEUIL_PERTES_CONSECUTIVES_PAUSE / DUREE_PAUSE_APRES_PERTES_MIN.
+                # Bloque uniquement l'OUVERTURE de nouveaux trades ; les positions
+                # déjà ouvertes restent surveillées normalement par leurs propres
+                # tâches (stops/planchers actifs, inchangés).
+                pause_jusqua = etat.get("pause_ouverture_jusqua_ts", 0)
+                if time.time() < pause_jusqua:
+                    minutes_restantes = round((pause_jusqua - time.time()) / 60, 1)
+                    log.info(f"  ⏸️ Pause après pertes consécutives — reprise dans "
+                             f"{minutes_restantes} min")
+                    await asyncio.sleep(min(PAUSE_SCAN, pause_jusqua - time.time()))
+                    continue
+
+                # ── Fenêtre anti-funding (08/07) — voir dans_fenetre_pre_funding.
+                # Pas de Telegram ici (une simple info log toutes les 30s pendant
+                # 20 min, 3x/jour, suffit — pas la peine de notifier un
+                # comportement normal et prévu).
+                if MODE_REEL and dans_fenetre_pre_funding():
+                    log.info(f"  ⏸️ Fenêtre pré-funding ({FENETRE_PRE_FUNDING_MIN} min avant "
+                             f"00h/08h/16h UTC) — aucune nouvelle ouverture pour éviter le "
+                             f"prélèvement de financement sur une position fraîche.")
+                    await asyncio.sleep(PAUSE_SCAN)
                     continue
 
                 # Scan des marchés disponibles
