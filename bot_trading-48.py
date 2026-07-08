@@ -2064,6 +2064,13 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                                          # tentative (le bloc ci-dessous retente automatiquement
                                          # à CHAQUE tick tant que dernier_index_plancher_dur n'a
                                          # pas avancé — voir commentaire plus bas).
+    dernier_retry_stop  = 0.0   # 08/07 — throttle du retry de pose du stop natif initial (voir
+                                  # bloc "RETRY POSE STOP NATIF" plus bas dans la boucle)
+    alerte_stop_absent_envoyee = False  # une seule alerte "pas de protection native" par trade,
+                                          # pas une par tentative de retry
+    ratio_prix_retry = (stop_loss_eur / position) if position else STOP_LOSS_PCT  # 08/07 —
+                        # reconstruit ratio_prix ici (non transmis tel quel à cette fonction),
+                        # pour recalculer un stop depuis le prix ACTUEL à chaque retry.
 
     # ── Boucle de surveillance — jusqu'au stop, au lock, ou 6h max
     while True:
@@ -2425,6 +2432,64 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                 f"{lock_flag_tg}"
             )
             dernier_statut_telegram = time.time()
+
+        # ── RETRY POSE STOP NATIF (08/07, demandé par Damien — "il ne doit pas
+        # avoir d'erreur, il faut qu'il soit validé") : si la pose initiale a
+        # échoué (algo_id est None — ex. rejet OKX 51302 "SL trigger price
+        # cannot be lower than the mark price", confirmé en conditions
+        # réelles lors d'un mouvement très rapide qui avait déjà dépassé le
+        # niveau visé au moment de la pose), on ne se contente plus de la
+        # seule surveillance interne (plus lente, exposée à plus de
+        # slippage). On retente à intervalle régulier, en recalculant le
+        # niveau depuis le prix ACTUEL (pas l'ancien, déjà obsolète) — avec
+        # la même validation active que pour le plancher dur.
+        if MODE_REEL and inst_id and taille_contrats and algo_id is None:
+            maintenant_retry_stop = time.time()
+            if maintenant_retry_stop - dernier_retry_stop >= INTERVALLE_CHECK_UPL_SEC:
+                dernier_retry_stop = maintenant_retry_stop
+                side_ouverture_retry = "buy" if direction == "ACHAT" else "sell"
+                if direction == "ACHAT":
+                    nouveau_stop_retry = round(prix_actuel * (1 - ratio_prix_retry), 8)
+                else:
+                    nouveau_stop_retry = round(prix_actuel * (1 + ratio_prix_retry), 8)
+                nouvel_algo_id_retry = await okx_placer_ordre_stop_algo(
+                    session, inst_id, side_ouverture_retry, taille_contrats, nouveau_stop_retry
+                )
+                retry_confirme = False
+                if nouvel_algo_id_retry:
+                    retry_confirme = await okx_algo_order_est_actif(
+                        session, inst_id, nouvel_algo_id_retry, "fixe"
+                    )
+                if nouvel_algo_id_retry and retry_confirme:
+                    algo_id      = nouvel_algo_id_retry
+                    algo_type    = "fixe"
+                    stop_initial = nouveau_stop_retry
+                    log.info(f"  🛡️ [STOP-RETRY] {symbole} : stop natif posé ET confirmé actif "
+                             f"({nouveau_stop_retry}, recalculé depuis le prix actuel après "
+                             f"échec initial).")
+                    await telegram(session,
+                        f"🛡️ <b>STOP NATIF ACTIVÉ (après retry)</b>\n"
+                        f"{symbole} : le stop a fini par se poser et être confirmé à "
+                        f"{nouveau_stop_retry} (recalculé depuis le prix actuel, la pose "
+                        f"initiale avait échoué)."
+                    )
+                else:
+                    if nouvel_algo_id_retry and not retry_confirme:
+                        # Accepté par OKX mais pas confirmé vivant ensuite — nettoyage,
+                        # même principe que pour le plancher dur.
+                        await okx_annuler_ordre_algo(session, inst_id, nouvel_algo_id_retry)
+                    if not alerte_stop_absent_envoyee:
+                        alerte_stop_absent_envoyee = True
+                        log.error(f"  ⚠️ [STOP-RETRY] {symbole} : toujours aucune protection "
+                                  f"native active — nouvelle tentative au prochain check. "
+                                  f"Surveillance interne seule en attendant.")
+                        await telegram(session,
+                            f"⚠️ <b>AUCUNE PROTECTION NATIVE — TENTATIVES EN COURS</b>\n"
+                            f"{symbole} : le stop natif n'a toujours pas pu être posé/confirmé.\n"
+                            f"Le bot retente automatiquement toutes les {INTERVALLE_CHECK_UPL_SEC}s "
+                            f"en recalculant depuis le prix actuel. La surveillance interne reste "
+                            f"active entretemps comme filet de secours."
+                        )
 
         if atteint_stop:
             # ── CORRECTIF (07/07, relecture complète) — exactement le même
