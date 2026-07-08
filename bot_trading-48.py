@@ -182,9 +182,18 @@ BOOST_CONFIANCE         = 1.20
 
 # ── Frais OKX réels (X-Perps, palier standard/non-VIP — identiques aux Swaps Perpétuels classiques)
 # Maker 0.02% / Taker 0.05% du notionnel — le bot sort au marché à l'ouverture
-# ET à la fermeture, donc taker des deux côtés. Pas de rollover/funding modélisé
-# ici (contrairement aux frais Kraken margin, OKX ne facture pas de frais de
-# financement séparé de cette façon sur ce produit dans cette version du bot).
+# ET à la fermeture, donc taker des deux côtés. CORRECTIF (08/07) — le
+# commentaire précédent affirmait à tort qu'OKX ne facture PAS de frais de
+# financement séparé sur ce produit : FAUX, confirmé en conditions réelles
+# (trade ETHUSD du 08/07 16h UTC : -2,8629 USDC de funding fee à lui seul,
+# plus de 5x le coût normal d'ouverture+fermeture). Ce frais tombe aux
+# horaires de règlement habituels des perpétuels (généralement 00h/08h/16h
+# UTC) si une position reste ouverte à ce moment précis, même brièvement.
+# Non modélisé/anticipé dans le calcul interne du bot (STOP_LOSS_PCT,
+# paliers...) — mais correctement intégré dans le résultat OFFICIEL du
+# trade via la vérification posId (voir okx_recuperer_position_reelle),
+# qui lit le champ fundingFee séparément et l'inclut toujours dans
+# net_reel avant d'écraser l'estimation interne.
 OKX_TAKER_FEE            = 0.0005  # 0.05% par exécution (ouverture OU fermeture)
 
 # ── Marge anti-slippage sur les stops natifs (08/07, demandé par Damien) —
