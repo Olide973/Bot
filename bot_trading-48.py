@@ -2373,7 +2373,31 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
 
                     if nouveau_plancher_id and nouveau_plancher_confirme:
                         if hard_floor_algo_id:
-                            await okx_annuler_ordre_algo(session, inst_id, hard_floor_algo_id)
+                            # ── CORRECTIF (08/07) — cette annulation n'était jusqu'ici
+                            # JAMAIS vérifiée : si elle échouait silencieusement côté
+                            # OKX, l'ancien plancher restait actif et orphelin pendant
+                            # que hard_floor_algo_id pointait déjà vers le nouveau —
+                            # confirmé en conditions réelles (3 ordres SL identiques
+                            # accumulés sur un seul trade ETHUSD après le passage à
+                            # "paliers 1/2/3 posent tous un plancher"). Un essai
+                            # supplémentaire avant d'abandonner, puis alerte explicite
+                            # avec l'algoId orphelin si ça persiste — jamais silencieux.
+                            ancien_annule = await okx_annuler_ordre_algo(session, inst_id, hard_floor_algo_id)
+                            if not ancien_annule:
+                                ancien_annule = await okx_annuler_ordre_algo(session, inst_id, hard_floor_algo_id)
+                            if not ancien_annule:
+                                log.error(f"  ⚠️ [PLANCHER-DUR] {symbole} : échec d'annulation de "
+                                          f"l'ANCIEN plancher (algoId={hard_floor_algo_id}) après 2 "
+                                          f"tentatives — probablement resté actif et orphelin côté "
+                                          f"OKX, sans risque (reduce-only) mais à nettoyer manuellement.")
+                                await telegram(session,
+                                    f"⚠️ <b>ANCIEN PLANCHER PEUT-ÊTRE ORPHELIN</b>\n"
+                                    f"{symbole} : l'ancien plancher (algoId={hard_floor_algo_id}) "
+                                    f"n'a pas pu être annulé après 2 tentatives.\n"
+                                    f"Sans danger (reduce-only, ne peut pas ouvrir de position ni "
+                                    f"dépasser la taille réelle) mais pense à l'annuler manuellement "
+                                    f"sur OKX si tu le vois encore traîner."
+                                )
                         hard_floor_algo_id         = nouveau_plancher_id
                         dernier_index_plancher_dur = index_lock
                         etat_global["nb_plancher_repositionne"] = (
