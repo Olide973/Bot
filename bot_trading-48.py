@@ -57,14 +57,15 @@ INTERVALLE_CHECK_UPL_SEC = 3   # 07/07 (13:15) — la vérification du vrai PnL 
                                 # (10 trades / 3s ≈ 3.3 req/s ≈ 6.6 par 2s, sous la limite).
 PAUSE_SCAN              = 30         # secondes entre chaque scan de nouveaux marchés
 MAX_TRADES_SIMULTANES   = 10         # 10 marchés max = 1 par marché
-TRAIL_RATIO_POST_PALIER1 = 0.003   # 07/07 (14:35) — hybride demandé : stop fixe classique
-                                     # (STOP_LOSS_PCT=0.6%) jusqu'au premier palier de lock, PUIS
-                                     # bascule UNE SEULE FOIS vers le trailing natif avec cet
-                                     # écart plus serré (0.30%, même valeur que le palier 1 lui-
-                                     # même) — protège le petit gain déjà acquis à ce stade, tout
-                                     # en gardant la fiabilité du trailing natif pour la suite
-                                     # (plus de repositionnement répété = plus de risque de
-                                     # rejet 'SL trigger price cannot be lower than last price').
+TRAIL_RATIO_POST_PALIER1 = 0.001   # 07/07 (22:41) — RESSERRÉ de 0.30% à 0.10%, suite à un
+                                     # premier trade hybride réel (pic +2.81€, net final +0.31€
+                                     # seulement) : 0.30% de prix ≈ 1.96€ de give-back sur cette
+                                     # taille de position — écrasait 70% d'un petit pic. Un écart
+                                     # fixe en % du PRIX ne s'adapte pas à la taille du gain :
+                                     # négligeable sur un gros pic, disproportionné sur un petit.
+                                     # 0.10% reste un compromis : plus serré protège mieux les
+                                     # petits gains, mais risque un peu plus de sorties sur un
+                                     # simple aller-retour de prix normal (à surveiller).
 
 # ── Détection signal mean reversion — surveillance temps réel
 SEUIL_MOUVEMENT_PCT     = 0.50   # dès que le prix bouge de 0.50% → signal
@@ -113,6 +114,21 @@ def get_palier_lock(pnl_max, capital):
         if pnl_max >= palier_eur:
             lock = palier_eur
     return lock
+
+def get_palier_lock_index(pnl_max, capital):
+    """Comme get_palier_lock, mais retourne aussi l'INDEX (1-based) du palier le plus
+    haut atteint dans LOCK_PALIERS_PCT — nécessaire pour le mécanisme de 'plancher dur'
+    (07/07, 23:11) : un palier sur deux (index pair) repositionne un stop fixe
+    indépendant qui ne redescend plus jamais, en plus du trailing natif qui continue
+    normalement au-dessus. Retourne (0.0, 0) si aucun palier atteint."""
+    lock  = 0.0
+    index = 0
+    for i, pct in enumerate(LOCK_PALIERS_PCT, 1):
+        palier_eur = round(capital * pct / 100, 2)
+        if pnl_max >= palier_eur:
+            lock  = palier_eur
+            index = i
+    return lock, index
 
 # ── Gestion mise dynamique
 WINS_CONFIANCE          = 3
@@ -669,7 +685,7 @@ async def okx_position_existe_deja(session, inst_id, contexte="anti-doublon"):
         log.error(f"  [{contexte.upper()}] Exception vérification position {inst_id} : {e}")
         return None
 
-async def okx_algo_order_est_actif(session, inst_id, algo_id):
+async def okx_algo_order_est_actif(session, inst_id, algo_id, algo_type):
     """Vérifie que l'ordre algo (stop fixe OU trailing) est bien encore VIVANT
     côté OKX — GET /api/v5/trade/orders-algo-pending (confirmé via la doc
     officielle : 'Retrieve a list of untriggered Algo orders'). Angle mort
@@ -683,14 +699,28 @@ async def okx_algo_order_est_actif(session, inst_id, algo_id):
     protection réelle — jusqu'à ce que le prix s'effondre sans qu'aucun stop
     ne se déclenche. Exactement le symptôme rapporté : paliers 1, 2, 3
     franchis normalement puis chute brutale en négatif, sans fermeture.
+
+    CORRECTIF (07/07, 22:54) : le paramètre 'ordType' est REQUIS par cet
+    endpoint — confirmé par l'erreur OKX elle-même (code 51000 'Parameter
+    ordType error', où 51000 est un code générique documenté 'Parameter %s
+    error', %s précisant le nom du paramètre en cause). Sans lui, CHAQUE
+    appel échouait silencieusement (aucune exception Python, juste un code
+    d'erreur ignoré par l'appelant) — la vérification n'a donc JAMAIS
+    fonctionné depuis sa création, bien que le reste du système ait
+    continué à protéger correctement via l'autre garde-fou (vérification
+    d'existence de la position). algo_type ('fixe' ou 'trailing') est
+    mappé vers la valeur OKX correspondante ('conditional' ou
+    'move_order_stop').
+
     Retourne True si l'ordre est bien dans la liste des ordres en attente,
     False s'il n'y est plus (danger : protection disparue), None si la
     vérification a échoué (repli : ne pas déclencher une fausse alerte sur
     un simple aléa réseau)."""
     if not algo_id:
         return None
+    ord_type_okx = "move_order_stop" if algo_type == "trailing" else "conditional"
     path  = "/api/v5/trade/orders-algo-pending"
-    query = f"?instId={inst_id}&algoId={algo_id}"
+    query = f"?instId={inst_id}&algoId={algo_id}&ordType={ord_type_okx}"
     try:
         async with session.get(
             OKX_BASE_URL + path + query,
@@ -1733,6 +1763,12 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                                        # "l'ordre de protection est-il encore vivant chez OKX ?"
                                        # (voir okx_algo_order_est_actif) — même fréquence que les
                                        # autres checks, pour rester sous le rate limit.
+    hard_floor_algo_id       = None  # 07/07 (23:11) — ordre FIXE indépendant du trailing,
+                                       # repositionné vers le haut à chaque palier "dur" (1 sur 2).
+                                       # Jamais touché par la logique du trailing/bascule — un
+                                       # second filet totalement séparé.
+    dernier_index_plancher_dur = 0    # index (1-based) du dernier palier "dur" déjà posé, pour ne
+                                       # jamais reposer deux fois le même plancher.
 
     # ── Boucle de surveillance — jusqu'au stop, au lock, ou 6h max
     while True:
@@ -1809,7 +1845,7 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
             maintenant_algo = time.time()
             if maintenant_algo - dernier_check_algo_vivant >= INTERVALLE_CHECK_UPL_SEC:
                 dernier_check_algo_vivant = maintenant_algo
-                algo_vivant = await okx_algo_order_est_actif(session, inst_id, algo_id)
+                algo_vivant = await okx_algo_order_est_actif(session, inst_id, algo_id, algo_type)
                 if algo_vivant is False:
                     # Ordre introuvable dans les ordres en attente : soit il
                     # a déclenché (position fermée), soit il a disparu sans
@@ -1842,7 +1878,7 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                     # fermeture normale via leur propre détection.
 
 
-        nouveau_lock = get_palier_lock(pnl_max_atteint, capital)
+        nouveau_lock, index_lock = get_palier_lock_index(pnl_max_atteint, capital)
         if nouveau_lock > lock_actuel:
             etait_zero_avant = (lock_actuel == 0.0)  # vrai seulement au tout premier palier franchi
             lock_actuel = nouveau_lock
@@ -1885,6 +1921,44 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                 else:
                     log.warning(f"  ⚠️ [BASCULE] Échec de la bascule vers le trailing pour {symbole} "
                                 f"— le stop fixe initial reste actif comme filet.")
+
+            # ── PLANCHER DUR — 1 palier sur 2 (07/07, 23:11, demandé) : en plus
+            # du trailing natif ci-dessus (qu'on ne touche JAMAIS ici), un
+            # SECOND ordre indépendant — un stop FIXE classique — se
+            # repositionne vers le haut à chaque palier d'INDEX PAIR (2e, 4e,
+            # 6e...). Une fois posé, ce plancher ne bouge plus tant que le
+            # palier pair suivant n'est pas atteint : le prix ne peut plus
+            # jamais redescendre en dessous, quoi que fasse le trailing
+            # au-dessus. Ordre des opérations, comme pour la bascule : on pose
+            # le NOUVEAU plancher d'abord, on n'annule l'ANCIEN plancher (pas
+            # le trailing !) que si la pose a réussi — jamais de fenêtre sans
+            # protection.
+            if (index_lock % 2 == 0 and index_lock > dernier_index_plancher_dur
+                    and MODE_REEL and inst_id and taille_contrats):
+                if direction == "ACHAT":
+                    prix_plancher = round(prix_entree * (1 + lock_actuel / position), 8)
+                else:
+                    prix_plancher = round(prix_entree * (1 - lock_actuel / position), 8)
+                side_ouverture_plancher = "buy" if direction == "ACHAT" else "sell"
+                nouveau_plancher_id = await okx_placer_ordre_stop_algo(
+                    session, inst_id, side_ouverture_plancher, taille_contrats, prix_plancher
+                )
+                if nouveau_plancher_id:
+                    if hard_floor_algo_id:
+                        await okx_annuler_ordre_algo(session, inst_id, hard_floor_algo_id)
+                    hard_floor_algo_id         = nouveau_plancher_id
+                    dernier_index_plancher_dur = index_lock
+                    log.info(f"  🧱 [PLANCHER-DUR] {symbole} : plancher repositionné à {lock_actuel}€ "
+                             f"(palier #{index_lock}, prix={prix_plancher})")
+                    await telegram(session,
+                        f"🧱 <b>PLANCHER VERROUILLÉ : {lock_actuel}€</b>\n"
+                        f"{symbole} : ce niveau ne peut plus être franchi vers le bas, quoi qu'il "
+                        f"arrive au trailing au-dessus."
+                    )
+                else:
+                    log.warning(f"  ⚠️ [PLANCHER-DUR] Échec repositionnement pour {symbole} sur le "
+                                f"palier #{index_lock} ({lock_actuel}€) — l'ancien plancher (s'il "
+                                f"existe) reste actif.")
 
         # Stop loss — calculé et vérifié EN PREMIER, avant toute logique de
         # lock. Priorité absolue : si le prix a franchi le niveau de stop,
@@ -2080,6 +2154,15 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
             await okx_annuler_trailing_stop(session, inst_id, algo_id)
         else:
             await okx_annuler_ordre_algo(session, inst_id, algo_id)
+
+    # ── Annulation du plancher dur (07/07, 23:11) — ordre INDÉPENDANT du
+    # trailing/stop ci-dessus, toujours de type 'conditional' (jamais
+    # trailing), donc toujours annulé via okx_annuler_ordre_algo. Sans
+    # cette annulation, un plancher resté actif pourrait se déclencher plus
+    # tard sur un AUTRE trade ouvert ensuite sur le même marché — même
+    # risque que pour l'algo principal.
+    if MODE_REEL and inst_id and hard_floor_algo_id:
+        await okx_annuler_ordre_algo(session, inst_id, hard_floor_algo_id)
 
     # ── Fermeture réelle de la position — INACTIF tant que MODE_REEL=0
     if MODE_REEL and inst_id:
