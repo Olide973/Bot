@@ -3784,33 +3784,54 @@ async def boucle_principale():
     connector = aiohttp.TCPConnector(limit=50)
     async with aiohttp.ClientSession(connector=connector) as session:
 
-        # ── Récupération automatique du vrai capital OKX au démarrage —
-        # UNIQUEMENT lors d'un RESET_TOUT explicite en MODE_REEL (un vrai
-        # nouveau départ voulu). Sur un simple redémarrage normal, on garde
-        # le capital déjà suivi en base (déjà tenu à jour par la
-        # resynchronisation post-trade) plutôt que de le réécraser.
-        if MODE_REEL and RESET_TOUT:
-            log.info("  RESET_TOUT + MODE_REEL : récupération automatique du capital réel OKX...")
+        # ── Récupération automatique du vrai capital OKX au démarrage (08/07,
+        # CORRIGÉ suite à une clarification de Damien : le bot doit vérifier
+        # lui-même le capital réel, pas se fier à une valeur codée en dur).
+        # DEUX changements par rapport à la version précédente :
+        # 1) S'exécute à CHAQUE démarrage en compte RÉEL (OKX_COMPTE_DEMO=0),
+        #    pas seulement lors d'un RESET_TOUT — sur un compte réel, le solde
+        #    OKX est TOUJOURS la source de vérité, il n'y a jamais de faux
+        #    solde à filtrer (contrairement au compte démo).
+        # 2) Le garde-fou "écart > 50% rejeté" est retiré pour un compte
+        #    RÉEL : il n'avait de sens que pour filtrer le solde démo par
+        #    défaut (~99 000 USDC, sans rapport avec les fonds alloués) — sur
+        #    un compte réel, ce même garde-fou pouvait à tort REJETER le vrai
+        #    solde s'il s'écartait de plus de 50% de la valeur codée en dur
+        #    (543.65€), ce qui aurait précisément empêché la synchronisation
+        #    automatique demandée. Le garde-fou reste actif uniquement pour
+        #    le compte DÉMO (OKX_COMPTE_DEMO=1), où le faux solde existe
+        #    réellement et doit continuer à être filtré.
+        if MODE_REEL and not OKX_COMPTE_DEMO:
+            log.info("  Compte RÉEL : récupération automatique du capital réel OKX...")
             solde_reel_demarrage = await okx_recuperer_solde_reel(session, "USDC")
             if solde_reel_demarrage is not None:
-                # Même garde-fou que la resynchronisation post-trade : rejette
-                # un solde qui s'écarte de plus de 50% de la dernière valeur
-                # connue (protection contre le solde démo par défaut ~100 000
-                # USDC sans rapport avec les fonds réellement alloués).
-                ecart_relatif = abs(solde_reel_demarrage - CAPITAL_INITIAL) / CAPITAL_INITIAL if CAPITAL_INITIAL > 0 else 0
-                if ecart_relatif > 0.5:
-                    log.error(f"  ⚠️ Solde OKX invraisemblable au démarrage rejeté : "
-                              f"{solde_reel_demarrage:.2f} USDC vs référence {CAPITAL_INITIAL}€ "
-                              f"(écart {ecart_relatif*100:.0f}%) — valeur codée en dur conservée")
-                else:
+                capital_avant = etat.get("capital", CAPITAL_INITIAL)
+                # La référence de performance (CAPITAL_INITIAL, base du %) n'est
+                # fixée qu'une seule fois — au tout premier démarrage réel (ou
+                # après un RESET_TOUT explicite) — pour ne pas faire bouger le
+                # point de départ des calculs de performance à chaque redémarrage.
+                if RESET_TOUT or etat.get("nb_trades", 0) == 0:
                     CAPITAL_INITIAL = round(solde_reel_demarrage, 2)
-                    etat["capital"] = CAPITAL_INITIAL
-                    sauvegarder_etat(etat)
-                    log.info(f"  ✅ Capital initial fixé automatiquement sur le vrai solde OKX : "
-                             f"{CAPITAL_INITIAL} USDC")
+                etat["capital"] = round(solde_reel_demarrage, 2)
+                sauvegarder_etat(etat)
+                log.info(f"  ✅ Capital réel synchronisé automatiquement depuis OKX : "
+                         f"{etat['capital']}€ (référence CAPITAL_INITIAL={CAPITAL_INITIAL}€, "
+                         f"valeur avant sync : {capital_avant}€)")
+                await telegram(session,
+                    f"💰 <b>CAPITAL RÉEL SYNCHRONISÉ AUTOMATIQUEMENT</b>\n"
+                    f"Lu directement sur ton compte OKX au démarrage : <b>{etat['capital']}€</b>\n"
+                    f"Aucune valeur codée en dur utilisée pour un compte réel."
+                )
             else:
-                log.warning("  ⚠️ Impossible de récupérer le vrai solde OKX au démarrage — "
-                            "valeur codée en dur conservée")
+                log.error("  ❌ Impossible de récupérer le vrai solde OKX au démarrage (compte "
+                          "réel) — valeur précédente conservée. À VÉRIFIER avant de laisser "
+                          "le bot ouvrir des trades.")
+                await telegram(session,
+                    f"⚠️ <b>ÉCHEC LECTURE SOLDE RÉEL AU DÉMARRAGE</b>\n"
+                    f"Capital conservé : {etat.get('capital', CAPITAL_INITIAL)}€ (non "
+                    f"resynchronisé). Vérifie que ça correspond à ton capital réel avant de "
+                    f"laisser le bot trader."
+                )
 
         # ── Chargement initial des marchés x10 depuis l'API OKX
         log.info("  Chargement des marchés x10 depuis l'API OKX...")
