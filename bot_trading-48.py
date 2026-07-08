@@ -1032,6 +1032,52 @@ async def okx_placer_trailing_stop_natif(session, inst_id, side_ouverture, taill
         log.error(f"  ❌ [TRAILING] Exception pose trailing stop {inst_id} : {e}")
         return None
 
+async def okx_amender_stop_floor(session, inst_id, algo_id, nouveau_prix_stop):
+    """Modifie EN PLACE le prix de déclenchement (slTriggerPx) du plancher dur
+    déjà posé, via /api/v5/trade/amend-algos — SANS l'annuler ni en reposer
+    un nouveau. Confirmé via la doc officielle OKX (endpoint distinct de
+    place-algo/cancel-algos, section Algo Trading) : 1 seul appel réseau au
+    lieu de 2 (pose du nouveau + annulation de l'ancien), et surtout aucune
+    fenêtre où le plancher serait absent ou dupliqué pendant la transition.
+
+    Ne s'applique QU'au plancher dur (ordType='conditional') — le trailing
+    natif ('move_order_stop') n'a pas de champ callbackRatio amendable par
+    cet endpoint, mais n'en a de toute façon pas besoin puisqu'il suit déjà
+    le prix en continu côté serveur OKX.
+
+    Retourne True si l'amendement a réussi, False sinon — dans ce cas,
+    l'appelant doit se rabattre sur l'ancien mécanisme pose+annulation
+    (jamais de trade laissé sans plancher à cause d'un simple échec ici)."""
+    if not algo_id:
+        return False
+    path = "/api/v5/trade/amend-algos"
+    body = json.dumps({
+        "instId":         inst_id,
+        "algoId":         algo_id,
+        "newSlTriggerPx": str(nouveau_prix_stop),
+        "newSlOrdPx":     "-1",   # exécution au marché dès déclenchement, comme à la pose initiale
+    })
+    try:
+        async with session.post(
+            OKX_BASE_URL + path, data=body,
+            headers=_okx_headers("POST", path, body),
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+            if data.get("code") != "0":
+                items = data.get("data", [])
+                sCode = items[0].get("sCode") if items else None
+                log.warning(f"  ⚠️ [PLANCHER-AMEND] Échec amendement {inst_id} algoId={algo_id} "
+                            f"vers {nouveau_prix_stop} (sCode={sCode}) : {data} — repli sur "
+                            f"pose+annulation.")
+                return False
+            log.info(f"  🧱 [PLANCHER-AMEND] Plancher amendé en place : {inst_id} algoId={algo_id} "
+                     f"→ {nouveau_prix_stop} (1 seul appel, aucune fenêtre sans protection)")
+            return True
+    except Exception as e:
+        log.error(f"  ❌ [PLANCHER-AMEND] Exception amendement {inst_id} algoId={algo_id} : {e}")
+        return False
+
 async def okx_annuler_trailing_stop(session, inst_id, algo_id):
     """Annule un trailing stop natif — endpoint DIFFÉRENT du stop classique.
     La doc OKX précise explicitement que /trade/cancel-algos NE COUVRE PAS
@@ -2003,26 +2049,58 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                     prix_plancher = round(prix_entree * (1 + lock_actuel / position), 8)
                 else:
                     prix_plancher = round(prix_entree * (1 - lock_actuel / position), 8)
-                side_ouverture_plancher = "buy" if direction == "ACHAT" else "sell"
-                nouveau_plancher_id = await okx_placer_ordre_stop_algo(
-                    session, inst_id, side_ouverture_plancher, taille_contrats, prix_plancher
-                )
-                if nouveau_plancher_id:
-                    if hard_floor_algo_id:
-                        await okx_annuler_ordre_algo(session, inst_id, hard_floor_algo_id)
-                    hard_floor_algo_id         = nouveau_plancher_id
+
+                # ── Amendement en place EN PRIORITÉ (08/07) : si un plancher
+                # existe déjà (pas le tout premier), on tente de modifier son
+                # prix directement via /trade/amend-algos — 1 seul appel,
+                # aucune fenêtre sans protection. Repli automatique sur
+                # l'ancien mécanisme pose+annulation si l'amendement échoue
+                # (ex: non supporté sur ce type de compte) ou s'il n'y a pas
+                # encore de plancher à amender.
+                plancher_amende = False
+                if hard_floor_algo_id:
+                    plancher_amende = await okx_amender_stop_floor(
+                        session, inst_id, hard_floor_algo_id, prix_plancher
+                    )
+
+                if plancher_amende:
                     dernier_index_plancher_dur = index_lock
-                    log.info(f"  🧱 [PLANCHER-DUR] {symbole} : plancher repositionné à {lock_actuel}€ "
+                    etat_global["nb_plancher_amende"] = etat_global.get("nb_plancher_amende", 0) + 1
+                    log.info(f"  🧱 [PLANCHER-DUR] {symbole} : plancher amendé à {lock_actuel}€ "
                              f"(palier #{index_lock}, prix={prix_plancher})")
                     await telegram(session,
                         f"🧱 <b>PLANCHER VERROUILLÉ : {lock_actuel}€</b>\n"
                         f"{symbole} : ce niveau ne peut plus être franchi vers le bas, quoi qu'il "
-                        f"arrive au trailing au-dessus."
+                        f"arrive au trailing au-dessus.\n"
+                        f"<i>Méthode : amendement en place (1 appel, sans interruption)</i>"
                     )
                 else:
-                    log.warning(f"  ⚠️ [PLANCHER-DUR] Échec repositionnement pour {symbole} sur le "
-                                f"palier #{index_lock} ({lock_actuel}€) — l'ancien plancher (s'il "
-                                f"existe) reste actif.")
+                    side_ouverture_plancher = "buy" if direction == "ACHAT" else "sell"
+                    nouveau_plancher_id = await okx_placer_ordre_stop_algo(
+                        session, inst_id, side_ouverture_plancher, taille_contrats, prix_plancher
+                    )
+                    if nouveau_plancher_id:
+                        if hard_floor_algo_id:
+                            await okx_annuler_ordre_algo(session, inst_id, hard_floor_algo_id)
+                        hard_floor_algo_id         = nouveau_plancher_id
+                        dernier_index_plancher_dur = index_lock
+                        etat_global["nb_plancher_repositionne"] = (
+                            etat_global.get("nb_plancher_repositionne", 0) + 1
+                        )
+                        log.info(f"  🧱 [PLANCHER-DUR] {symbole} : plancher repositionné "
+                                 f"(pose+annulation) à {lock_actuel}€ (palier #{index_lock}, "
+                                 f"prix={prix_plancher})")
+                        await telegram(session,
+                            f"🧱 <b>PLANCHER VERROUILLÉ : {lock_actuel}€</b>\n"
+                            f"{symbole} : ce niveau ne peut plus être franchi vers le bas, quoi "
+                            f"qu'il arrive au trailing au-dessus.\n"
+                            f"<i>Méthode : repositionnement classique (pose+annulation — "
+                            f"l'amendement direct n'était pas possible ici)</i>"
+                        )
+                    else:
+                        log.warning(f"  ⚠️ [PLANCHER-DUR] Échec repositionnement pour {symbole} "
+                                    f"sur le palier #{index_lock} ({lock_actuel}€) — l'ancien "
+                                    f"plancher (s'il existe) reste actif.")
 
         # Stop loss — calculé et vérifié EN PREMIER, avant toute logique de
         # lock. Priorité absolue : si le prix a franchi le niveau de stop,
@@ -2672,6 +2750,8 @@ def reset_pnl_jour_si_nouveau_jour(etat):
     if etat.get("date_jour", "") != aujourd_hui:
         etat["pnl_jour"]  = 0.0
         etat["date_jour"] = aujourd_hui
+        etat["nb_plancher_amende"]        = 0
+        etat["nb_plancher_repositionne"]  = 0
         log.info("  Nouveau jour — PnL remis à 0")
         return True
     return False
@@ -2812,6 +2892,18 @@ async def envoyer_rapport_quotidien(session, etat):
     msg_top  = "\n".join([f"🏆 {m} {'+' if g>=0 else ''}{g}€" for m, g in top3])
     msg_pire = "\n".join([f"💀 {m} {g}€" for m, g in pires3 if g < 0])
 
+    nb_amende        = etat.get("nb_plancher_amende", 0)
+    nb_repositionne  = etat.get("nb_plancher_repositionne", 0)
+    nb_planchers_maj = nb_amende + nb_repositionne
+    if nb_planchers_maj > 0:
+        bloc_plancher = (
+            f"\n🧱 <b>PLANCHERS DURS MIS À JOUR</b>\n"
+            f"Amendés (1 appel) : {nb_amende} | Repositionnés (pose+annulation) : "
+            f"{nb_repositionne}\n"
+        )
+    else:
+        bloc_plancher = ""
+
     message = (
         f"📊 <b>RAPPORT QUOTIDIEN</b>\n"
         f"Journee du {date_affich}\n\n"
@@ -2826,7 +2918,8 @@ async def envoyer_rapport_quotidien(session, etat):
         f"📊 <b>VOLUME MOYEN</b>\n"
         f"Gagnants : {vol_moy_w}x | Perdants : {vol_moy_p}x\n\n"
         f"🕐 <b>HEURES DES PERTES</b>\n"
-        f"{lignes_pertes_h}\n\n"
+        f"{lignes_pertes_h}\n"
+        f"{bloc_plancher}\n"
         f"<code>{'─'*40}</code>\n"
         f"<b>CLASSEMENT MARCHÉS</b>\n"
         f"<code>{'MARCHÉ':<12} {'GAINS':<10} {'G/P':<6} RSI MOY</code>\n"
@@ -3091,6 +3184,8 @@ async def boucle_principale():
         ("date_jour", ""),
         ("wins_consecutifs", 0),
         ("nb_skips", 0),
+        ("nb_plancher_amende", 0),
+        ("nb_plancher_repositionne", 0),
         ("nb_trades", 0),
         ("nb_wins", 0),
         ("nb_losses", 0),
