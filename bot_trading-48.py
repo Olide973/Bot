@@ -2338,10 +2338,28 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                 # s'occupe de la fermeture réelle et de la vérification posId —
                 # aucune duplication de logique de fermeture ici.
                 if niveau_deja_depasse:
+                    # ── CORRECTIF (08/07) — incident réel confirmé sur HYPEUSD : la
+                    # fermeture d'urgence attendait le nettoyage générique après la
+                    # boucle (annulation du stop, annulation du plancher, PUIS
+                    # fermeture) — plusieurs appels réseau séquentiels, chacun
+                    # ajoutant de la latence pendant laquelle le prix continue de
+                    # bouger (précisément parce qu'on est dans le cas où il bouge
+                    # déjà trop vite). Résultat observé : "PnL au moment de la
+                    # décision" +1.09€, mais net réel seulement +0.21€ — l'écart
+                    # venait en bonne partie de cette latence évitable. Priorité
+                    # absolue maintenant : fermer la position TOUT DE SUITE, avant
+                    # même d'envoyer le message Telegram — okx_fermer_position est
+                    # sûre à appeler même si un ordre stop/plancher existe encore
+                    # (reduce-only, jamais de double fermeture), et le nettoyage
+                    # générique après la boucle annulera les ordres devenus inutiles
+                    # sans effet néfaste (position déjà fermée = no-op silencieux).
                     log.error(f"  🚨 [PLANCHER-DUR] {symbole} : niveau du palier #{index_lock} "
                               f"({lock_actuel}€, prix cible={prix_plancher}) déjà dépassé par le "
-                              f"prix actuel ({prix_actuel}) — fermeture immédiate au marché plutôt "
-                              f"que de poser un plancher affaibli.")
+                              f"prix actuel ({prix_actuel}) — fermeture immédiate au marché "
+                              f"(priorité absolue, avant même les messages) plutôt que de poser un "
+                              f"plancher affaibli ou d'attendre le nettoyage générique.")
+                    if inst_id:
+                        await okx_fermer_position(session, inst_id)
                     frais_urgence   = calc_frais(position)
                     gain_final      = round(pnl - frais_urgence["total"], 4)
                     resultat_final  = "GAGNE" if gain_final > 0 else "PERDU"
@@ -2349,9 +2367,10 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                         f"🚨 <b>FERMETURE IMMÉDIATE — PALIER NON TENABLE</b>\n"
                         f"{symbole} : le niveau du palier #{index_lock} ({lock_actuel}€) n'était "
                         f"déjà plus atteignable au moment de la pose (prix trop rapide).\n"
-                        f"Plutôt que de poser un plancher affaibli, fermeture immédiate pour "
-                        f"capturer le meilleur prix encore disponible.\n"
-                        f"PnL au moment de la décision : {'+' if pnl>=0 else ''}{pnl:.2f}€"
+                        f"Fermeture envoyée immédiatement, en priorité absolue, pour capturer le "
+                        f"meilleur prix encore disponible.\n"
+                        f"PnL au moment de la décision (estimation, avant vérification OKX) : "
+                        f"{'+' if pnl>=0 else ''}{pnl:.2f}€"
                     )
                     break
 
