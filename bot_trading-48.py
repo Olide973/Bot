@@ -137,6 +137,20 @@ BOOST_CONFIANCE         = 1.20
 # financement séparé de cette façon sur ce produit dans cette version du bot).
 OKX_TAKER_FEE            = 0.0005  # 0.05% par exécution (ouverture OU fermeture)
 
+# ── Marge anti-slippage sur les stops natifs (08/07, demandé par Damien) —
+# un stop "au marché" (slOrdPx=-1) garantit la fermeture mais PAS le prix :
+# lors d'un mouvement brutal (confirmé en conditions réelles : perte de
+# -21,59 USDC pour un stop prévu à -3,24€), le prix d'exécution réel peut
+# être largement pire que le niveau de déclenchement. En posant plutôt un
+# prix LIMITE légèrement au-delà du déclenchement (recommandation officielle
+# OKX : "set the order price not too close to the trigger price to ensure
+# the order will be filled promptly"), on plafonne la perte maximale
+# possible au lieu de la laisser ouverte. Contrepartie assumée : dans un gap
+# extrême qui saute par-dessus ce prix limite lui-même, l'ordre pourrait ne
+# pas se remplir immédiatement — la surveillance interne du bot (boucle de
+# CHECK_INTERVAL) reste alors le filet de secours pour fermer au marché.
+STOP_BUFFER_SLIPPAGE_PCT = 0.0015  # 0.15% au-delà du niveau de déclenchement
+
 TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 OKX_API_KEY      = os.environ.get('OKX_API_KEY', '')
@@ -165,6 +179,18 @@ MARCHES          = []   # liste des symboles actifs (levier x10 uniquement)
 OKX_SYMBOLS      = {}   # { "BTCUSD": "BTC-USD-YYMMDD", ... } — instId PUBLIC (www.okx.com), utilisé pour les prix (WebSocket + REST) — NE PAS écraser avec l'instId du compte
 OKX_SYMBOLS_EXEC = {}   # { "BTCUSD": "BTC-USD-YYMMDD", ... } — instId scopé au COMPTE (démo ou réel), utilisé uniquement pour passer/fermer un ordre
 OKX_CT_VAL       = {}   # { "BTCUSD": 0.01, ... } — valeur d'un contrat (usage réel uniquement)
+
+# ── Alerte anticipée de rollover X-Perp (08/07) : chaque X-Perp a une date
+# d'expiration ferme (~5 ans, champ expTime), à laquelle OKX génère un
+# NOUVEAU contrat (nouvel instId) pour le même actif — confirmé via la
+# doc officielle OKX ("On the first day of the expiry month, a new
+# far-dated contract is automatically generated"). C'est très probablement
+# la cause structurelle des incohérences instId feed/exécution observées
+# depuis plusieurs semaines. On ne peut pas empêcher ce rollover (il est
+# côté OKX), mais on peut le voir venir et prévenir Damien À L'AVANCE
+# plutôt que de le découvrir en cours de trade.
+SEUIL_ALERTE_ROLLOVER_JOURS = 10  # avertir dès que l'expiration est à moins de X jours
+ROLLOVER_ALERTES_ENVOYEES   = set()  # instId déjà signalés cette session — pas de spam quotidien
 
 # ═══════════════════════════════════════════════════════════════
 #  ÉTAT GLOBAL
@@ -352,26 +378,119 @@ async def filtrer_marches_selon_compte(session):
             if base:
                 inst_par_base[base] = inst  # instrument complet, scopé au compte
 
-        avant            = set(MARCHES)
-        nouveaux_marches = [m for m in MARCHES if m[:-3] in inst_par_base]
-        supprimes        = avant - set(nouveaux_marches)
+        # ── Snapshot de l'ancien mapping AVANT écrasement (08/07) — nécessaire
+        # pour détecter un changement d'instId (= rollover survenu) et le
+        # distinguer d'une simple première résolution.
+        ancien_exec = dict(OKX_SYMBOLS_EXEC)
 
-        MARCHES = nouveaux_marches
+        avant                = set(MARCHES)
+        candidats            = [m for m in avant if m[:-3] in inst_par_base]
+        nouveaux_marches     = []
         nouveaux_ct_val_exec = {}
-        for m in MARCHES:
-            inst_exec = inst_par_base[m[:-3]]
-            OKX_SYMBOLS_EXEC[m] = inst_exec.get("instId")  # instId d'exécution, scopé au compte — jamais utilisé pour les prix
+
+        for m in candidats:
+            inst_exec    = inst_par_base[m[:-3]]
+            inst_id_exec = inst_exec.get("instId")
             ct_val_public = OKX_CT_VAL.get(m)
             try:
                 ct_val_exec = float(inst_exec.get("ctVal", 0) or 0)
             except (TypeError, ValueError):
                 ct_val_exec = 0.0
-            nouveaux_ct_val_exec[m] = ct_val_exec
+
+            # ── GARDE-FOU (08/07) — "le bot s'adapte automatiquement au nouveau
+            # contrat SI il est conforme, sinon il bloque le marché" (demandé
+            # explicitement par Damien, suite à l'incident BTCUSD ctVal=0.0001
+            # vs 1, facteur 10000, qui avait causé un surdimensionnement de
+            # position). Conditions minimales de conformité avant d'accepter
+            # ce contrat pour trader dessus : ctVal exploitable (>0), devise de
+            # règlement et de contrat renseignées, et état "live" si le champ
+            # est présent (pas "expired"/"suspend"). Si une seule de ces
+            # conditions échoue, le marché est EXCLU de MARCHES (donc plus
+            # aucun trade dessus) plutôt que de deviner ou de tenter avec des
+            # valeurs invalides.
+            conforme  = True
+            problemes = []
+            if ct_val_exec <= 0:
+                conforme = False
+                problemes.append(f"ctVal invalide ({inst_exec.get('ctVal')!r})")
+            if not inst_exec.get("ctValCcy"):
+                conforme = False
+                problemes.append("ctValCcy manquant")
+            if not inst_exec.get("settleCcy"):
+                conforme = False
+                problemes.append("settleCcy manquant")
+            etat_inst = inst_exec.get("state")
+            if etat_inst and etat_inst != "live":
+                conforme = False
+                problemes.append(f"state={etat_inst} (attendu 'live')")
+
+            if not conforme:
+                log.error(f"  🚫 [MARCHÉ BLOQUÉ] {m} : contrat {inst_id_exec} non conforme — "
+                          f"{', '.join(problemes)}. Exclu de MARCHES jusqu'au prochain "
+                          f"rafraîchissement.")
+                await telegram(session,
+                    f"🚫 <b>MARCHÉ BLOQUÉ : {m}</b>\n"
+                    f"Le contrat {inst_id_exec} ne respecte pas les critères de conformité "
+                    f"({', '.join(problemes)}).\n"
+                    f"Aucun trade ne sera ouvert sur {m} tant que ce n'est pas résolu côté "
+                    f"OKX — re-vérifié automatiquement à chaque rafraîchissement des marchés."
+                )
+                continue  # ne PAS inclure ce marché — jamais deviner avec des valeurs douteuses
+
+            # ── Contrat conforme : on l'adopte. Si l'instId a changé depuis la
+            # dernière fois (rollover survenu), le bot bascule automatiquement
+            # dessus et le signale clairement — plutôt que de continuer à
+            # utiliser silencieusement l'ancien identifiant.
+            ancien_id = ancien_exec.get(m)
+            if ancien_id and ancien_id != inst_id_exec:
+                log.warning(f"  🔄 [ROLLOVER] {m} : nouveau contrat adopté automatiquement "
+                            f"({ancien_id} → {inst_id_exec}, ctVal={ct_val_exec}).")
+                await telegram(session,
+                    f"🔄 <b>ROLLOVER DÉTECTÉ ET ADOPTÉ</b>\n"
+                    f"{m} : bascule automatique vers le nouveau contrat conforme.\n"
+                    f"Ancien : <code>{ancien_id}</code>\n"
+                    f"Nouveau : <code>{inst_id_exec}</code> (ctVal={ct_val_exec})\n"
+                    f"Aucune action requise — le bot trade désormais sur le nouveau contrat."
+                )
+
+            nouveaux_marches.append(m)
+            OKX_SYMBOLS_EXEC[m]      = inst_id_exec  # instId d'exécution, scopé au compte — jamais utilisé pour les prix
+            nouveaux_ct_val_exec[m]  = ct_val_exec
             ecart = " ⚠️ ÉCART DÉTECTÉ" if ct_val_public and ct_val_exec and ct_val_public != ct_val_exec else ""
-            log.info(f"     [DIAG-EXEC] {m} instId={inst_exec.get('instId')} "
+            log.info(f"     [DIAG-EXEC] {m} instId={inst_id_exec} "
                      f"ctVal={inst_exec.get('ctVal')} ctValCcy={inst_exec.get('ctValCcy')} "
                      f"settleCcy={inst_exec.get('settleCcy')} instFamily={inst_exec.get('instFamily')} "
                      f"(vs ctVal catalogue public : {ct_val_public}){ecart}")
+
+            # ── Alerte anticipée de rollover (08/07) — voir commentaire sur
+            # SEUIL_ALERTE_ROLLOVER_JOURS. expTime est un timestamp epoch en
+            # millisecondes (chaîne), vide pour les instruments sans échéance.
+            exp_time_ms = inst_exec.get("expTime")
+            if exp_time_ms and inst_id_exec not in ROLLOVER_ALERTES_ENVOYEES:
+                try:
+                    exp_dt        = datetime.utcfromtimestamp(int(exp_time_ms) / 1000)
+                    jours_restants = (exp_dt - datetime.utcnow()).days
+                    if jours_restants <= SEUIL_ALERTE_ROLLOVER_JOURS:
+                        ROLLOVER_ALERTES_ENVOYEES.add(inst_id_exec)
+                        log.warning(f"  📅 [ROLLOVER] {m} : le contrat {inst_id_exec} expire le "
+                                    f"{exp_dt.strftime('%d/%m/%Y')} (dans {jours_restants} jours) — "
+                                    f"un nouveau contrat sera généré automatiquement par OKX et "
+                                    f"adopté automatiquement au prochain rafraîchissement (s'il "
+                                    f"est conforme).")
+                        await telegram(session,
+                            f"📅 <b>ROLLOVER X-PERP À VENIR</b>\n"
+                            f"{m} : le contrat actuel ({inst_id_exec}) expire le "
+                            f"{exp_dt.strftime('%d/%m/%Y')} (dans {jours_restants} jours).\n"
+                            f"OKX générera un nouveau contrat — le bot basculera dessus "
+                            f"automatiquement s'il est conforme, ou bloquera {m} sinon. "
+                            f"Aucune action requise de ta part."
+                        )
+                except (ValueError, TypeError, OverflowError) as e:
+                    log.warning(f"  [ROLLOVER] Impossible de parser expTime={exp_time_ms} pour {m} : {e}")
+
+        supprimes = avant - set(nouveaux_marches)
+        MARCHES   = nouveaux_marches
+
         # CORRECTIF : on utilise désormais le ctVal de l'instrument d'EXÉCUTION
         # (celui du compte, effectivement tradé), pas celui du catalogue public
         # — les deux peuvent référencer des contrats différents (échéances
@@ -517,10 +636,12 @@ async def okx_recuperer_position_reelle(session, inst_id, pos_id_attendu=None):
                 return None
             enregistrements = data["data"]
             p = None
+            matched_via_pos_id = False
             if pos_id_attendu:
                 for candidat in enregistrements:
                     if candidat.get("posId") == pos_id_attendu:
                         p = candidat
+                        matched_via_pos_id = True
                         break
                 if p is None:
                     log.error(f"  [VÉRIF-RÉELLE] ⚠️ Aucun dossier avec posId={pos_id_attendu} "
@@ -530,12 +651,21 @@ async def okx_recuperer_position_reelle(session, inst_id, pos_id_attendu=None):
             else:
                 p = enregistrements[0]
             return {
-                "pnl":         float(p.get("pnl", 0) or 0),
-                "fee":         float(p.get("fee", 0) or 0),           # frais de transaction (ouv+ferm)
-                "funding_fee": float(p.get("fundingFee", 0) or 0),    # frais de financement séparés
-                "open_px":     p.get("openAvgPx"),
-                "close_px":    p.get("closeAvgPx"),
-                "pos_id":      p.get("posId"),
+                "pnl":                 float(p.get("pnl", 0) or 0),
+                "fee":                 float(p.get("fee", 0) or 0),           # frais de transaction (ouv+ferm)
+                "funding_fee":         float(p.get("fundingFee", 0) or 0),    # frais de financement séparés
+                "open_px":             p.get("openAvgPx"),
+                "close_px":            p.get("closeAvgPx"),
+                "pos_id":              p.get("posId"),
+                "matched_via_pos_id":  matched_via_pos_id,  # 08/07 — True = dossier confirmé
+                                                              # EXACT par posId (identifiant unique
+                                                              # OKX) ; False = dossier "le plus
+                                                              # récent" pris par approximation
+                                                              # (pos_id_attendu absent). Permet à
+                                                              # l'appelant de ne PAS appliquer sa
+                                                              # propre vérification de prix
+                                                              # (approximative) par-dessus un
+                                                              # résultat déjà certain.
             }
     except Exception as e:
         log.error(f"  [VÉRIF-RÉELLE] Exception position-history {inst_id} : {e}")
@@ -902,8 +1032,26 @@ async def okx_placer_ordre_stop_algo(session, inst_id, side_ouverture, taille_co
     stop doit être posé dans le sens INVERSE pour fermer la position.
     Retourne l'algoId si succès, sinon None (dans ce cas, la surveillance
     interne du bot — boucle de 3s — reste l'unique filet de sécurité,
-    exactement comme avant ce correctif)."""
+    exactement comme avant ce correctif).
+
+    ── PRIX LIMITE PLAFONNÉ (08/07) — voir STOP_BUFFER_SLIPPAGE_PCT. Au lieu
+    d'un ordre au marché pur (slOrdPx=-1, aucune limite de prix), on pose un
+    prix limite légèrement au-delà du déclenchement, dans le sens qui
+    garantit un remplissage quasi certain en conditions normales tout en
+    plafonnant la perte maximale en cas de mouvement brutal — recommandation
+    officielle OKX. Le déclenchement lui-même passe au prix "mark" (moyenne
+    lissée, moins sensible à une mèche isolée) plutôt que "last", pour éviter
+    un déclenchement prématuré sur un pic de prix ponctuel non confirmé."""
     side_fermeture = "sell" if side_ouverture == "buy" else "buy"
+    # Fermeture par VENTE (position ACHAT/longue) : le marché baisse jusqu'au
+    # déclenchement — le prix limite doit être un peu EN DESSOUS pour être
+    # sûr de trouver preneur. Fermeture par ACHAT (position VENTE/courte) :
+    # le marché monte jusqu'au déclenchement — le prix limite doit être un
+    # peu AU-DESSUS.
+    if side_fermeture == "sell":
+        prix_limite = round(float(prix_stop) * (1 - STOP_BUFFER_SLIPPAGE_PCT), 8)
+    else:
+        prix_limite = round(float(prix_stop) * (1 + STOP_BUFFER_SLIPPAGE_PCT), 8)
     path = "/api/v5/trade/order-algo"
     body = json.dumps({
         "instId":         inst_id,
@@ -913,8 +1061,8 @@ async def okx_placer_ordre_stop_algo(session, inst_id, side_ouverture, taille_co
         "sz":             str(taille_contrats),
         "reduceOnly":     "true",
         "slTriggerPx":    str(prix_stop),
-        "slOrdPx":        "-1",             # exécution au marché dès déclenchement
-        "slTriggerPxType": "last",
+        "slOrdPx":        str(prix_limite),  # prix limite plafonné, plus "-1" (marché pur)
+        "slTriggerPxType": "mark",           # moins sensible à une mèche isolée que "last"
     })
     try:
         async with session.post(
@@ -1032,7 +1180,7 @@ async def okx_placer_trailing_stop_natif(session, inst_id, side_ouverture, taill
         log.error(f"  ❌ [TRAILING] Exception pose trailing stop {inst_id} : {e}")
         return None
 
-async def okx_amender_stop_floor(session, inst_id, algo_id, nouveau_prix_stop):
+async def okx_amender_stop_floor(session, inst_id, algo_id, nouveau_prix_stop, side_ouverture):
     """Modifie EN PLACE le prix de déclenchement (slTriggerPx) du plancher dur
     déjà posé, via /api/v5/trade/amend-algos — SANS l'annuler ni en reposer
     un nouveau. Confirmé via la doc officielle OKX (endpoint distinct de
@@ -1045,17 +1193,28 @@ async def okx_amender_stop_floor(session, inst_id, algo_id, nouveau_prix_stop):
     cet endpoint, mais n'en a de toute façon pas besoin puisqu'il suit déjà
     le prix en continu côté serveur OKX.
 
+    side_ouverture = 'buy' ou 'sell' (sens du trade à l'ouverture) — permet
+    de calculer le prix limite plafonné (voir STOP_BUFFER_SLIPPAGE_PCT dans
+    okx_placer_ordre_stop_algo) dans le bon sens, cohérent avec la pose
+    initiale du plancher.
+
     Retourne True si l'amendement a réussi, False sinon — dans ce cas,
     l'appelant doit se rabattre sur l'ancien mécanisme pose+annulation
     (jamais de trade laissé sans plancher à cause d'un simple échec ici)."""
     if not algo_id:
         return False
+    side_fermeture = "sell" if side_ouverture == "buy" else "buy"
+    if side_fermeture == "sell":
+        prix_limite = round(float(nouveau_prix_stop) * (1 - STOP_BUFFER_SLIPPAGE_PCT), 8)
+    else:
+        prix_limite = round(float(nouveau_prix_stop) * (1 + STOP_BUFFER_SLIPPAGE_PCT), 8)
     path = "/api/v5/trade/amend-algos"
     body = json.dumps({
-        "instId":         inst_id,
-        "algoId":         algo_id,
-        "newSlTriggerPx": str(nouveau_prix_stop),
-        "newSlOrdPx":     "-1",   # exécution au marché dès déclenchement, comme à la pose initiale
+        "instId":              inst_id,
+        "algoId":              algo_id,
+        "newSlTriggerPx":      str(nouveau_prix_stop),
+        "newSlOrdPx":          str(prix_limite),  # prix limite plafonné, cohérent avec la pose initiale
+        "newSlTriggerPxType":  "mark",
     })
     try:
         async with session.post(
@@ -2059,8 +2218,9 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                 # encore de plancher à amender.
                 plancher_amende = False
                 if hard_floor_algo_id:
+                    side_ouverture_amend = "buy" if direction == "ACHAT" else "sell"
                     plancher_amende = await okx_amender_stop_floor(
-                        session, inst_id, hard_floor_algo_id, prix_plancher
+                        session, inst_id, hard_floor_algo_id, prix_plancher, side_ouverture_amend
                     )
 
                 if plancher_amende:
@@ -2356,16 +2516,28 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
         if inst_id:
             verif_reelle = await okx_recuperer_position_reelle(session, inst_id, pos_id_attendu=pos_id)
             if verif_reelle:
-                # ── Garde-fou : okx_recuperer_position_reelle vérifie déjà EXACTEMENT
-                # via posId quand il a été capturé à l'ouverture (voir
-                # okx_recuperer_pos_id) — si le posId ne correspond à aucun dossier
-                # récent, la fonction renvoie déjà None et ce bloc n'est jamais atteint.
-                # Cette comparaison de prix reste un second filet, utile uniquement
-                # si pos_id n'a pas pu être capturé (échec réseau à l'ouverture, ou
-                # position antérieure à ce correctif) — sinon redondante mais inoffensive.
+                # ── okx_recuperer_position_reelle vérifie déjà EXACTEMENT via
+                # posId quand il a été capturé à l'ouverture (voir
+                # okx_recuperer_pos_id) — si le posId ne correspond à aucun
+                # dossier récent, la fonction renvoie déjà None et ce bloc
+                # n'est jamais atteint. La comparaison de prix ci-dessous ne
+                # s'applique donc plus QUE dans le cas restant : pos_id_attendu
+                # absent (échec réseau à l'ouverture, ou position antérieure à
+                # ce correctif) — voir matched_via_pos_id ci-dessous.
                 open_px_dossier = verif_reelle.get("open_px")
+                matched_via_pos_id = verif_reelle.get("matched_via_pos_id", False)
                 dossier_correspond = True
-                if open_px_dossier:
+                # ── CORRECTIF (08/07) : cette comparaison de prix est un second
+                # filet APPROXIMATIF, utile uniquement quand le dossier a été pris
+                # par approximation (pos_id_attendu absent ou non synchronisé). Si
+                # matched_via_pos_id est True, le dossier est déjà confirmé EXACT
+                # par l'identifiant unique OKX (posId) — le comparer quand même au
+                # prix_entree interne du bot (qui peut lui-même être faussé par un
+                # fort glissement ou une incohérence instId, comme observé sur un
+                # trade ETHUSD réel : -21,59 USDC réels rapportés comme -0,54€)
+                # revient à laisser une valeur approximative invalider une
+                # certitude. Dans ce cas, on saute directement cette vérification.
+                if not matched_via_pos_id and open_px_dossier:
                     try:
                         ecart_open_px = abs(float(open_px_dossier) - prix_entree) / prix_entree
                         if ecart_open_px > 0.005:
@@ -2374,14 +2546,15 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                         dossier_correspond = False
 
                 if not dossier_correspond:
-                    log.error(f"  [VÉRIF-RÉELLE] ⚠️ Dossier position-history REJETÉ pour {symbole} : "
-                              f"prix d'ouverture du dossier ({open_px_dossier}) ne correspond pas au "
-                              f"prix d'entrée réel de ce trade ({prix_entree}) — probablement le "
-                              f"dossier d'un AUTRE trade sur ce marché. Calcul interne conservé, "
-                              f"funding fee ignoré.")
+                    log.error(f"  [VÉRIF-RÉELLE] ⚠️ Dossier position-history REJETÉ pour {symbole} "
+                              f"(match approximatif, sans posId) : prix d'ouverture du dossier "
+                              f"({open_px_dossier}) ne correspond pas au prix d'entrée interne "
+                              f"({prix_entree}) — probablement le dossier d'un AUTRE trade sur ce "
+                              f"marché. Calcul interne conservé, funding fee ignoré.")
                     await telegram(session,
                         f"⚠️ <b>VÉRIFICATION OKX IGNORÉE</b>\n"
-                        f"{symbole} : le dossier récupéré ne correspond pas à ce trade "
+                        f"{symbole} : dossier trouvé par approximation (posId indisponible), et "
+                        f"son prix d'ouverture ne correspond pas à ce trade "
                         f"(prix d'ouverture {open_px_dossier} vs {prix_entree} attendu).\n"
                         f"Calcul interne conservé par précaution."
                     )
@@ -2400,6 +2573,28 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                              f"frais_transaction={verif_reelle['fee']} "
                              f"frais_financement={verif_reelle['funding_fee']} "
                              f"net={net_reel} | Bot interne: {gain_final}")
+
+                    # ── DIAGNOSTIC NON BLOQUANT (08/07) : même quand le dossier est
+                    # confirmé exact via posId, on note l'écart entre le prix
+                    # d'entrée interne (estimation post-fill, potentiellement
+                    # faussée par un fort glissement ou une divergence instId
+                    # feed/exécution) et le prix d'entrée réellement enregistré
+                    # par OKX (open_px_dossier). Objectif : suivre dans le temps
+                    # l'ampleur de ce phénomène récurrent SANS jamais lui
+                    # permettre d'influencer le résultat officiel — seul un
+                    # journal, jamais un filtre.
+                    if matched_via_pos_id and open_px_dossier:
+                        try:
+                            ecart_diag = abs(float(open_px_dossier) - prix_entree) / prix_entree
+                            if ecart_diag > 0.003:
+                                log.warning(f"  🔬 [DIAG-PRIX] {symbole} : prix d'entrée interne "
+                                            f"({prix_entree}) vs réel OKX confirmé posId "
+                                            f"({open_px_dossier}) — écart {ecart_diag*100:.2f}% "
+                                            f"(purement informatif, résultat officiel déjà basé "
+                                            f"sur le dossier OKX).")
+                        except (ValueError, TypeError, ZeroDivisionError):
+                            pass
+
                     # Le résultat RÉEL OKX devient le résultat OFFICIEL du trade —
                     # élimine l'écart à la source plutôt que de juste le signaler.
                     # Garde-fou : rejeté si manifestement aberrant (gain plus grand
