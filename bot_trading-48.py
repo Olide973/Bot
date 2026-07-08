@@ -122,17 +122,22 @@ SEUIL_CAPITAL_BTC       = 6000.0  # capital mini pour que BTCUSD soit inclus dan
 
 # ── Lock profits par paliers proportionnels au capital
 # Recalibré le 07/07 (11:54) : les deux plus bas paliers (0.16%, 0.20%)
-# ont été retirés après analyse de TOUTES les sorties LOCK de la soirée —
-# le bot surestimait systématiquement le gain net à chaque fois (jamais
-# l'inverse), à cause du coût réel d'un ordre au marché à la fermeture
-# (spread) qui s'ajoute aux frais. Écarts observés : 0.13€ à 0.54€ selon
-# les trades. Premier palier désormais à 0.30% (~1.63€), qui reste net
-# positif même dans le pire cas observé (0.54€ d'écart) : 1.63 - 0.54
-# (frais) - 0.54 (pire écart) ≈ 0.55€ net. Les paliers suivants (2 à 27)
-# sont inchangés — un trade qui continue de monter n'est jamais plafonné.
-# Palier 0.36% ajouté le 07/07 (12:50), entre 0.30% et 0.40%.
+# avaient été retirés après analyse de TOUTES les sorties LOCK de la
+# soirée — le bot surestimait systématiquement le gain net, à cause du
+# coût réel d'un ordre au marché à la fermeture (spread) qui s'ajoute aux
+# frais. Écarts observés à l'époque : 0.13€ à 0.54€ selon les trades.
+# RÉTABLI le 08/07 à la demande explicite de Damien : le palier 0.20%
+# (~1,09€) revient en première position. À noter pour rester honnête sur
+# le risque : au pire écart historiquement observé (0.54€), ce palier ne
+# laisse quasiment aucune marge nette (1.09 - 0.54 frais - 0.54 écart ≈
+# 0.01€, potentiellement négatif). Deux protections ajoutées DEPUIS cette
+# première analyse réduisent ce risque sans l'annuler : le stop/plancher
+# utilise désormais un prix limite plafonné (STOP_BUFFER_SLIPPAGE_PCT, pas
+# un ordre au marché pur) et sa pose est activement validée avant d'être
+# considérée effective (voir okx_placer_ordre_stop_algo /
+# okx_amender_stop_floor). Palier 0.36% ajouté le 07/07 (12:50), conservé.
 LOCK_PALIERS_PCT = [
-    0.30, 0.36, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
+    0.20, 0.36, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
     1.80, 2.20, 2.60, 3.20, 3.80, 4.60, 5.50, 6.50, 7.50, 9.00,
     10.00, 12.50, 15.00, 17.50, 20.00, 25.00, 30.00, 45.00, 60.00,
 ]
@@ -160,6 +165,16 @@ def get_palier_lock_index(pnl_max, capital):
             lock  = palier_eur
             index = i
     return lock, index
+
+def palier_pose_plancher_dur(index_lock):
+    """Détermine si le palier d'index donné (1-based) doit poser/repositionner le
+    plancher dur — règle demandée par Damien le 08/07 : les TROIS premiers paliers
+    (1, 2, 3) le posent systématiquement ("d'office", pour verrouiller vite sur le
+    début du trade), puis à partir du palier 4 on reprend l'alternance habituelle
+    un palier sur deux, sur les index IMPAIRS (5, 7, 9...)."""
+    if index_lock <= 3:
+        return index_lock >= 1
+    return index_lock % 2 == 1
 
 # ── Gestion mise dynamique
 WINS_CONFIANCE          = 3
@@ -2273,21 +2288,22 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                     log.warning(f"  ⚠️ [BASCULE] Échec de la bascule vers le trailing pour {symbole} "
                                 f"— le stop fixe initial reste actif comme filet.")
 
-            # ── PLANCHER DUR — 1 palier sur 2 (07/07, 23:11 ; parité inversée
-            # le 08/07 à la demande de Damien) : en plus du trailing natif
-            # ci-dessus (qu'on ne touche JAMAIS ici), un SECOND ordre
-            # indépendant — un stop FIXE classique — se repositionne vers le
-            # haut à chaque palier d'INDEX IMPAIR (1er, 3e, 5e...). Le tout
-            # premier palier pose donc à la fois la bascule vers le trailing
-            # (bloc ci-dessus) ET ce plancher dur, au même niveau. Une fois
-            # posé, ce plancher ne bouge plus tant que le palier impair
-            # suivant n'est pas atteint : le prix ne peut plus jamais
-            # redescendre en dessous, quoi que fasse le trailing au-dessus.
-            # Ordre des opérations, comme pour la bascule : on pose le
-            # NOUVEAU plancher d'abord, on n'annule l'ANCIEN plancher (pas le
-            # trailing !) que si la pose a réussi — jamais de fenêtre sans
-            # protection.
-            if (index_lock % 2 == 1 and index_lock > dernier_index_plancher_dur
+            # ── PLANCHER DUR (07/07, 23:11 ; règle mise à jour le 08/07 à la
+            # demande de Damien) : en plus du trailing natif ci-dessus (qu'on
+            # ne touche JAMAIS ici), un SECOND ordre indépendant — un stop
+            # FIXE classique — se repositionne vers le haut à chaque palier
+            # concerné par palier_pose_plancher_dur() : les TROIS premiers
+            # paliers (1, 2, 3) d'office, puis un palier sur deux à partir du
+            # 4e (index impair : 5, 7, 9...). Le tout premier palier pose donc
+            # à la fois la bascule vers le trailing (bloc ci-dessus) ET ce
+            # plancher dur, au même niveau. Une fois posé, ce plancher ne
+            # bouge plus tant que le palier suivant concerné n'est pas
+            # atteint : le prix ne peut plus jamais redescendre en dessous,
+            # quoi que fasse le trailing au-dessus. Ordre des opérations,
+            # comme pour la bascule : on pose le NOUVEAU plancher d'abord, on
+            # n'annule l'ANCIEN plancher (pas le trailing !) que si la pose a
+            # réussi — jamais de fenêtre sans protection.
+            if (palier_pose_plancher_dur(index_lock) and index_lock > dernier_index_plancher_dur
                     and MODE_REEL and inst_id and taille_contrats):
                 if direction == "ACHAT":
                     prix_plancher = round(prix_entree * (1 + lock_actuel / position), 8)
@@ -2867,6 +2883,7 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
             'duree_minutes': duree,
             'rsi':           rsi_1h,
             'vol_ratio':     details.get("vol_ratio", 0.0),
+            'pos_id':        pos_id,
         })
 
     if alerte_perte_a_envoyer:
@@ -3139,6 +3156,119 @@ async def reprendre_surveillance_position_orpheline(session, symbole, inst_id, e
         debut_override=debut_override, algo_id=algo_id,
         taille_contrats=taille_contrats_reelle, pos_id=pos_id, algo_type=algo_type
     )
+
+
+async def reconcilier_trades_manques(session, etat):
+    """Rattrape les trades qui se sont fermés côté OKX PENDANT que le bot était
+    hors ligne (ex : entre l'arrêt et le redémarrage lors d'un redéploiement
+    Railway) — incident réel confirmé le 08/07 : un trade DOGEUSD ouvert à
+    12:14 s'est fermé à 12:50 avec une perte réelle (-3,29 USDC) sans JAMAIS
+    être rapporté sur Telegram ni comptabilisé dans le capital suivi. Cause :
+    le stop/plancher posé côté OKX continue de fonctionner même bot éteint,
+    mais si la fermeture a lieu PENDANT cette fenêtre, la position n'est plus
+    "ouverte" au redémarrage — la reprise de position orpheline (qui ne
+    regarde que les positions ENCORE ouvertes) ne peut pas la voir.
+
+    Compare l'historique récent OKX (positions-history, identifié par posId,
+    LA source d'identité unique) à ce que le bot a déjà enregistré dans
+    etat["historique"], et rattrape tout écart : capital, historique, ET
+    message Telegram rétroactif.
+
+    Fenêtre de recherche bornée par etat["reconciliation_depuis_ts"] (mise à
+    jour à chaque exécution) plutôt que "tout l'historique OKX" : les trades
+    d'avant l'existence de ce correctif n'ont pas de pos_id enregistré, donc
+    TOUT semblerait "manquant" sans cette borne — un recomptage complet du
+    capital historique serait une corruption bien pire que le problème
+    d'origine. Au tout premier passage (clé absente), la fenêtre par défaut
+    est volontairement courte (2h) pour rattraper un incident récent sans
+    ressusciter d'anciens trades déjà comptabilisés."""
+    if not MODE_REEL or RESET_TOUT:
+        return
+    maintenant_ts = time.time()
+    depuis_ts = etat.get("reconciliation_depuis_ts")
+    if depuis_ts is None:
+        depuis_ts = maintenant_ts - 2 * 3600  # 2h en arrière au tout premier passage
+
+    posids_connus = {h.get("pos_id") for h in etat.get("historique", []) if h.get("pos_id")}
+    quelque_chose_rattrape = False
+
+    for symbole, inst_id in list(OKX_SYMBOLS_EXEC.items()):
+        path  = "/api/v5/account/positions-history"
+        query = f"?instId={inst_id}&limit=10"
+        try:
+            async with session.get(
+                OKX_BASE_URL + path + query,
+                headers=_okx_headers("GET", path + query, ""),
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                data = await resp.json()
+            if data.get("code") != "0":
+                continue
+            for p in data.get("data", []):
+                pos_id_okx = p.get("posId")
+                if not pos_id_okx or pos_id_okx in posids_connus:
+                    continue
+                u_time_ms = p.get("uTime")
+                if not u_time_ms:
+                    continue
+                try:
+                    u_time_sec = float(u_time_ms) / 1000.0
+                except (ValueError, TypeError):
+                    continue
+                if u_time_sec < depuis_ts:
+                    continue  # fermé avant la fenêtre de recherche — ignoré volontairement
+                try:
+                    pnl         = float(p.get("pnl", 0) or 0)
+                    fee         = float(p.get("fee", 0) or 0)
+                    funding_fee = float(p.get("fundingFee", 0) or 0)
+                except (ValueError, TypeError):
+                    continue
+                gain_net = round(pnl - abs(fee) - abs(funding_fee), 4)
+                resultat = "GAGNE" if gain_net > 0 else "PERDU"
+                close_dt = datetime.utcfromtimestamp(u_time_sec)
+
+                etat["capital"]   = round(etat["capital"] + gain_net, 2)
+                etat["cumul_net"] = round(etat["capital"] - CAPITAL_INITIAL, 2)
+                etat["pnl_jour"]  = round(etat.get("pnl_jour", 0) + gain_net, 2)
+                etat["nb_trades"] = etat.get("nb_trades", 0) + 1
+                if gain_net > 0:
+                    etat["nb_wins"]     = etat.get("nb_wins", 0) + 1
+                    etat["total_gagne"] = round(etat.get("total_gagne", 0) + gain_net, 2)
+                else:
+                    etat["nb_losses"]   = etat.get("nb_losses", 0) + 1
+                    etat["total_perdu"] = round(etat.get("total_perdu", 0) + abs(gain_net), 2)
+
+                etat.setdefault("historique", []).append({
+                    'heure':         (close_dt - timedelta(hours=3)).strftime('%Y-%m-%d %H:%M'),
+                    'marche':        symbole,
+                    'direction':     "?",
+                    'resultat':      resultat,
+                    'gain':          gain_net,
+                    'mise':          None,
+                    'capital':       etat["capital"],
+                    'duree_minutes': None,
+                    'rsi':           None,
+                    'vol_ratio':     0.0,
+                    'pos_id':        pos_id_okx,
+                })
+                posids_connus.add(pos_id_okx)
+                quelque_chose_rattrape = True
+                log.error(f"  🔁 [RECONCILIATION] {symbole} : trade fermé pendant que le bot "
+                          f"était hors ligne, rattrapé (posId={pos_id_okx}, net={gain_net}€).")
+                await telegram(session,
+                    f"🔁 <b>TRADE RATTRAPÉ (fermé hors-ligne)</b>\n"
+                    f"{symbole} : ce trade s'est fermé pendant que le bot était hors ligne "
+                    f"(redémarrage/redéploiement) et n'avait jamais été rapporté.\n"
+                    f"Résultat net : {'+' if gain_net>=0 else ''}{gain_net}€\n"
+                    f"Clôturé le {close_dt.strftime('%d/%m %H:%M')} UTC\n"
+                    f"Capital ajusté en conséquence : {etat['capital']}€"
+                )
+        except Exception as e:
+            log.error(f"  ❌ [RECONCILIATION] Exception pour {symbole} ({inst_id}) : {e}")
+
+    etat["reconciliation_depuis_ts"] = maintenant_ts
+    if quelque_chose_rattrape:
+        sauvegarder_etat(etat)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -3715,6 +3845,14 @@ async def boucle_principale():
                         asyncio.create_task(
                             reprendre_surveillance_position_orpheline(session, symb, inst_id_ouvert, etat)
                         )
+
+        # ── Rattrapage des trades fermés PENDANT que le bot était hors ligne
+        # (08/07, incident réel confirmé — voir reconcilier_trades_manques) —
+        # après la reprise des positions ENCORE ouvertes ci-dessus, on
+        # regarde maintenant celles déjà CLOSES entretemps, jamais vues ni
+        # comptabilisées. Capital corrigé avant le message de démarrage
+        # ci-dessous, pour qu'il affiche déjà la valeur à jour.
+        await reconcilier_trades_manques(session, etat)
 
         await telegram(session,
             (f"🔄 <b>RESET COMPLET EFFECTUÉ</b>\nCapital, PnL, compteurs et historique remis à zéro.\n\n" if RESET_TOUT else "")
