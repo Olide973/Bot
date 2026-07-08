@@ -57,15 +57,11 @@ INTERVALLE_CHECK_UPL_SEC = 3   # 07/07 (13:15) — la vérification du vrai PnL 
                                 # (10 trades / 3s ≈ 3.3 req/s ≈ 6.6 par 2s, sous la limite).
 PAUSE_SCAN              = 30         # secondes entre chaque scan de nouveaux marchés
 MAX_TRADES_SIMULTANES   = 10         # 10 marchés max = 1 par marché
-TRAIL_RATIO_POST_PALIER1 = 0.001   # 07/07 (22:41) — RESSERRÉ de 0.30% à 0.10%, suite à un
-                                     # premier trade hybride réel (pic +2.81€, net final +0.31€
-                                     # seulement) : 0.30% de prix ≈ 1.96€ de give-back sur cette
-                                     # taille de position — écrasait 70% d'un petit pic. Un écart
-                                     # fixe en % du PRIX ne s'adapte pas à la taille du gain :
-                                     # négligeable sur un gros pic, disproportionné sur un petit.
-                                     # 0.10% reste un compromis : plus serré protège mieux les
-                                     # petits gains, mais risque un peu plus de sorties sur un
-                                     # simple aller-retour de prix normal (à surveiller).
+TRAIL_RATIO_POST_PALIER1 = 0.002   # 08/07 (05:34) — ajusté à 0.20% suite au retrait du
+                                     # palier 0.20% (retour à 28 paliers, premier à 0.30%).
+                                     # Historique : 0.30% d'origine jugé trop large (give-back
+                                     # de 70% sur un petit pic de 2.81€) -> resserré à 0.10% ->
+                                     # repassé à 0.20% ici, sur demande explicite.
 
 # ── Détection signal mean reversion — surveillance temps réel
 SEUIL_MOUVEMENT_PCT     = 0.50   # dès que le prix bouge de 0.50% → signal
@@ -101,7 +97,7 @@ SEUIL_CAPITAL_BTC       = 6000.0  # capital mini pour que BTCUSD soit inclus dan
 # sont inchangés — un trade qui continue de monter n'est jamais plafonné.
 # Palier 0.36% ajouté le 07/07 (12:50), entre 0.30% et 0.40%.
 LOCK_PALIERS_PCT = [
-    0.20, 0.30, 0.36, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
+    0.30, 0.36, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
     1.80, 2.20, 2.60, 3.20, 3.80, 4.60, 5.50, 6.50, 7.50, 9.00,
     10.00, 12.50, 15.00, 17.50, 20.00, 25.00, 30.00, 45.00, 60.00,
 ]
