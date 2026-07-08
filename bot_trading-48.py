@@ -729,6 +729,21 @@ async def okx_algo_order_est_actif(session, inst_id, algo_id, algo_type):
         ) as resp:
             data = await resp.json()
             if data.get("code") != "0":
+                # ── CORRECTIF (08/07, 00:43) — confirmé en conditions réelles :
+                # OKX répond parfois avec une ERREUR au niveau code (pas juste
+                # une liste vide) quand l'algoId interrogé n'existe simplement
+                # plus dans le système — code 51603 'Order does not exist'.
+                # Ceci arrive normalement APRÈS qu'un ordre s'est déclenché et
+                # a été nettoyé côté OKX. Sans cette distinction, CE code précis
+                # était traité comme 'vérification impossible' (None) au lieu
+                # de 'ordre disparu' (False) — la détection de fermeture ne se
+                # déclenchait donc JAMAIS, laissant tourner le bot indéfiniment
+                # sans jamais envoyer le message Telegram de clôture (symptôme
+                # concret rapporté : trade fermé sur OKX, aucun message reçu).
+                if data.get("code") == "51603":
+                    log.info(f"  ℹ️ [ALGO-VIVANT] {inst_id} algoId={algo_id} : {data.get('msg')} "
+                             f"(51603 = déjà déclenché et nettoyé côté OKX) — traité comme disparu.")
+                    return False
                 log.error(f"  [ALGO-VIVANT] Erreur lecture ordres pendants {inst_id} : {data}")
                 return None
             for o in data.get("data", []):
@@ -1763,6 +1778,10 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                                        # "l'ordre de protection est-il encore vivant chez OKX ?"
                                        # (voir okx_algo_order_est_actif) — même fréquence que les
                                        # autres checks, pour rester sous le rate limit.
+    dernier_check_plancher_vivant = 0.0  # 08/07 (00:39) — même check que ci-dessus, mais pour
+                                           # le plancher dur (ordre séparé du trailing) — sans ça,
+                                           # sa fermeture pourrait passer inaperçue (aucun message
+                                           # Telegram envoyé), signalé concrètement par Damien.
     hard_floor_algo_id       = None  # 07/07 (23:11) — ordre FIXE indépendant du trailing,
                                        # repositionné vers le haut à chaque palier "dur" (1 sur 2).
                                        # Jamais touché par la logique du trailing/bascule — un
@@ -1876,6 +1895,55 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                     # la liste) ou None (échec réseau) — rien à faire ici,
                     # les branches stop/lock plus bas gèrent déjà la
                     # fermeture normale via leur propre détection.
+
+        # ── Check équivalent pour le PLANCHER DUR (08/07, 00:39) — ordre
+        # séparé du trailing (voir plus bas), donc jamais couvert par le
+        # check ci-dessus. Sans ce check dédié, une fermeture par le
+        # plancher pouvait passer inaperçue : le check 'atteint_stop' (plus
+        # bas) compare au stop FIXE d'ORIGINE, bien plus bas que le
+        # plancher — ne se déclenche pas ; le check LOCK dépend du PnL
+        # interne, qui peut mettre du temps à refléter la fermeture réelle.
+        # Résultat concret signalé : trade fermé sur OKX sans aucun message
+        # Telegram de fermeture. Si le plancher a disparu SANS fermer la
+        # position, ce n'est pas une urgence (le trailing protège toujours
+        # séparément) — on se contente de l'oublier proprement.
+        if MODE_REEL and inst_id and hard_floor_algo_id:
+            maintenant_plancher = time.time()
+            if maintenant_plancher - dernier_check_plancher_vivant >= INTERVALLE_CHECK_UPL_SEC:
+                dernier_check_plancher_vivant = maintenant_plancher
+                plancher_vivant = await okx_algo_order_est_actif(
+                    session, inst_id, hard_floor_algo_id, "fixe"
+                )
+                if plancher_vivant is False:
+                    position_encore_ouverte = await okx_position_existe_deja(
+                        session, inst_id, contexte="trailing"
+                    )
+                    if position_encore_ouverte is False:
+                        log.info(f"  ℹ️ [PLANCHER-DUR] {symbole} fermé par le plancher dur — "
+                                 f"réconciliation à partir du dernier PnL connu ({pnl:.2f}€).")
+                        frais    = calc_frais(position)
+                        gain_net = round(pnl - frais["total"], 4)
+                        await telegram(session,
+                            f"🧱 <b>SORTIE (plancher dur)</b>\n"
+                            f"{symbole} | {direction}\n"
+                            f"Fermée automatiquement par le plancher verrouillé.\n"
+                            f"Dernier PnL connu avant fermeture : {'+' if pnl>=0 else ''}{pnl:.2f}€\n"
+                            f"Frais (ouv+ferm) : -{frais['total']}€\n"
+                            f"Estimation avant vérification OKX : {'+' if gain_net>=0 else ''}{gain_net}€\n"
+                            f"PnL max : +{pnl_max_atteint:.2f}€\n"
+                            f"Durée : {duree} min"
+                        )
+                        resultat_final    = "GAGNE" if gain_net > 0 else "PERDU"
+                        gain_final        = gain_net
+                        hard_floor_algo_id = None  # déjà disparu, rien à annuler plus bas
+                        break
+                    # Position encore ouverte : le plancher a disparu sans
+                    # fermer (rare) — pas d'urgence, le trailing protège
+                    # toujours séparément. On oublie juste ce plancher.
+                    else:
+                        log.warning(f"  ⚠️ [PLANCHER-DUR] {symbole} : le plancher a disparu sans "
+                                    f"fermer la position — le trailing reste actif comme filet.")
+                        hard_floor_algo_id = None
 
 
         nouveau_lock, index_lock = get_palier_lock_index(pnl_max_atteint, capital)
