@@ -168,13 +168,13 @@ def get_palier_lock_index(pnl_max, capital):
 
 def palier_pose_plancher_dur(index_lock):
     """Détermine si le palier d'index donné (1-based) doit poser/repositionner le
-    plancher dur — règle demandée par Damien le 08/07 : les TROIS premiers paliers
-    (1, 2, 3) le posent systématiquement ("d'office", pour verrouiller vite sur le
-    début du trade), puis à partir du palier 4 on reprend l'alternance habituelle
-    un palier sur deux, sur les index IMPAIRS (5, 7, 9...)."""
-    if index_lock <= 3:
-        return index_lock >= 1
-    return index_lock % 2 == 1
+    plancher dur. MODIFIÉ le 08/07 à la demande explicite de Damien, suite à un
+    trade HYPEUSD où le prix a grimpé jusqu'à +5,82€ de PnL max mais où seul le
+    palier 7 (5,45€) avait un plancher posé — le trade est ressorti à +3,99€ net
+    réel, en dessous de ce qu'un plancher posé à CHAQUE palier franchi aurait pu
+    verrouiller de plus près. Désormais TOUS les paliers posent/repositionnent le
+    plancher dur, sans exception — plus d'alternance ni de paliers "d'office"."""
+    return index_lock >= 1
 
 # ── Gestion mise dynamique
 WINS_CONFIANCE          = 3
@@ -2994,9 +2994,10 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
         f"PnL jour : {'+' if etat_global.get('pnl_jour',0)>=0 else ''}"
         f"{round(etat_global.get('pnl_jour',0),2)}€\n"
         f"Trades : {nb_trades_total} | WR : {round(win_rate,1)}%\n"
+        f"<i>— Totaux cumulés depuis le début (pas seulement aujourd'hui) —</i>\n"
         f"Gagné : +{round(etat_global.get('total_gagne',0),2)}€ | "
         f"Perdu : -{round(etat_global.get('total_perdu',0),2)}€\n"
-        f"<b>NET : {'+' if etat_global.get('cumul_net',0)>=0 else ''}"
+        f"<b>NET cumulé : {'+' if etat_global.get('cumul_net',0)>=0 else ''}"
         f"{round(etat_global.get('cumul_net',0),2)}€</b>"
     )
 
