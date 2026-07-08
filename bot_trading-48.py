@@ -1848,9 +1848,11 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
         # affectée par cet écart, quel qu'il soit.
         inst_id_feed = OKX_SYMBOLS.get(symbole)
         if inst_id_feed and inst_id_feed != inst_id:
-            log.error(f"  🚨 [INCOHÉRENCE INSTID] {symbole} : feed={inst_id_feed} "
-                      f"vs exécution={inst_id} — DIFFÉRENTS. La position réelle et le "
-                      f"prix suivi par WebSocket ne portent pas sur le même contrat.")
+            # ── WARNING (pas ERROR) volontairement (08/07) : message Telegram
+            # dédié juste en dessous — éviter le doublon via le miroir d'erreurs.
+            log.warning(f"  🚨 [INCOHÉRENCE INSTID] {symbole} : feed={inst_id_feed} "
+                        f"vs exécution={inst_id} — DIFFÉRENTS. La position réelle et le "
+                        f"prix suivi par WebSocket ne portent pas sur le même contrat.")
             await telegram(session,
                 f"🚨 <b>ALERTE — INCOHÉRENCE INSTID</b>\n"
                 f"{symbole} : le contrat de prix (WebSocket) et le contrat d'exécution "
@@ -2902,10 +2904,14 @@ async def reprendre_surveillance_position_orpheline(session, symbole, inst_id, e
     # à 03:51).
     inst_id_feed = OKX_SYMBOLS.get(symbole)
     if inst_id_feed and inst_id_feed != inst_id:
-        log.error(f"  🚨 [INCOHÉRENCE INSTID] {symbole} (reprise orpheline) : "
-                  f"feed={inst_id_feed} vs exécution={inst_id} — DIFFÉRENTS. "
-                  f"Surveillance sur le flux public, protégée par le stop natif "
-                  f"et la vérification upl — confirme la divergence des catalogues OKX.")
+        # ── Niveau WARNING (pas ERROR) volontairement (08/07) : ce cas a déjà
+        # son propre message Telegram dédié juste en dessous — le passer en
+        # ERROR le ferait aussi remonter en double via le miroir d'erreurs
+        # (HandlerErreursTelegram), pour la même information.
+        log.warning(f"  🚨 [INCOHÉRENCE INSTID] {symbole} (reprise orpheline) : "
+                    f"feed={inst_id_feed} vs exécution={inst_id} — DIFFÉRENTS. "
+                    f"Surveillance sur le flux public, protégée par le stop natif "
+                    f"et la vérification upl — confirme la divergence des catalogues OKX.")
         await telegram(session,
             f"🚨 <b>INCOHÉRENCE INSTID</b> (position reprise)\n"
             f"{symbole} : feed={inst_id_feed} vs exécution={inst_id}.\n"
