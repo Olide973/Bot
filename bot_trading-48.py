@@ -32,6 +32,35 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ── Miroir automatique des erreurs vers Telegram (08/07, demandé par
+# Damien) : au lieu de devoir aller chercher une info dans les logs Railway
+# à chaque fois qu'il y a un souci à diagnostiquer, TOUTE ligne de log de
+# niveau ERROR ou CRITICAL — où qu'elle soit dans le fichier, présente ou
+# future — est automatiquement mise en file d'attente ici, puis regroupée
+# et envoyée sur Telegram par la boucle principale (voir
+# vider_file_erreurs_vers_telegram) toutes les 60s. Choix du niveau ERROR
+# (pas WARNING) : les WARNING sont souvent des cas déjà gérés/informatifs
+# (repli normal, déjà annoncés ailleurs sur Telegram) — les envoyer aussi
+# aurait noyé le chat. Un ERROR, lui, signale systématiquement quelque
+# chose qui mérite l'attention de Damien.
+FILE_ERREURS_TELEGRAM = []
+
+class HandlerErreursTelegram(logging.Handler):
+    """Handler de logging synchrone (donc utilisable partout, y compris hors
+    contexte async) qui se contente d'empiler le message formaté — l'envoi
+    réel vers Telegram (async, nécessite une session aiohttp) est fait à
+    part par la boucle principale, jamais ici directement."""
+    def emit(self, record):
+        try:
+            FILE_ERREURS_TELEGRAM.append(self.format(record))
+        except Exception:
+            pass  # ne jamais faire planter le logging lui-même
+
+_handler_erreurs = HandlerErreursTelegram()
+_handler_erreurs.setLevel(logging.ERROR)
+_handler_erreurs.setFormatter(logging.Formatter('%(asctime)s - %(message)s', datefmt='%H:%M:%S'))
+log.addHandler(_handler_erreurs)
+
 # ═══════════════════════════════════════════════════════════════
 #  CONFIGURATION
 # ═══════════════════════════════════════════════════════════════
@@ -47,6 +76,12 @@ MISE_BASE_PCT           = 0.10    # 10% du capital → mise ~50€ → position 
 MISE_MIN                = 10.0    # mise minimum cohérente avec l'objectif frais 0.50€
 MISE_MAX_PCT            = 0.12    # plafond légèrement au-dessus pour le boost confiance
 CHECK_INTERVAL          = 1          # secondes entre chaque check prix — réduit de 3 à 1 le 07/07 (12:50) pour détecter les franchissements de palier plus vite ; sans surcoût API significatif, le cache WebSocket (SEUIL_FRAICHEUR_PRIX_SEC=2s) reste utilisé la plupart du temps
+INTERVALLE_STATUT_TELEGRAM_SEC = 900  # 08/07 — statut de position envoyé sur Telegram
+                                       # toutes les 15 min (au lieu du log toutes les
+                                       # 1 min, gardé en interne) : assez fréquent pour
+                                       # suivre un trade sans ouvrir Railway, assez
+                                       # espacé pour ne pas spammer avec plusieurs
+                                       # positions ouvertes en simultané.
 INTERVALLE_CHECK_UPL_SEC = 3   # 07/07 (13:15) — la vérification du vrai PnL OKX (upl) ne
                                 # peut PAS suivre le même rythme que CHECK_INTERVAL=1s : la
                                 # doc officielle OKX confirme /account/positions limitée à
@@ -1315,6 +1350,38 @@ async def telegram(session, message):
     except Exception as e:
         log.error(f"Erreur Telegram : {e}")
 
+async def vider_file_erreurs_vers_telegram(session):
+    """Regroupe toutes les erreurs (niveau ERROR/CRITICAL) accumulées depuis
+    le dernier passage — voir HandlerErreursTelegram — en UN SEUL message
+    Telegram, plutôt qu'un message par erreur (qui noierait le chat en cas
+    de rafale). Appelée toutes les 60s depuis la boucle principale.
+
+    La file est vidée AVANT l'envoi (pas après) : si l'envoi Telegram
+    lui-même échoue, on ne rappelle pas log.error ici (juste un print sur
+    stdout, visible dans Railway) — pour éviter que l'échec d'envoi ne
+    s'auto-alimente indéfiniment dans sa propre file."""
+    if not FILE_ERREURS_TELEGRAM:
+        return
+    lignes = FILE_ERREURS_TELEGRAM[:]
+    FILE_ERREURS_TELEGRAM.clear()
+    # Limite raisonnable par message Telegram (4096 caractères max côté
+    # Telegram) — au-delà, on tronque plutôt que d'échouer silencieusement.
+    corps = "\n".join(lignes)
+    if len(corps) > 3500:
+        corps = corps[:3500] + f"\n… ({len(lignes)} erreurs au total, tronqué)"
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        # Texte BRUT (pas de parse_mode) : les messages d'erreur/exceptions
+        # peuvent contenir des caractères '<', '>', '&' (dicts Python, JSON
+        # d'erreur OKX...) qui casseraient le parsing HTML de Telegram et
+        # feraient échouer silencieusement l'envoi de tout le lot.
+        await session.post(url, data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text":    f"🪵 ERREURS DÉTECTÉES ({len(lignes)})\n\n{corps}",
+        }, timeout=aiohttp.ClientTimeout(total=10))
+    except Exception as e:
+        print(f"[TELEGRAM-ERRORS] Échec envoi du lot d'erreurs : {e}")
+
 # ═══════════════════════════════════════════════════════════════
 #  DONNÉES MARCHÉ — OKX
 # ═══════════════════════════════════════════════════════════════
@@ -1958,8 +2025,9 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
     okx_annuler_trailing_stop). taille_contrats n'est plus utilisée dans cette boucle
     depuis le passage au trailing natif (07/07, 13:20) — conservée dans la signature
     pour compatibilité, sans effet."""
-    debut           = debut_override if debut_override is not None else time.time()
-    dernier_log     = 0
+    debut                   = debut_override if debut_override is not None else time.time()
+    dernier_log             = 0
+    dernier_statut_telegram = 0
     pnl_max_atteint = 0.0
     lock_actuel     = 0.0
     resultat_final  = "PERDU"
@@ -1989,6 +2057,11 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                                        # second filet totalement séparé.
     dernier_index_plancher_dur = 0    # index (1-based) du dernier palier "dur" déjà posé, pour ne
                                        # jamais reposer deux fois le même plancher.
+    dernier_index_plancher_alerte = 0  # 08/07 — dernier palier pour lequel l'échec de pose a déjà
+                                         # été signalé sur Telegram, pour ne pas spammer à chaque
+                                         # tentative (le bloc ci-dessous retente automatiquement
+                                         # à CHAQUE tick tant que dernier_index_plancher_dur n'a
+                                         # pas avancé — voir commentaire plus bas).
 
     # ── Boucle de surveillance — jusqu'au stop, au lock, ou 6h max
     while True:
@@ -2191,18 +2264,21 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                     log.warning(f"  ⚠️ [BASCULE] Échec de la bascule vers le trailing pour {symbole} "
                                 f"— le stop fixe initial reste actif comme filet.")
 
-            # ── PLANCHER DUR — 1 palier sur 2 (07/07, 23:11, demandé) : en plus
-            # du trailing natif ci-dessus (qu'on ne touche JAMAIS ici), un
-            # SECOND ordre indépendant — un stop FIXE classique — se
-            # repositionne vers le haut à chaque palier d'INDEX PAIR (2e, 4e,
-            # 6e...). Une fois posé, ce plancher ne bouge plus tant que le
-            # palier pair suivant n'est pas atteint : le prix ne peut plus
-            # jamais redescendre en dessous, quoi que fasse le trailing
-            # au-dessus. Ordre des opérations, comme pour la bascule : on pose
-            # le NOUVEAU plancher d'abord, on n'annule l'ANCIEN plancher (pas
-            # le trailing !) que si la pose a réussi — jamais de fenêtre sans
+            # ── PLANCHER DUR — 1 palier sur 2 (07/07, 23:11 ; parité inversée
+            # le 08/07 à la demande de Damien) : en plus du trailing natif
+            # ci-dessus (qu'on ne touche JAMAIS ici), un SECOND ordre
+            # indépendant — un stop FIXE classique — se repositionne vers le
+            # haut à chaque palier d'INDEX IMPAIR (1er, 3e, 5e...). Le tout
+            # premier palier pose donc à la fois la bascule vers le trailing
+            # (bloc ci-dessus) ET ce plancher dur, au même niveau. Une fois
+            # posé, ce plancher ne bouge plus tant que le palier impair
+            # suivant n'est pas atteint : le prix ne peut plus jamais
+            # redescendre en dessous, quoi que fasse le trailing au-dessus.
+            # Ordre des opérations, comme pour la bascule : on pose le
+            # NOUVEAU plancher d'abord, on n'annule l'ANCIEN plancher (pas le
+            # trailing !) que si la pose a réussi — jamais de fenêtre sans
             # protection.
-            if (index_lock % 2 == 0 and index_lock > dernier_index_plancher_dur
+            if (index_lock % 2 == 1 and index_lock > dernier_index_plancher_dur
                     and MODE_REEL and inst_id and taille_contrats):
                 if direction == "ACHAT":
                     prix_plancher = round(prix_entree * (1 + lock_actuel / position), 8)
@@ -2224,22 +2300,44 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                     )
 
                 if plancher_amende:
+                    # ── VALIDATION ACTIVE (08/07, demandé par Damien — "il ne doit
+                    # pas avoir d'erreur, il faut qu'il soit validé") : un code
+                    # "0" (succès) renvoyé par OKX à la requête d'amendement ne
+                    # garantit pas que l'ordre est RÉELLEMENT vivant ensuite (rejet
+                    # asynchrone possible côté OKX). On le reconfirme explicitement
+                    # via okx_algo_order_est_actif avant de déclarer la protection
+                    # posée — c'est cette vérification, pas seulement le code
+                    # HTTP, qui déclenche le message "PLANCHER VERROUILLÉ".
+                    plancher_confirme = await okx_algo_order_est_actif(
+                        session, inst_id, hard_floor_algo_id, "fixe"
+                    )
+                else:
+                    plancher_confirme = False
+
+                if plancher_amende and plancher_confirme:
                     dernier_index_plancher_dur = index_lock
                     etat_global["nb_plancher_amende"] = etat_global.get("nb_plancher_amende", 0) + 1
-                    log.info(f"  🧱 [PLANCHER-DUR] {symbole} : plancher amendé à {lock_actuel}€ "
-                             f"(palier #{index_lock}, prix={prix_plancher})")
+                    log.info(f"  🧱 [PLANCHER-DUR] {symbole} : plancher amendé ET confirmé actif "
+                             f"à {lock_actuel}€ (palier #{index_lock}, prix={prix_plancher})")
                     await telegram(session,
                         f"🧱 <b>PLANCHER VERROUILLÉ : {lock_actuel}€</b>\n"
                         f"{symbole} : ce niveau ne peut plus être franchi vers le bas, quoi qu'il "
                         f"arrive au trailing au-dessus.\n"
-                        f"<i>Méthode : amendement en place (1 appel, sans interruption)</i>"
+                        f"<i>Méthode : amendement en place, confirmé actif côté OKX</i>"
                     )
                 else:
                     side_ouverture_plancher = "buy" if direction == "ACHAT" else "sell"
                     nouveau_plancher_id = await okx_placer_ordre_stop_algo(
                         session, inst_id, side_ouverture_plancher, taille_contrats, prix_plancher
                     )
+                    # ── Même principe de validation active pour la pose classique.
+                    nouveau_plancher_confirme = False
                     if nouveau_plancher_id:
+                        nouveau_plancher_confirme = await okx_algo_order_est_actif(
+                            session, inst_id, nouveau_plancher_id, "fixe"
+                        )
+
+                    if nouveau_plancher_id and nouveau_plancher_confirme:
                         if hard_floor_algo_id:
                             await okx_annuler_ordre_algo(session, inst_id, hard_floor_algo_id)
                         hard_floor_algo_id         = nouveau_plancher_id
@@ -2247,20 +2345,51 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                         etat_global["nb_plancher_repositionne"] = (
                             etat_global.get("nb_plancher_repositionne", 0) + 1
                         )
-                        log.info(f"  🧱 [PLANCHER-DUR] {symbole} : plancher repositionné "
-                                 f"(pose+annulation) à {lock_actuel}€ (palier #{index_lock}, "
-                                 f"prix={prix_plancher})")
+                        log.info(f"  🧱 [PLANCHER-DUR] {symbole} : plancher repositionné ET "
+                                 f"confirmé actif (pose+annulation) à {lock_actuel}€ "
+                                 f"(palier #{index_lock}, prix={prix_plancher})")
                         await telegram(session,
                             f"🧱 <b>PLANCHER VERROUILLÉ : {lock_actuel}€</b>\n"
                             f"{symbole} : ce niveau ne peut plus être franchi vers le bas, quoi "
                             f"qu'il arrive au trailing au-dessus.\n"
-                            f"<i>Méthode : repositionnement classique (pose+annulation — "
-                            f"l'amendement direct n'était pas possible ici)</i>"
+                            f"<i>Méthode : repositionnement classique, confirmé actif côté OKX "
+                            f"(l'amendement direct n'était pas possible ici)</i>"
                         )
                     else:
-                        log.warning(f"  ⚠️ [PLANCHER-DUR] Échec repositionnement pour {symbole} "
-                                    f"sur le palier #{index_lock} ({lock_actuel}€) — l'ancien "
-                                    f"plancher (s'il existe) reste actif.")
+                        # ── Nettoyage (08/07) : si l'ordre a bien été accepté par OKX
+                        # (nouveau_plancher_id non nul) mais que la vérification
+                        # d'activité échoue ensuite (aléa réseau sur ce 2e appel,
+                        # rejet asynchrone...), on l'annule explicitement plutôt que
+                        # de le laisser traîner orphelin sur OKX pendant que le
+                        # prochain tick en repose un autre.
+                        if nouveau_plancher_id and not nouveau_plancher_confirme:
+                            await okx_annuler_ordre_algo(session, inst_id, nouveau_plancher_id)
+
+                        # ── CORRECTIF (08/07) — cet échec était auparavant SILENCIEUX
+                        # (log.warning uniquement, jamais remonté sur Telegram). Passé
+                        # en log.error (capturé aussi par le miroir d'erreurs vers
+                        # Telegram) + alerte immédiate dédiée. IMPORTANT : comme
+                        # dernier_index_plancher_dur n'avance PAS ici, ce bloc entier
+                        # sera retenté automatiquement au TICK SUIVANT (CHECK_INTERVAL,
+                        # 1s) — jusqu'à validation effective ou franchissement du
+                        # palier suivant. dernier_index_plancher_alerte évite de
+                        # spammer Telegram à chaque nouvelle tentative pour le MÊME
+                        # palier : une seule alerte, puis silence jusqu'à validation
+                        # ou nouveau palier.
+                        if index_lock != dernier_index_plancher_alerte:
+                            dernier_index_plancher_alerte = index_lock
+                            log.error(f"  ⚠️ [PLANCHER-DUR] Échec de pose/validation pour {symbole} "
+                                      f"sur le palier #{index_lock} ({lock_actuel}€) — nouvelle "
+                                      f"tentative automatique au prochain tick. L'ancien plancher "
+                                      f"(s'il existe) reste actif entretemps.")
+                            await telegram(session,
+                                f"⚠️ <b>ÉCHEC POSE PLANCHER — NOUVELLE TENTATIVE EN COURS</b>\n"
+                                f"{symbole} : le plancher au palier #{index_lock} ({lock_actuel}€) "
+                                f"n'a pas pu être posé/confirmé côté OKX.\n"
+                                f"Le bot retente automatiquement à chaque seconde tant que ce "
+                                f"n'est pas validé. L'ancien plancher (s'il existe) reste actif "
+                                f"entretemps — une confirmation 🧱 suivra dès que ce sera bon."
+                            )
 
         # Stop loss — calculé et vérifié EN PREMIER, avant toute logique de
         # lock. Priorité absolue : si le prix a franchi le niveau de stop,
@@ -2273,12 +2402,27 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
         atteint_stop = (prix_actuel <= stop_initial if direction == "ACHAT"
                         else prix_actuel >= stop_initial)
 
-        # Log toutes les minutes
+        # Log toutes les minutes (détail interne, Railway)
         if time.time() - dernier_log >= 60:
             lock_flag = f" LOCK{lock_actuel}€" if lock_actuel > 0 else ""
             log.info(f"  [{datetime.now().strftime('%H:%M:%S')}] {symbole} {prix_actuel} | "
                      f"PnL {'+' if pnl>=0 else ''}{pnl:.2f}€{lock_flag} | {duree}min")
             dernier_log = time.time()
+
+        # ── Statut périodique sur Telegram (08/07, demandé par Damien — éviter
+        # d'avoir à rouvrir Railway pour suivre un trade en cours) : même
+        # information que le log ci-dessus, mais espacée de 15 min au lieu de
+        # 1 min pour ne pas noyer le chat, même avec plusieurs trades ouverts
+        # en simultané.
+        if time.time() - dernier_statut_telegram >= INTERVALLE_STATUT_TELEGRAM_SEC:
+            lock_flag_tg = f"\nPalier verrouillé : {lock_actuel}€" if lock_actuel > 0 else ""
+            await telegram(session,
+                f"📍 <b>STATUT — {symbole}</b>\n"
+                f"Prix actuel : {prix_actuel} | Durée : {duree}min\n"
+                f"PnL : {'+' if pnl>=0 else ''}{pnl:.2f}€ | PnL max : +{pnl_max_atteint:.2f}€"
+                f"{lock_flag_tg}"
+            )
+            dernier_statut_telegram = time.time()
 
         if atteint_stop:
             # ── CORRECTIF (07/07, relecture complète) — exactement le même
@@ -3523,6 +3667,8 @@ async def boucle_principale():
         log.info("  ⏳ Attente des premiers ticks WebSocket (3s)...")
         await asyncio.sleep(3)
 
+        dernier_vidage_erreurs = 0.0  # 08/07 — voir vider_file_erreurs_vers_telegram
+
         while True:
             try:
                 if arret_demande and not taches_trades_actives:
@@ -3531,6 +3677,13 @@ async def boucle_principale():
 
                 if reset_pnl_jour_si_nouveau_jour(etat):
                     sauvegarder_etat(etat)
+
+                # ── Vidage groupé des erreurs vers Telegram toutes les 60s
+                # (08/07) — voir HandlerErreursTelegram / FILE_ERREURS_TELEGRAM
+                # tout en haut du fichier.
+                if time.time() - dernier_vidage_erreurs >= 60:
+                    await vider_file_erreurs_vers_telegram(session)
+                    dernier_vidage_erreurs = time.time()
 
                 maintenant_utc = datetime.utcnow()
 
