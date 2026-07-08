@@ -2316,8 +2316,20 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                     and MODE_REEL and inst_id and taille_contrats):
                 if direction == "ACHAT":
                     prix_plancher = round(prix_entree * (1 + lock_actuel / position), 8)
+                    # ── CORRECTIF (08/07) — incident réel confirmé sur INJUSD : si le
+                    # prix retrace SOUS ce niveau avant que la pose n'ait lieu, OKX
+                    # rejette (sCode 51304, "SL trigger price cannot be higher than
+                    # the mark price") — et comme ce niveau est figé (calculé depuis
+                    # prix_entree, pas depuis le prix actuel), CHAQUE retry automatique
+                    # échouait à l'identique, indéfiniment. On plafonne désormais le
+                    # niveau visé pour qu'il reste toujours valide par rapport au prix
+                    # ACTUEL — au prix d'un plancher légèrement inférieur à la cible
+                    # d'origine dans ce cas précis, mais qui a enfin une chance réelle
+                    # de se poser plutôt que de retenter éternellement en vain.
+                    prix_plancher = min(prix_plancher, round(prix_actuel * (1 - STOP_BUFFER_SLIPPAGE_PCT), 8))
                 else:
                     prix_plancher = round(prix_entree * (1 - lock_actuel / position), 8)
+                    prix_plancher = max(prix_plancher, round(prix_actuel * (1 + STOP_BUFFER_SLIPPAGE_PCT), 8))
 
                 # ── Amendement en place EN PRIORITÉ (08/07) : si un plancher
                 # existe déjà (pas le tout premier), on tente de modifier son
