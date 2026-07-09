@@ -147,7 +147,16 @@ TRAIL_RATIO_POST_PALIER1 = 0.002   # 08/07 (05:34) — ajusté à 0.20% suite au
 
 # ── Détection signal mean reversion — surveillance temps réel
 SEUIL_MOUVEMENT_PCT     = 0.50   # dès que le prix bouge de 0.50% → signal
-VOLUME_MINI             = 0.25   # volume min vs moyenne 24h
+# ── ÉLARGI le 09/07 (phase de collecte de données, demandé par Damien) : de
+# 0.25x à 0.20x. Objectif explicite : laisser entrer PLUS de trades pour
+# accumuler une base statistique sur RSI/volume (déjà enregistrés par trade
+# dans le rapport quotidien) — les seuils larges d'aujourd'hui contiennent
+# toujours les seuils serrés de demain (on peut filtrer après coup sur les
+# données collectées), l'inverse n'est pas vrai. Resserrer seulement après
+# validation sur un ÉCHANTILLON JAMAIS VU (pas les mêmes trades qui ont
+# servi à choisir le seuil — sinon on cale le bot sur le bruit du moment,
+# pas sur un vrai signal durable).
+VOLUME_MINI             = 0.20   # volume min vs moyenne 24h
 STOP_LOSS_PCT           = 0.006  # stop = 0.6% du prix d'entrée (≈ -4€ au capital/mise actuels) — évolue avec la taille de position, contrairement à un stop fixe en €
 DUREE_MAX_MINUTES       = 360    # 6h — fermeture forcée si ni stop ni lock atteint avant
 TOLERANCE_LOCK_UPL_EUR  = 0.10   # tolérance sur la vérification du PnL réel OKX avant une
@@ -157,9 +166,11 @@ TOLERANCE_LOCK_UPL_EUR  = 0.10   # tolérance sur la vérification du PnL réel 
                                   # que les écarts réellement significatifs (le problème
                                   # observé était de l'ordre de -14€ à -27€, pas de -0.05€).
 
-# ── Filtre RSI 1h
-RSI_SEUIL_BAS           = 45     # RSI < 45 → marché baissier → inverser ACHAT en VENTE
-RSI_SEUIL_HAUT          = 55     # RSI > 55 → marché haussier → inverser VENTE en ACHAT
+# ── Filtre RSI 1h — ÉLARGI le 09/07 (même raison que VOLUME_MINI ci-dessus) :
+# de 45/55 à 40/60, pour laisser entrer plus de signaux et bâtir la base de
+# données RSI/volume avant de resserrer sur un seuil validé.
+RSI_SEUIL_BAS           = 40     # RSI < 40 → marché baissier → inverser ACHAT en VENTE
+RSI_SEUIL_HAUT          = 60     # RSI > 60 → marché haussier → inverser VENTE en ACHAT
 RSI_PERIODE             = 14
 
 # ── Protections
