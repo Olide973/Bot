@@ -43,9 +43,9 @@ def init_database():
         cur = conn.cursor()
         cur.execute("""
             CREATE TABLE IF NOT EXISTS etat_bot (
-                id    INTEGER PRIMARY KEY DEFAULT 1,
-                etat  TEXT NOT NULL,
-                maj   TIMESTAMP DEFAULT NOW()
+                id     INTEGER PRIMARY KEY DEFAULT 1,
+                data   TEXT NOT NULL,
+                maj_le TIMESTAMP DEFAULT NOW()
             )
         """)
         cur.execute("""
@@ -82,7 +82,7 @@ def charger_etat():
         conn = get_connection()
         try:
             cur = conn.cursor()
-            cur.execute("SELECT etat FROM etat_bot WHERE id = 1")
+            cur.execute("SELECT data FROM etat_bot WHERE id = 1")
             row = cur.fetchone()
             if row and row[0]:
                 return json.loads(row[0])
@@ -104,8 +104,8 @@ def sauvegarder_etat(etat):
         try:
             cur = conn.cursor()
             cur.execute("""
-                INSERT INTO etat_bot (id, etat, maj) VALUES (1, %s, NOW())
-                ON CONFLICT (id) DO UPDATE SET etat = EXCLUDED.etat, maj = NOW()
+                INSERT INTO etat_bot (id, data, maj_le) VALUES (1, %s, NOW())
+                ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, maj_le = NOW()
             """, (json.dumps(etat),))
             conn.commit()
         finally:
