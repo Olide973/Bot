@@ -2040,14 +2040,18 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
         # que la protection elle-même se base sur la réalité, pas sur une
         # estimation périmée dès la première seconde du trade.
         if avg_px_reel and abs(avg_px_reel - prix_entree) / prix_entree > 0.0005:
+            glissement_calc = (avg_px_reel - prix_entree) / prix_entree * 100
+            details["glissement_pct"] = round(glissement_calc, 4)
             log.warning(f"  ⚠️ [GLISSEMENT] {symbole} : prix visé {prix_entree} → rempli "
-                        f"{avg_px_reel} (écart {(avg_px_reel-prix_entree)/prix_entree*100:.3f}%) — "
+                        f"{avg_px_reel} (écart {glissement_calc:.3f}%) — "
                         f"recalcul du stop/objectif sur le prix réel.")
             await telegram(session,
                 f"⚠️ <b>GLISSEMENT D'EXÉCUTION</b>\n{symbole} : prix visé {prix_entree}, "
-                f"rempli à {avg_px_reel} (écart {(avg_px_reel-prix_entree)/prix_entree*100:.3f}%).\n"
+                f"rempli à {avg_px_reel} (écart {glissement_calc:.3f}%).\n"
                 f"Stop et objectif recalculés sur le prix réel."
             )
+        else:
+            details["glissement_pct"] = 0.0
         if avg_px_reel:
             prix_entree = avg_px_reel
             if direction == "ACHAT":
@@ -3065,17 +3069,21 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                 )
 
         etat_global.setdefault("historique", []).append({
-            'heure':         (datetime.utcnow() - timedelta(hours=3)).strftime('%Y-%m-%d %H:%M'),
-            'marche':        symbole,
-            'direction':     direction,
-            'resultat':      resultat_final,
-            'gain':          round(gain_final, 2),
-            'mise':          round(mise, 2),
-            'capital':       etat_global["capital"],
-            'duree_minutes': duree,
-            'rsi':           rsi_1h,
-            'vol_ratio':     details.get("vol_ratio", 0.0),
-            'pos_id':        pos_id,
+            'heure':           (datetime.utcnow() - timedelta(hours=3)).strftime('%Y-%m-%d %H:%M'),
+            'heure_ouverture': (datetime.fromtimestamp(debut) - timedelta(hours=3)).strftime('%Y-%m-%d %H:%M'),
+            'marche':          symbole,
+            'direction':       direction,
+            'resultat':        resultat_final,
+            'gain':            round(gain_final, 2),
+            'mise':            round(mise, 2),
+            'capital':         etat_global["capital"],
+            'duree_minutes':   duree,
+            'rsi':             rsi_1h,
+            'vol_ratio':       details.get("vol_ratio", 0.0),
+            'variation_pct':   details.get("variation_pct", 0.0),
+            'atr':             details.get("atr", None),
+            'glissement_pct':  details.get("glissement_pct", 0.0),
+            'pos_id':          pos_id,
         })
 
     if alerte_perte_a_envoyer:
@@ -3519,6 +3527,11 @@ async def envoyer_rapport_quotidien(session, etat):
     vol_wins     = []
     vol_pertes   = []
     heure_pertes = {}
+    detail_trades = []  # 09/07 — un enregistrement par trade (pas agrégé), pour
+                          # que Damien puisse voir le RSI et le volume de CHAQUE
+                          # trade de la journée, gagnant comme perdant, et calculer
+                          # lui-même quel seuil retenir plutôt que d'ajuster à
+                          # l'aveugle.
 
     for h in trades_jour:
         marche   = h.get("marche", "?")
@@ -3527,10 +3540,20 @@ async def envoyer_rapport_quotidien(session, etat):
         duree    = h.get("duree_minutes", 0)
         rsi      = h.get("rsi", 50.0)
         vol      = h.get("vol_ratio", 0.0)
+        variation   = h.get("variation_pct", 0.0)
+        atr_h       = h.get("atr", None)
+        glissement  = h.get("glissement_pct", 0.0)
+        heure_ouv   = h.get("heure_ouverture", h.get("heure", ""))
         heure_str = h.get("heure", "")
 
         gains_jour[marche]  = round(gains_jour.get(marche, 0) + gain, 2)
         rsi_jour.setdefault(marche, []).append(rsi)
+        detail_trades.append({
+            "marche": marche, "heure": heure_str[11:16] if len(heure_str) >= 16 else "?",
+            "heure_ouv": heure_ouv[11:16] if len(heure_ouv) >= 16 else "?",
+            "rsi": rsi, "vol": vol, "gain": gain, "resultat": resultat,
+            "variation": variation, "atr": atr_h, "glissement": glissement,
+        })
 
         if resultat == "GAGNE":
             wins_jour[marche] = wins_jour.get(marche, 0) + 1
@@ -3605,6 +3628,45 @@ async def envoyer_rapport_quotidien(session, etat):
     vol_moy_w    = round(sum(vol_wins) / len(vol_wins), 2) if vol_wins else 0
     vol_moy_p    = round(sum(vol_pertes) / len(vol_pertes), 2) if vol_pertes else 0
 
+    # ── Moyennes TOUS trades confondus, gagnants ET perdants ensemble (09/07,
+    # demandé par Damien : "au lieu de se baser à l'aveugle, on va se baser sur
+    # des données"). Objectif : donner de quoi choisir un seuil RSI/volume à
+    # partir de ce qui s'est réellement passé, pas d'une intuition.
+    rsi_tous = [d["rsi"] for d in detail_trades]
+    vol_tous = [d["vol"] for d in detail_trades]
+    rsi_moy_tous = round(sum(rsi_tous) / len(rsi_tous), 1) if rsi_tous else 0
+    vol_moy_tous = round(sum(vol_tous) / len(vol_tous), 2) if vol_tous else 0
+    # ── Min/max (09/07, demandé en plus de la moyenne) — la fourchette
+    # complète observée dans la journée, tous trades confondus.
+    rsi_min_tous = round(min(rsi_tous), 1) if rsi_tous else 0
+    rsi_max_tous = round(max(rsi_tous), 1) if rsi_tous else 0
+    vol_min_tous = round(min(vol_tous), 2) if vol_tous else 0
+    vol_max_tous = round(max(vol_tous), 2) if vol_tous else 0
+
+    # ── Les 3 nouvelles données (09/07, demandé en plus de RSI/volume) :
+    # variation d'entrée, ATR (volatilité), glissement d'exécution. Toutes
+    # déjà calculées ailleurs dans le bot — jamais moyennées jusqu'ici.
+    variation_tous = [d["variation"] for d in detail_trades]
+    atr_tous       = [d["atr"] for d in detail_trades if d["atr"] is not None]
+    glissement_tous = [d["glissement"] for d in detail_trades]
+    variation_moy = round(sum(variation_tous) / len(variation_tous), 3) if variation_tous else 0
+    variation_min = round(min(variation_tous), 3) if variation_tous else 0
+    variation_max = round(max(variation_tous), 3) if variation_tous else 0
+    atr_moy = round(sum(atr_tous) / len(atr_tous), 5) if atr_tous else None
+    atr_min = round(min(atr_tous), 5) if atr_tous else None
+    atr_max = round(max(atr_tous), 5) if atr_tous else None
+    glissement_moy = round(sum(glissement_tous) / len(glissement_tous), 3) if glissement_tous else 0
+    glissement_min = round(min(glissement_tous), 3) if glissement_tous else 0
+    glissement_max = round(max(glissement_tous), 3) if glissement_tous else 0
+    rsi_gagnants = [d["rsi"] for d in detail_trades if d["resultat"] == "GAGNE"]
+    vol_gagnants = [d["vol"] for d in detail_trades if d["resultat"] == "GAGNE"]
+    # "Seuil suggéré" = le pire cas (min) parmi les gagnants du jour : le
+    # niveau le plus bas qui a quand même donné un trade gagnant aujourd'hui —
+    # une indication concrète, pas une recommandation statistiquement fiable
+    # sur un seul jour (échantillon trop petit pour ça).
+    rsi_min_gagnant = round(min(rsi_gagnants), 1) if rsi_gagnants else None
+    vol_min_gagnant = round(min(vol_gagnants), 2) if vol_gagnants else None
+
     lignes_marches = []
     for marche, gain in classement:
         emoji  = "✅" if gain >= 0 else "❌"
@@ -3639,6 +3701,43 @@ async def envoyer_rapport_quotidien(session, etat):
     else:
         bloc_plancher = ""
 
+    # ── Détail RSI/volume PAR TRADE (09/07) — un trade par ligne, gagnant
+    # comme perdant, dans l'ordre chronologique. Sur beaucoup de trades dans
+    # la journée, Telegram tronque au-delà d'un certain nombre de caractères
+    # — on garde donc ce détail lisible même si la journée a été chargée.
+    lignes_detail = []
+    for d in detail_trades:
+        emoji_d = "✅" if d["resultat"] == "GAGNE" else "❌"
+        atr_aff = f"{d['atr']:.5f}" if d['atr'] is not None else "?"
+        lignes_detail.append(
+            f"{emoji_d} <code>{d['heure_ouv']} {d['marche']:<10} RSI:{d['rsi']:<5} "
+            f"Vol:{d['vol']:<5} Var:{d['variation']:.2f}% Gliss:{d['glissement']:+.2f}% "
+            f"ATR:{atr_aff} {'+' if d['gain']>=0 else ''}{d['gain']}€</code>"
+        )
+    bloc_detail = "\n".join(lignes_detail)
+
+    bloc_suggestion = ""
+    if rsi_min_gagnant is not None and vol_min_gagnant is not None:
+        bloc_atr = (
+            f"ATR — moyenne : {atr_moy} | min : {atr_min} | max : {atr_max}\n"
+            if atr_moy is not None else ""
+        )
+        bloc_suggestion = (
+            f"\n💡 <b>POUR CHOISIR UN SEUIL</b>\n"
+            f"RSI — moyenne : {rsi_moy_tous} | min : {rsi_min_tous} | max : {rsi_max_tous}\n"
+            f"Volume — moyenne : {vol_moy_tous}x | min : {vol_min_tous}x | max : "
+            f"{vol_max_tous}x\n"
+            f"Variation d'entrée — moyenne : {variation_moy}% | min : {variation_min}% | "
+            f"max : {variation_max}%\n"
+            f"Glissement d'exécution — moyenne : {glissement_moy}% | min : {glissement_min}% "
+            f"| max : {glissement_max}%\n"
+            f"{bloc_atr}"
+            f"Pire cas encore gagnant aujourd'hui : RSI {rsi_min_gagnant} | Volume "
+            f"{vol_min_gagnant}x\n"
+            f"<i>(indicatif sur 1 seule journée — pas encore fiable statistiquement, "
+            f"à confirmer sur plusieurs jours avant de changer un seuil)</i>\n"
+        )
+
     message = (
         f"📊 <b>RAPPORT QUOTIDIEN</b>\n"
         f"Journee du {date_affich}\n\n"
@@ -3654,12 +3753,22 @@ async def envoyer_rapport_quotidien(session, etat):
         f"Gagnants : {vol_moy_w}x | Perdants : {vol_moy_p}x\n\n"
         f"🕐 <b>HEURES DES PERTES</b>\n"
         f"{lignes_pertes_h}\n"
-        f"{bloc_plancher}\n"
+        f"{bloc_plancher}"
+        f"{bloc_suggestion}\n"
+        f"<code>{'─'*40}</code>\n"
+        f"<b>DÉTAIL PAR TRADE (RSI / VOLUME)</b>\n"
+        f"{bloc_detail}\n\n"
         f"<code>{'─'*40}</code>\n"
         f"<b>CLASSEMENT MARCHÉS</b>\n"
         f"<code>{'MARCHÉ':<12} {'GAINS':<10} {'G/P':<6} RSI MOY</code>\n"
         f"{chr(10).join(lignes_marches)}"
     )
+    # ── Sécurité longueur (09/07) : avec le détail par trade ajouté, une
+    # journée à beaucoup de trades peut dépasser la limite Telegram (4096
+    # caractères). On tronque plutôt que d'échouer silencieusement à envoyer
+    # tout le rapport.
+    if len(message) > 4000:
+        message = message[:4000] + "\n\n… (rapport tronqué, trop de trades pour un seul message)"
     log.info("  Envoi rapport quotidien Telegram")
     await telegram(session, message)
 
