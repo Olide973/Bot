@@ -159,6 +159,13 @@ SEUIL_MOUVEMENT_PCT     = 0.50   # dès que le prix bouge de 0.50% → signal
 VOLUME_MINI             = 0.20   # volume min vs moyenne 24h
 STOP_LOSS_PCT           = 0.006  # stop = 0.6% du prix d'entrée (≈ -4€ au capital/mise actuels) — évolue avec la taille de position, contrairement à un stop fixe en €
 DUREE_MAX_MINUTES       = 360    # 6h — fermeture forcée si ni stop ni lock atteint avant
+# ── Suivi post-stop (09/07, demandé par Damien) : après un stop-loss, on
+# continue de suivre le prix pendant DUREE_SUIVI_POST_STOP_MIN de plus (sans
+# aucune position ouverte, juste en observation) pour savoir si le marché a
+# continué dans le sens du stop (bien calibré) ou est reparti en sens
+# inverse (stop trop serré) — donnée concrète pour ajuster STOP_LOSS_PCT
+# lors des prochaines mises à jour, plutôt que de deviner.
+DUREE_SUIVI_POST_STOP_MIN = 15
 TOLERANCE_LOCK_UPL_EUR  = 0.10   # tolérance sur la vérification du PnL réel OKX avant une
                                   # sortie LOCK — absorbe le bruit de sync normal entre le
                                   # tick WebSocket et l'API positions (quelques ms d'écart),
@@ -2115,6 +2122,56 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
         taille_contrats=taille_contrats, pos_id=pos_id, algo_type=algo_type_stop
     )
 
+async def suivre_prix_post_stop(session, symbole, direction, prix_stop_reel, prix_entree,
+                                  pos_id, etat_global):
+    """Suit le prix pendant DUREE_SUIVI_POST_STOP_MIN après un stop-loss —
+    sans position ouverte, en pure observation — pour savoir si le marché a
+    continué dans le sens du stop (bien calibré) ou est reparti en sens
+    inverse (stop trop serré). Envoie un message dédié et enrichit
+    l'historique déjà enregistré (recherché par pos_id) avec cette donnée,
+    pour qu'elle serve de base aux prochains ajustements de STOP_LOSS_PCT."""
+    await asyncio.sleep(DUREE_SUIVI_POST_STOP_MIN * 60)
+    try:
+        prix_apres = await get_prix_actuel(session, symbole)
+    except Exception as e:
+        log.error(f"  ❌ [SUIVI-POST-STOP] Échec lecture prix pour {symbole} : {e}")
+        return
+    if prix_apres is None or not prix_stop_reel:
+        return
+
+    variation_post_pct = round((prix_apres - prix_stop_reel) / prix_stop_reel * 100, 3)
+    if direction == "ACHAT":
+        stop_bien_place    = prix_apres < prix_stop_reel
+        a_recupere_entree  = prix_apres >= prix_entree
+    else:
+        stop_bien_place    = prix_apres > prix_stop_reel
+        a_recupere_entree  = prix_apres <= prix_entree
+
+    verdict = ("↘️ Le prix a continué dans le sens du stop — stop bien placé"
+               if stop_bien_place else
+               "↗️ Le prix est reparti en sens inverse — stop peut-être trop serré")
+    if a_recupere_entree:
+        verdict += " (et même repassé le prix d'entrée initial)"
+
+    log.info(f"  📐 [SUIVI-POST-STOP] {symbole} : {DUREE_SUIVI_POST_STOP_MIN}min après le stop, "
+             f"prix {prix_stop_reel} → {prix_apres} ({variation_post_pct:+.3f}%). {verdict}")
+    await telegram(session,
+        f"📐 <b>SUIVI POST-STOP — {symbole}</b>\n"
+        f"{DUREE_SUIVI_POST_STOP_MIN} min après la fermeture : prix {prix_stop_reel} → "
+        f"{prix_apres} ({variation_post_pct:+.3f}%).\n"
+        f"{verdict}\n"
+        f"<i>Donnée conservée pour calibrer la distance du stop lors des prochaines "
+        f"mises à jour.</i>"
+    )
+
+    for entree in etat_global.get("historique", []):
+        if entree.get("pos_id") == pos_id and pos_id is not None:
+            entree["suivi_post_stop_pct"] = variation_post_pct
+            entree["stop_bien_place"]     = stop_bien_place
+            break
+    sauvegarder_etat(etat_global)
+
+
 async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital, position,
                                       prix_entree, stop_initial, objectif_final, stop_loss_eur,
                                       rsi_1h, details, inst_id, etat_global, debut_override=None,
@@ -2733,9 +2790,11 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                             f"Durée : {duree} min"
                         )
                         gain_final = pnl_net
+                        asyncio.create_task(suivre_prix_post_stop(
+                            session, symbole, direction, stop_initial, prix_entree,
+                            pos_id, etat_global
+                        ))
                         break
-                # Position toujours ouverte (ou check pas encore dû) : la
-                # protection native n'a pas encore fermé — on ne fait RIEN,
                 # on ne l'annule jamais, on continue la boucle.
             else:
                 # Pas de protection native active (les deux poses ont
@@ -2754,6 +2813,10 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                     f"Durée : {duree} min"
                 )
                 gain_final = pnl_net
+                asyncio.create_task(suivre_prix_post_stop(
+                    session, symbole, direction, stop_initial, prix_entree,
+                    pos_id, etat_global
+                ))
                 break
 
         # Sortie lock : PnL redescend sous le palier verrouillé (mais le
