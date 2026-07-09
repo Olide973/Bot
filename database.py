@@ -2,6 +2,18 @@
 ╔══════════════════════════════════════════════════════════════════╗
 ║   MODULE BASE DE DONNÉES — REIVAX284 V4 OKX (PostgreSQL/pg8000)  ║
 ╚══════════════════════════════════════════════════════════════════╝
+
+### MODIF (résumé) ###
+1) init_database() ne swallow plus les erreurs de connexion : avant, un
+   except Exception loggait puis laissait la fonction retourner
+   normalement (None). Le bot démarrait alors et tradait SANS aucune
+   persistance ni récupération de position au redémarrage, sans jamais
+   crasher pour te le signaler. Maintenant l'exception est relevée
+   (log.error puis "raise") pour que le bot s'arrête net si la DB est
+   injoignable, plutôt que de trader "à l'aveugle".
+   Note : le cas DATABASE_URL non défini reste volontairement toléré
+   (log.warning + return) car c'est un choix explicite de config
+   ("je n'utilise pas de DB pour ce déploiement"), différent d'un échec.
 """
 
 import os
@@ -32,7 +44,14 @@ def get_connection():
 
 
 def init_database():
-    """Crée les tables si elles n'existent pas encore."""
+    """Crée les tables si elles n'existent pas encore.
+
+    ### MODIF: si DATABASE_URL est vide, c'est un choix de config assumé
+    (bot sans persistance) -> on tolère et on continue.
+    Si DATABASE_URL est défini mais que la connexion/création échoue,
+    c'est une panne -> on relève l'exception pour stopper le démarrage
+    plutôt que de laisser le bot trader sans DB à son insu.
+    """
     if not DATABASE_URL:
         log.warning("DATABASE_URL non défini — base de données désactivée")
         return
@@ -75,7 +94,13 @@ def init_database():
         conn.close()
         log.info("  Base de données initialisée (etat_bot, trades)")
     except Exception as e:
-        log.error(f"Erreur init_database : {e}")
+        # ### MODIF: avant -> log.error(...) puis return silencieux (le bot
+        # démarrait quand même, sans DB, sans le savoir). Maintenant -> on
+        # relève l'exception pour que ça crashe au démarrage, de façon
+        # visible dans les Deploy Logs, plutôt que de découvrir l'absence
+        # de persistance seulement au moment d'un redémarrage inopiné.
+        log.error(f"Erreur init_database (fatale) : {e}")
+        raise
 
 
 def charger_etat():
