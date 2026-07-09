@@ -1,175 +1,151 @@
-"""
-╔══════════════════════════════════════════════════════════════════╗
-║   MODULE BASE DE DONNÉES — REIVAX284 V4 OKX (PostgreSQL/pg8000)  ║
-╚══════════════════════════════════════════════════════════════════╝
-
-### MODIF (résumé) ###
-1) init_database() ne swallow plus les erreurs de connexion : avant, un
-   except Exception loggait puis laissait la fonction retourner
-   normalement (None). Le bot démarrait alors et tradait SANS aucune
-   persistance ni récupération de position au redémarrage, sans jamais
-   crasher pour te le signaler. Maintenant l'exception est relevée
-   (log.error puis "raise") pour que le bot s'arrête net si la DB est
-   injoignable, plutôt que de trader "à l'aveugle".
-   Note : le cas DATABASE_URL non défini reste volontairement toléré
-   (log.warning + return) car c'est un choix explicite de config
-   ("je n'utilise pas de DB pour ce déploiement"), différent d'un échec.
-"""
-
+# ═══════════════════════════════════════════════════════════════
+#  database.py — persistance PostgreSQL (Railway) pour bot_trading-48.py
+#  Reconstruit le 09/07/2026 à partir de la structure d'origine
+#  (mai 2026) : pg8000, DATABASE_URL lue DANS get_connection()
+#  (correctif de mai — jamais au niveau module), tables etat_bot
+#  et trades. Interface identique à l'original :
+#    init_database(), charger_etat(), sauvegarder_etat(etat),
+#    enregistrer_trade(trade)
+# ═══════════════════════════════════════════════════════════════
 import os
 import json
 import logging
-import ssl
 from urllib.parse import urlparse
-import pg8000.native as pg8000
+
+import pg8000
 
 log = logging.getLogger(__name__)
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
-
 
 def get_connection():
-    url = urlparse(DATABASE_URL)
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return pg8000.Connection(
-        user=url.username,
-        password=url.password,
-        host=url.hostname,
-        port=url.port or 5432,
-        database=url.path.lstrip("/"),
-        ssl_context=ctx,
+    """Ouvre une connexion PostgreSQL à partir de DATABASE_URL.
+    La variable est lue ICI (pas au niveau module) — correctif de mai 2026 :
+    Railway injecte parfois la variable après l'import du module, la lire à
+    l'import figeait une valeur vide."""
+    url = os.environ.get("DATABASE_URL", "")
+    if not url:
+        raise RuntimeError("DATABASE_URL absente des variables d'environnement")
+    p = urlparse(url)
+    return pg8000.connect(
+        user=p.username,
+        password=p.password,
+        host=p.hostname,
+        port=p.port or 5432,
+        database=(p.path or "/postgres").lstrip("/"),
     )
 
 
 def init_database():
-    """Crée les tables si elles n'existent pas encore.
-
-    ### MODIF: si DATABASE_URL est vide, c'est un choix de config assumé
-    (bot sans persistance) -> on tolère et on continue.
-    Si DATABASE_URL est défini mais que la connexion/création échoue,
-    c'est une panne -> on relève l'exception pour stopper le démarrage
-    plutôt que de laisser le bot trader sans DB à son insu.
-    """
-    if not DATABASE_URL:
-        log.warning("DATABASE_URL non défini — base de données désactivée")
-        return
+    """Crée les tables si absentes (idempotent — ne touche jamais aux données
+    existantes)."""
+    conn = get_connection()
     try:
-        conn = get_connection()
-        conn.run("""
+        cur = conn.cursor()
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS etat_bot (
-                id INTEGER PRIMARY KEY DEFAULT 1,
-                data JSONB NOT NULL,
-                maj_le TIMESTAMP DEFAULT NOW()
-            );
+                id    INTEGER PRIMARY KEY DEFAULT 1,
+                etat  TEXT NOT NULL,
+                maj   TIMESTAMP DEFAULT NOW()
+            )
         """)
-        conn.run("""
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS trades (
-                id SERIAL PRIMARY KEY,
-                marche VARCHAR(20),
-                direction VARCHAR(10),
-                resultat VARCHAR(10),
-                prix_entree DOUBLE PRECISION,
-                prix_sortie DOUBLE PRECISION,
-                stop_loss DOUBLE PRECISION,
-                objectif DOUBLE PRECISION,
-                mise DOUBLE PRECISION,
-                gain DOUBLE PRECISION,
-                frais DOUBLE PRECISION,
-                funding DOUBLE PRECISION,
+                id            SERIAL PRIMARY KEY,
+                horodatage    TIMESTAMP DEFAULT NOW(),
+                marche        TEXT,
+                direction     TEXT,
+                resultat      TEXT,
+                prix_entree   DOUBLE PRECISION,
+                prix_sortie   DOUBLE PRECISION,
+                stop_loss     DOUBLE PRECISION,
+                objectif      DOUBLE PRECISION,
+                mise          DOUBLE PRECISION,
+                gain          DOUBLE PRECISION,
                 capital_apres DOUBLE PRECISION,
-                duree_minutes INTEGER,
-                score DOUBLE PRECISION,
-                adx DOUBLE PRECISION,
-                atr DOUBLE PRECISION,
-                rsi DOUBLE PRECISION,
-                cree_le TIMESTAMP DEFAULT NOW()
-            );
+                duree_minutes DOUBLE PRECISION,
+                score         DOUBLE PRECISION,
+                adx           DOUBLE PRECISION,
+                atr           DOUBLE PRECISION,
+                rsi           DOUBLE PRECISION
+            )
         """)
-        # Migration : ajoute les colonnes ajoutées après la création initiale
-        # de la table 'trades' (déploiements précédents)
-        conn.run("ALTER TABLE trades ADD COLUMN IF NOT EXISTS frais DOUBLE PRECISION;")
-        conn.run("ALTER TABLE trades ADD COLUMN IF NOT EXISTS funding DOUBLE PRECISION;")
-        conn.close()
+        conn.commit()
         log.info("  Base de données initialisée (etat_bot, trades)")
-    except Exception as e:
-        # ### MODIF: avant -> log.error(...) puis return silencieux (le bot
-        # démarrait quand même, sans DB, sans le savoir). Maintenant -> on
-        # relève l'exception pour que ça crashe au démarrage, de façon
-        # visible dans les Deploy Logs, plutôt que de découvrir l'absence
-        # de persistance seulement au moment d'un redémarrage inopiné.
-        log.error(f"Erreur init_database (fatale) : {e}")
-        raise
+    finally:
+        conn.close()
 
 
 def charger_etat():
-    """Charge l'état global depuis la base. Retourne {} si absent ou en cas d'erreur."""
-    if not DATABASE_URL:
-        return {}
+    """Charge l'état complet du bot (dict). Retourne {} si aucun état
+    sauvegardé — le bot initialise alors ses champs par défaut."""
     try:
         conn = get_connection()
-        rows = conn.run("SELECT data FROM etat_bot WHERE id = 1;")
-        conn.close()
-        if rows and rows[0][0]:
-            return rows[0][0]
-        return {}
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT etat FROM etat_bot WHERE id = 1")
+            row = cur.fetchone()
+            if row and row[0]:
+                return json.loads(row[0])
+            return {}
+        finally:
+            conn.close()
     except Exception as e:
-        log.error(f"Erreur charger_etat : {e}")
+        log.error(f"  [DB] Échec chargement état : {e} — état vide utilisé")
         return {}
 
 
 def sauvegarder_etat(etat):
-    """Sauvegarde (upsert) l'état global complet en base."""
-    if not DATABASE_URL:
-        return
+    """Sauvegarde l'état complet du bot (upsert sur la ligne unique id=1).
+    Ne lève jamais : un échec de sauvegarde ne doit pas interrompre le
+    trading — l'erreur est loggée (et remontée sur Telegram via le miroir
+    d'erreurs du bot)."""
     try:
         conn = get_connection()
-        conn.run("""
-            INSERT INTO etat_bot (id, data, maj_le)
-            VALUES (1, :data, NOW())
-            ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, maj_le = NOW();
-        """, data=json.dumps(etat))
-        conn.close()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO etat_bot (id, etat, maj) VALUES (1, %s, NOW())
+                ON CONFLICT (id) DO UPDATE SET etat = EXCLUDED.etat, maj = NOW()
+            """, (json.dumps(etat),))
+            conn.commit()
+        finally:
+            conn.close()
     except Exception as e:
-        log.error(f"Erreur sauvegarder_etat : {e}")
+        log.error(f"  [DB] Échec sauvegarde état : {e}")
 
 
 def enregistrer_trade(trade):
-    """Enregistre un trade clôturé dans la table trades (historique brut)."""
-    if not DATABASE_URL:
-        return
+    """Insère un trade clôturé dans l'historique. Ne lève jamais — un échec
+    d'enregistrement ne doit pas faire planter le cycle de trading."""
     try:
         conn = get_connection()
-        conn.run("""
-            INSERT INTO trades (
-                marche, direction, resultat, prix_entree, prix_sortie,
-                stop_loss, objectif, mise, gain, frais, funding, capital_apres,
-                duree_minutes, score, adx, atr, rsi
-            ) VALUES (
-                :marche, :direction, :resultat, :prix_entree, :prix_sortie,
-                :stop_loss, :objectif, :mise, :gain, :frais, :funding, :capital_apres,
-                :duree_minutes, :score, :adx, :atr, :rsi
-            );
-        """,
-            marche=trade.get("marche"),
-            direction=trade.get("direction"),
-            resultat=trade.get("resultat"),
-            prix_entree=trade.get("prix_entree"),
-            prix_sortie=trade.get("prix_sortie"),
-            stop_loss=trade.get("stop_loss"),
-            objectif=trade.get("objectif"),
-            mise=trade.get("mise"),
-            gain=trade.get("gain"),
-            frais=trade.get("frais"),
-            funding=trade.get("funding"),
-            capital_apres=trade.get("capital_apres"),
-            duree_minutes=trade.get("duree_minutes"),
-            score=trade.get("score"),
-            adx=trade.get("adx"),
-            atr=trade.get("atr"),
-            rsi=trade.get("rsi"),
-        )
-        conn.close()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO trades
+                    (marche, direction, resultat, prix_entree, prix_sortie,
+                     stop_loss, objectif, mise, gain, capital_apres,
+                     duree_minutes, score, adx, atr, rsi)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                trade.get("marche"),
+                trade.get("direction"),
+                trade.get("resultat"),
+                trade.get("prix_entree"),
+                trade.get("prix_sortie"),
+                trade.get("stop_loss"),
+                trade.get("objectif"),
+                trade.get("mise"),
+                trade.get("gain"),
+                trade.get("capital_apres"),
+                trade.get("duree_minutes"),
+                trade.get("score"),
+                trade.get("adx"),
+                trade.get("atr"),
+                trade.get("rsi"),
+            ))
+            conn.commit()
+        finally:
+            conn.close()
     except Exception as e:
-        log.error(f"Erreur enregistrer_trade : {e}")
+        log.error(f"  [DB] Échec enregistrement trade {trade.get('marche')} : {e}")
