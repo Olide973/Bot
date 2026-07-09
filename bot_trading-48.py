@@ -56,6 +56,29 @@ from database import init_database, charger_etat, sauvegarder_etat, enregistrer_
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
+
+# ===================== WRAPPERS ASYNC POUR LA DB (pg8000 = sync/bloquant) =====================
+# ### MODIF (nouveau): charger_etat(), sauvegarder_etat() et enregistrer_trade()
+# sont des fonctions SYNCHRONES (pg8000, pas asyncpg). Deux risques :
+#  1) les await directement -> "TypeError: object NoneType can't be used in
+#     'await' expression" (même bug que celui déjà réglé pour init_database)
+#  2) les appeler en sync dans une coroutine -> chaque appel bloque TOUTE la
+#     boucle asyncio le temps de l'aller-retour réseau vers PostgreSQL,
+#     gelant la surveillance des stops pendant ce temps.
+# Ces wrappers utilisent asyncio.to_thread pour exécuter le code bloquant
+# dans un thread séparé sans geler la boucle. À utiliser partout dans le
+# reste du bot à la place des fonctions importées directement.
+async def charger_etat_async():
+    return await asyncio.to_thread(charger_etat)
+
+
+async def sauvegarder_etat_async(etat):
+    return await asyncio.to_thread(sauvegarder_etat, etat)
+
+
+async def enregistrer_trade_async(trade):
+    return await asyncio.to_thread(enregistrer_trade, trade)
+
 # ===================== CONFIGURATION ANTI-FRAIS =====================
 CAPITAL_INITIAL         = 543.65
 SEUIL_ALERTE_PERTE_PCT  = 10.0
@@ -257,6 +280,11 @@ async def ouvrir_trade(symbole, sens, prix_entree, capital_dispo, atr_value, rsi
              f"SL={stop_loss:.4f} | Mise={mise:.1f}€ | ATR={atr_value:.4f}")
 
     # trades_ouverts[...] = {...}  # à implémenter selon ta logique existante
+    # ### RAPPEL: pour persister l'état ou enregistrer ce trade plus tard,
+    # utiliser sauvegarder_etat_async(...) / enregistrer_trade_async(...)
+    # définies plus haut — jamais sauvegarder_etat(...) / enregistrer_trade(...)
+    # directement dans une coroutine (bloquant), et jamais avec un await
+    # dessus directement (ce sont des fonctions sync -> renvoient None).
     return True
 
 # ===================== BOUCLE PRINCIPALE (exemple) =====================
