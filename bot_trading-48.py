@@ -2137,6 +2137,9 @@ async def suivre_prix_post_stop(session, symbole, direction, prix_stop_reel, pri
         log.error(f"  ❌ [SUIVI-POST-STOP] Échec lecture prix pour {symbole} : {e}")
         return
     if prix_apres is None or not prix_stop_reel:
+        log.error(f"  ❌ [SUIVI-POST-STOP] {symbole} : impossible de conclure "
+                  f"(prix_apres={prix_apres}, prix_stop_reel={prix_stop_reel}) — "
+                  f"message non envoyé.")
         return
 
     variation_post_pct = round((prix_apres - prix_stop_reel) / prix_stop_reel * 100, 3)
@@ -3619,6 +3622,8 @@ async def envoyer_rapport_quotidien(session, etat):
         glissement  = h.get("glissement_pct", 0.0)
         heure_ouv   = h.get("heure_ouverture", h.get("heure", ""))
         heure_str = h.get("heure", "")
+        suivi_post_stop_pct = h.get("suivi_post_stop_pct", None)
+        stop_bien_place     = h.get("stop_bien_place", None)
 
         gains_jour[marche]  = round(gains_jour.get(marche, 0) + gain, 2)
         rsi_jour.setdefault(marche, []).append(rsi)
@@ -3627,6 +3632,7 @@ async def envoyer_rapport_quotidien(session, etat):
             "heure_ouv": heure_ouv[11:16] if len(heure_ouv) >= 16 else "?",
             "rsi": rsi, "vol": vol, "gain": gain, "resultat": resultat,
             "variation": variation, "atr": atr_h, "glissement": glissement,
+            "suivi_post_stop_pct": suivi_post_stop_pct, "stop_bien_place": stop_bien_place,
         })
 
         if resultat == "GAGNE":
@@ -3812,6 +3818,29 @@ async def envoyer_rapport_quotidien(session, etat):
             f"à confirmer sur plusieurs jours avant de changer un seuil)</i>\n"
         )
 
+    # ── Récapitulatif SUIVI POST-STOP (09/07, demandé par Damien) — pour
+    # chaque stop du jour où la donnée est disponible (15 min après la
+    # fermeture, voir suivre_prix_post_stop) : est-ce que le prix a continué
+    # dans le sens du stop (bien calibré) ou est reparti en sens inverse
+    # (stop trop serré) ? Objectif : donner une vraie base pour ajuster
+    # STOP_LOSS_PCT, trade par trade ET en tendance générale sur la journée.
+    trades_avec_suivi = [d for d in detail_trades if d["suivi_post_stop_pct"] is not None]
+    bloc_post_stop = ""
+    if trades_avec_suivi:
+        nb_bien_places = sum(1 for d in trades_avec_suivi if d["stop_bien_place"])
+        lignes_post_stop = []
+        for d in trades_avec_suivi:
+            icone = "↘️" if d["stop_bien_place"] else "↗️"
+            lignes_post_stop.append(
+                f"{icone} <code>{d['marche']:<10} {d['suivi_post_stop_pct']:+.3f}%</code>"
+            )
+        bloc_post_stop = (
+            f"\n📐 <b>SUIVI POST-STOP</b> ({nb_bien_places}/{len(trades_avec_suivi)} bien placés)\n"
+            + "\n".join(lignes_post_stop) + "\n"
+            f"<i>↘️ = le prix a continué dans le sens du stop | ↗️ = reparti en sens "
+            f"inverse (stop peut-être trop serré)</i>\n"
+        )
+
     message = (
         f"📊 <b>RAPPORT QUOTIDIEN</b>\n"
         f"Journee du {date_affich}\n\n"
@@ -3828,7 +3857,8 @@ async def envoyer_rapport_quotidien(session, etat):
         f"🕐 <b>HEURES DES PERTES</b>\n"
         f"{lignes_pertes_h}\n"
         f"{bloc_plancher}"
-        f"{bloc_suggestion}\n"
+        f"{bloc_suggestion}"
+        f"{bloc_post_stop}\n"
         f"<code>{'─'*40}</code>\n"
         f"<b>DÉTAIL PAR TRADE (RSI / VOLUME)</b>\n"
         f"{bloc_detail}\n\n"
@@ -4317,6 +4347,18 @@ async def boucle_principale():
                             await WS_CONNEXION_ACTIVE.close()
                         except Exception as e:
                             log.error(f"Erreur lors de la resynchronisation WebSocket : {e}")
+
+                # ── Rapport HORAIRE (09/07, demandé par Damien) — même contenu
+                # que le rapport quotidien (il lit l'état courant sans rien
+                # réinitialiser), envoyé toutes les heures pendant la journée
+                # pour suivre en direct RSI/volume/suivi post-stop, sans
+                # attendre le rapport officiel de 19h.
+                cle_heure_actuelle = maintenant_utc.strftime('%Y-%m-%d %H')
+                if (maintenant_utc.minute < 1 and
+                        etat.get("dernier_rapport_horaire", "") != cle_heure_actuelle):
+                    await envoyer_rapport_quotidien(session, etat)
+                    etat["dernier_rapport_horaire"] = cle_heure_actuelle
+                    sauvegarder_etat(etat)
 
                 # Rapport quotidien à 19h Guyane = 22h UTC
                 if (maintenant_utc.hour == 22 and
