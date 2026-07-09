@@ -261,7 +261,12 @@ async def ouvrir_trade(symbole, sens, prix_entree, capital_dispo, atr_value, rsi
 
 # ===================== BOUCLE PRINCIPALE (exemple) =====================
 async def main():
-    await init_database()
+    # ### MODIF: init_database() est une fonction SYNCHRONE dans database.py
+    # (pg8000 est un driver bloquant, pas asyncpg). Un "await init_database()"
+    # provoque "TypeError: object NoneType can't be used in 'await' expression"
+    # car une def normale renvoie None. Idem pour charger_etat(),
+    # sauvegarder_etat() et enregistrer_trade() : ne jamais les await.
+    init_database()
     log.info("🚀 Bot Mean Reversion Anti-Frais v3 démarré")
 
     while not arret_demande:
