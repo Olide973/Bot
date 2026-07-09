@@ -2793,10 +2793,6 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                             f"Durée : {duree} min"
                         )
                         gain_final = pnl_net
-                        asyncio.create_task(suivre_prix_post_stop(
-                            session, symbole, direction, stop_initial, prix_entree,
-                            pos_id, etat_global
-                        ))
                         break
                 # on ne l'annule jamais, on continue la boucle.
             else:
@@ -2816,10 +2812,6 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                     f"Durée : {duree} min"
                 )
                 gain_final = pnl_net
-                asyncio.create_task(suivre_prix_post_stop(
-                    session, symbole, direction, stop_initial, prix_entree,
-                    pos_id, etat_global
-                ))
                 break
 
         # Sortie lock : PnL redescend sous le palier verrouillé (mais le
@@ -2963,6 +2955,17 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                 f"{symbole} : la position réelle n'a peut-être pas été fermée côté OKX.\n"
                 f"Vérifie manuellement sur l'app OKX immédiatement."
             )
+
+    # ── Suivi post-stop CENTRALISÉ (09/07, demandé par Damien : "il faut que
+    # je le poste stop de TOUS les trades qui ont été en négatif") — ici,
+    # après la boucle, resultat_final est connu quelle que soit la CAUSE de
+    # la fermeture (stop classique, plancher qui a quand même fini négatif,
+    # durée max dépassée...). Couvre donc tous les cas de perte, pas
+    # seulement la sortie stop-loss classique.
+    if resultat_final == "PERDU":
+        asyncio.create_task(suivre_prix_post_stop(
+            session, symbole, direction, prix_actuel, prix_entree, pos_id, etat_global
+        ))
 
     # ── Resynchronisation avec le VRAI solde OKX avant de mettre à jour le
     # capital — uniquement en MODE_REEL. Le calcul interne (capital +
