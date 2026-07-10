@@ -101,7 +101,12 @@ PAUSE_SCAN              = 30         # secondes entre chaque scan de nouveaux ma
 # le même après-midi, dépassant chacun leur stop max prévu). Réduire le
 # nombre de trades simultanés réduit directement l'ampleur d'un tel épisode
 # sur le capital réel, au prix d'un volume de trades plus faible.
-MAX_TRADES_SIMULTANES   = 4
+# RELEVÉ à 10 le 09/07 (demandé par Damien) : phase active de collecte de
+# données (RSI, volume, suivi post-stop...) — plus de trades simultanés =
+# plus de données accumulées plus vite. Le risque de corrélation ci-dessus
+# reste valable, mais accepté temporairement pour cette phase. À REMETTRE
+# à 4 une fois assez de données recueillies.
+MAX_TRADES_SIMULTANES   = 10
 # ── NOUVEAU (08/07, carte blanche accordée par Damien après la première
 # journée réelle) : un compteur de pertes consécutives existait déjà
 # (pertes_consecutives) mais n'était utilisé nulle part pour agir — juste
