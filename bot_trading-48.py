@@ -1836,6 +1836,12 @@ async def analyser_marche(session, symbole):
 
     details = {
         "atr":           atr_val,
+        # ── ATR en % du prix (10/07, demandé par Damien) : l'ATR brut n'est
+        # pas comparable entre marchés (5.33 sur ETHUSD à ~1750$ vs 0.00077
+        # sur ADAUSD à ~0.17$ — pas qu'ETHUSD soit 7000x plus volatil, juste
+        # une différence d'échelle de prix). Exprimé en %, les marchés
+        # deviennent comparables entre eux.
+        "atr_pct":       round(atr_val / prix_actuel * 100, 3) if prix_actuel else 0.0,
         "vol_ratio":     vol_ratio,
         "rsi_1h":        rsi_1h,
         "variation_pct": abs(variation_pct),
@@ -3240,6 +3246,7 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
             'vol_ratio':       details.get("vol_ratio", 0.0),
             'variation_pct':   details.get("variation_pct", 0.0),
             'atr':             details.get("atr", None),
+            'atr_pct':         details.get("atr_pct", None),
             'glissement_pct':  details.get("glissement_pct", 0.0),
             'pos_id':          pos_id,
         })
@@ -3699,7 +3706,7 @@ async def envoyer_rapport_quotidien(session, etat):
         rsi      = h.get("rsi", 50.0)
         vol      = h.get("vol_ratio", 0.0)
         variation   = h.get("variation_pct", 0.0)
-        atr_h       = h.get("atr", None)
+        atr_h       = h.get("atr_pct", None)
         glissement  = h.get("glissement_pct", 0.0)
         heure_ouv   = h.get("heure_ouverture", h.get("heure", ""))
         heure_str = h.get("heure", "")
@@ -3815,9 +3822,9 @@ async def envoyer_rapport_quotidien(session, etat):
     variation_moy = round(sum(variation_tous) / len(variation_tous), 3) if variation_tous else 0
     variation_min = round(min(variation_tous), 3) if variation_tous else 0
     variation_max = round(max(variation_tous), 3) if variation_tous else 0
-    atr_moy = round(sum(atr_tous) / len(atr_tous), 5) if atr_tous else None
-    atr_min = round(min(atr_tous), 5) if atr_tous else None
-    atr_max = round(max(atr_tous), 5) if atr_tous else None
+    atr_moy = round(sum(atr_tous) / len(atr_tous), 3) if atr_tous else None
+    atr_min = round(min(atr_tous), 3) if atr_tous else None
+    atr_max = round(max(atr_tous), 3) if atr_tous else None
     glissement_moy = round(sum(glissement_tous) / len(glissement_tous), 3) if glissement_tous else 0
     glissement_min = round(min(glissement_tous), 3) if glissement_tous else 0
     glissement_max = round(max(glissement_tous), 3) if glissement_tous else 0
@@ -3871,7 +3878,7 @@ async def envoyer_rapport_quotidien(session, etat):
     lignes_detail = []
     for d in detail_trades:
         emoji_d = "✅" if d["resultat"] == "GAGNE" else "❌"
-        atr_aff = f"{d['atr']:.5f}" if d['atr'] is not None else "?"
+        atr_aff = f"{d['atr']:.3f}%" if d['atr'] is not None else "?"
         lignes_detail.append(
             f"{emoji_d} <code>{d['heure_ouv']} {d['marche']:<10} RSI:{d['rsi']:<5} "
             f"Vol:{d['vol']:<5} Var:{d['variation']:.2f}% Gliss:{d['glissement']:+.2f}% "
@@ -3882,7 +3889,7 @@ async def envoyer_rapport_quotidien(session, etat):
     bloc_suggestion = ""
     if rsi_min_gagnant is not None and vol_min_gagnant is not None:
         bloc_atr = (
-            f"ATR — moyenne : {atr_moy} | min : {atr_min} | max : {atr_max}\n"
+            f"ATR — moyenne : {atr_moy}% | min : {atr_min}% | max : {atr_max}%\n"
             if atr_moy is not None else ""
         )
         bloc_suggestion = (
