@@ -2635,7 +2635,27 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
             # réussi — jamais de fenêtre sans protection.
             if (palier_pose_plancher_dur(index_lock) and index_lock > dernier_index_plancher_dur
                     and MODE_REEL and inst_id and taille_contrats):
-                if direction == "ACHAT":
+                # ── BREAKEVEN au 1er palier (10/07, demandé par Damien, suite
+                # à l'analyse du ratio gain/perte 3,1x sur 26 trades) : au lieu
+                # de verrouiller tout de suite le petit gain du palier 1
+                # (~1€), on neutralise juste le RISQUE — le plancher se pose au
+                # prix d'entrée (+ une petite marge pour couvrir les frais),
+                # sans capturer le gain. Ça laisse la place au prix de
+                # continuer vers un vrai gain proportionné au risque pris
+                # (jusqu'au niveau du stop, 0.75%), au lieu de couper
+                # systématiquement à la première petite avance. Les paliers
+                # suivants (2+) reprennent le verrouillage normal du gain
+                # réellement atteint.
+                est_breakeven = (index_lock == 1)
+                if est_breakeven:
+                    tampon_frais = OKX_TAKER_FEE * 2 * 1.15  # petite marge au-dessus du coût réel des 2 frais
+                    if direction == "ACHAT":
+                        prix_plancher = round(prix_entree * (1 + tampon_frais), 8)
+                        niveau_deja_depasse = prix_actuel <= prix_plancher
+                    else:
+                        prix_plancher = round(prix_entree * (1 - tampon_frais), 8)
+                        niveau_deja_depasse = prix_actuel >= prix_plancher
+                elif direction == "ACHAT":
                     prix_plancher = round(prix_entree * (1 + lock_actuel / position), 8)
                     niveau_deja_depasse = prix_actuel <= prix_plancher
                 else:
@@ -2695,11 +2715,17 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                     )
                     break
 
-                # ── Le gain réellement garanti correspond maintenant TOUJOURS à
-                # la cible nominale du palier (lock_actuel), puisqu'on ne pose
-                # plus jamais un plancher affaibli — plus besoin de distinguer
-                # "réel" vs "cible", ils sont désormais identiques par construction.
-                gain_reel_plancher = lock_actuel
+                # ── Le gain réellement garanti correspond à la cible nominale
+                # du palier (lock_actuel) pour les paliers 2+, ou à ~0€
+                # (breakeven, tampon frais inclus) pour le tout premier —
+                # voir est_breakeven ci-dessus.
+                if est_breakeven:
+                    if direction == "ACHAT":
+                        gain_reel_plancher = round((prix_plancher / prix_entree - 1) * position, 2)
+                    else:
+                        gain_reel_plancher = round((1 - prix_plancher / prix_entree) * position, 2)
+                else:
+                    gain_reel_plancher = lock_actuel
                 plancher_reduit    = False
 
                 # ── Amendement en place EN PRIORITÉ (08/07) : si un plancher
@@ -2742,12 +2768,24 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                         f"bougé avant la pose — niveau plafonné pour rester valide.</i>"
                         if plancher_reduit else ""
                     )
+                    titre_plancher = (
+                        f"🧱 <b>RISQUE NEUTRALISÉ (breakeven, ~{gain_reel_plancher}€)</b>"
+                        if est_breakeven else
+                        f"🧱 <b>PLANCHER VERROUILLÉ : {gain_reel_plancher}€</b>"
+                    )
+                    texte_breakeven = (
+                        f"\n<i>Palier 1 : le risque est neutralisé (pas de perte possible), le "
+                        f"gain n'est PAS encore capturé — le trailing continue de suivre pour "
+                        f"viser un vrai gain proportionné.</i>"
+                        if est_breakeven else ""
+                    )
                     await telegram(session,
-                        f"🧱 <b>PLANCHER VERROUILLÉ : {gain_reel_plancher}€</b>\n"
+                        f"{titre_plancher}\n"
                         f"{symbole} : ce niveau ne peut plus être franchi vers le bas, quoi qu'il "
                         f"arrive au trailing au-dessus.\n"
                         f"<i>Méthode : amendement en place, confirmé actif côté OKX</i>"
                         f"{avertissement_reduit}"
+                        f"{texte_breakeven}"
                     )
                 else:
                     side_ouverture_plancher = "buy" if direction == "ACHAT" else "sell"
@@ -2801,13 +2839,25 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                             f"bougé avant la pose — niveau plafonné pour rester valide.</i>"
                             if plancher_reduit else ""
                         )
+                        titre_plancher2 = (
+                            f"🧱 <b>RISQUE NEUTRALISÉ (breakeven, ~{gain_reel_plancher}€)</b>"
+                            if est_breakeven else
+                            f"🧱 <b>PLANCHER VERROUILLÉ : {gain_reel_plancher}€</b>"
+                        )
+                        texte_breakeven2 = (
+                            f"\n<i>Palier 1 : le risque est neutralisé (pas de perte possible), le "
+                            f"gain n'est PAS encore capturé — le trailing continue de suivre pour "
+                            f"viser un vrai gain proportionné.</i>"
+                            if est_breakeven else ""
+                        )
                         await telegram(session,
-                            f"🧱 <b>PLANCHER VERROUILLÉ : {gain_reel_plancher}€</b>\n"
+                            f"{titre_plancher2}\n"
                             f"{symbole} : ce niveau ne peut plus être franchi vers le bas, quoi "
                             f"qu'il arrive au trailing au-dessus.\n"
                             f"<i>Méthode : repositionnement classique, confirmé actif côté OKX "
                             f"(l'amendement direct n'était pas possible ici)</i>"
                             f"{avertissement_reduit}"
+                            f"{texte_breakeven2}"
                         )
                     else:
                         # ── Nettoyage (08/07) : si l'ordre a bien été accepté par OKX
