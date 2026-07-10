@@ -4394,6 +4394,12 @@ async def boucle_principale():
                 if statut == "KILL_SWITCH":
                     await asyncio.sleep(60)
                     etat = charger_etat()
+                    # ── CORRECTIF (09/07) — cause exacte de l'erreur "'capital'" :
+                    # si ce rechargement échoue ou renvoie un état vide (aléa DB
+                    # passager), la clé 'capital' n'existe plus et le code
+                    # plantait juste après (etat["capital"] direct). Filet de
+                    # sécurité minimal, pas une réinitialisation complète.
+                    etat.setdefault("capital", CAPITAL_INITIAL)
                     continue
 
                 # ── Pause après pertes consécutives (08/07) — voir
