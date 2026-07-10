@@ -12,6 +12,7 @@ import asyncio
 import aiohttp
 import os
 import json
+import random
 import hmac
 import hashlib
 import base64
@@ -173,6 +174,22 @@ VOLUME_MINI             = 0.20   # volume min vs moyenne 24h
 # à valider sur de nouvelles données (les 8 trades déjà vus ne peuvent pas
 # servir à eux-mêmes de preuve, voir discussion du 09/07).
 STOP_LOSS_PCT           = 0.0075  # stop = 0.75% du prix d'entrée — évolue avec la taille de position, contrairement à un stop fixe en €
+
+# ── Glissement SIMULÉ en mode SIMULATION (10/07, demandé par Damien) —
+# jusqu'ici, en simulation, prix_entree était EXACTEMENT le prix visé, sans
+# aucun frottement : irréaliste, très différent du réel. Calibré sur les
+# glissements RÉELLEMENT observés en compte réel cette semaine (typiquement
+# -0.05% à -0.35%, avec de rares accidents plus sévères lors de mouvements
+# très rapides, jusqu'à -1.7% voire -2.8%). Toujours défavorable, comme un
+# vrai ordre au marché qui mange le carnet plutôt que d'aider. Objectif :
+# que la phase d'analyse en simulation prépare vraiment à ce qui attend en
+# réel, plutôt que de donner une image trop optimiste des gains nets.
+GLISSEMENT_SIMULE_MOYEN_PCT    = 0.15   # glissement typique (valeur absolue)
+GLISSEMENT_SIMULE_ECART_TYPE   = 0.12
+GLISSEMENT_SIMULE_PROBA_ACCIDENT = 0.05  # ~5% de chance d'un glissement sévère
+GLISSEMENT_SIMULE_ACCIDENT_MOYEN = 1.8
+GLISSEMENT_SIMULE_ACCIDENT_ECART = 0.8
+GLISSEMENT_SIMULE_MAX_PCT      = 4.0    # plafond absolu, jamais irréaliste
 DUREE_MAX_MINUTES       = 360    # 6h — fermeture forcée si ni stop ni lock atteint avant
 # ── Suivi post-stop (09/07, demandé par Damien) : après un stop-loss, on
 # continue de suivre le prix pendant DUREE_SUIVI_POST_STOP_MIN de plus (sans
@@ -1477,6 +1494,61 @@ async def telegram(session, message):
     except Exception as e:
         log.error(f"Erreur Telegram : {e}")
 
+async def telegram_document(session, nom_fichier, contenu_texte, legende=""):
+    """Envoie un fichier texte (CSV notamment) en pièce jointe Telegram, via
+    l'endpoint sendDocument (multipart). Utilisé pour le détail complet des
+    trades du rapport quotidien (10/07, demandé par Damien) : le message
+    texte seul dépassait la limite de 4096 caractères de Telegram sur une
+    journée chargée ("rapport tronqué, trop de trades") — le détail
+    ligne-par-ligne part maintenant en pièce jointe, ouvrable dans
+    Excel/Google Sheets, sans limite de taille pratique."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(TELEGRAM_CHAT_ID))
+        if legende:
+            form.add_field("caption", legende)
+        form.add_field("document", contenu_texte.encode("utf-8-sig"),
+                        filename=nom_fichier, content_type="text/csv")
+        await session.post(url, data=form, timeout=aiohttp.ClientTimeout(total=20))
+    except Exception as e:
+        log.error(f"Erreur envoi document Telegram ({nom_fichier}) : {e}")
+
+def construire_csv_trades(detail_trades):
+    """Construit le contenu CSV du détail par trade — mêmes champs que le
+    bloc texte 'DÉTAIL PAR TRADE' du rapport, mais sans limite de lignes.
+    Noms de colonnes = noms de champs RÉELS de detail_trades dans ce
+    fichier (pas de risque de colonne vide par mauvaise correspondance,
+    contrairement à un générateur externe qui devinerait ces noms)."""
+    import csv
+    import io
+    buffer = io.StringIO()
+    colonnes = [
+        "heure_ouverture", "marche", "resultat", "gain_eur", "rsi",
+        "volume_ratio", "variation_pct", "glissement_pct", "atr_pct",
+        "stop_bien_place", "suivi_post_stop_pct", "palier1_atteint_post_stop",
+    ]
+    writer = csv.writer(buffer, delimiter=';')
+    writer.writerow(colonnes)
+    for d in detail_trades:
+        writer.writerow([
+            d.get("heure_ouv", "?"),
+            d.get("marche", "?"),
+            d.get("resultat", "?"),
+            d.get("gain", 0),
+            d.get("rsi", ""),
+            d.get("vol", ""),
+            d.get("variation", ""),
+            d.get("glissement", ""),
+            d.get("atr", ""),
+            d.get("stop_bien_place", ""),
+            d.get("suivi_post_stop_pct", ""),
+            d.get("palier1_post_stop", ""),
+        ])
+    return buffer.getvalue()
+
 async def vider_file_erreurs_vers_telegram(session):
     """Regroupe toutes les erreurs (niveau ERROR/CRITICAL) accumulées depuis
     le dernier passage — voir HandlerErreursTelegram — en UN SEUL message
@@ -2135,6 +2207,35 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
         # le bon dossier position-history, plutôt que de deviner via une
         # comparaison de prix approximative (voir surveiller_et_fermer_trade).
         pos_id = await okx_recuperer_pos_id(session, inst_id)
+    else:
+        # ── Glissement SIMULÉ (10/07) — voir constantes GLISSEMENT_SIMULE_*
+        # plus haut. Symétrique au recalcul réel ci-dessus : même logique de
+        # recalcul du stop/objectif à partir du prix simulé, pour que la
+        # simulation se comporte comme le réel face au glissement.
+        glissement_simule_pct = -abs(random.gauss(GLISSEMENT_SIMULE_MOYEN_PCT,
+                                                     GLISSEMENT_SIMULE_ECART_TYPE))
+        if random.random() < GLISSEMENT_SIMULE_PROBA_ACCIDENT:
+            glissement_simule_pct = -abs(random.gauss(GLISSEMENT_SIMULE_ACCIDENT_MOYEN,
+                                                         GLISSEMENT_SIMULE_ACCIDENT_ECART))
+        glissement_simule_pct = max(glissement_simule_pct, -GLISSEMENT_SIMULE_MAX_PCT)
+        prix_simule = round(prix_entree * (1 + glissement_simule_pct / 100), 8)
+        details["glissement_pct"] = round(glissement_simule_pct, 4)
+        if abs(glissement_simule_pct) > 0.05:
+            log.info(f"  🎲 [GLISSEMENT SIMULÉ] {symbole} : prix visé {prix_entree} → "
+                     f"simulé {prix_simule} (écart {glissement_simule_pct:.3f}%, calibré "
+                     f"sur les données réelles observées cette semaine).")
+            await telegram(session,
+                f"🎲 <b>GLISSEMENT SIMULÉ</b>\n{symbole} : prix visé {prix_entree}, "
+                f"simulé à {prix_simule} (écart {glissement_simule_pct:.3f}%).\n"
+                f"Stop et objectif recalculés — glissement calibré sur les données réelles."
+            )
+        prix_entree = prix_simule
+        if direction == "ACHAT":
+            stop_initial   = round(prix_entree * (1 - ratio_prix), 8)
+            objectif_final = round(prix_entree * (1 + ratio_prix * 2), 8)
+        else:
+            stop_initial   = round(prix_entree * (1 + ratio_prix), 8)
+            objectif_final = round(prix_entree * (1 - ratio_prix * 2), 8)
 
     await surveiller_et_fermer_trade(
         session, symbole, direction, mise, capital, position,
@@ -3969,21 +4070,29 @@ async def envoyer_rapport_quotidien(session, etat):
         f"{bloc_suggestion}"
         f"{bloc_post_stop}\n"
         f"<code>{'─'*40}</code>\n"
-        f"<b>DÉTAIL PAR TRADE (RSI / VOLUME)</b>\n"
-        f"{bloc_detail}\n\n"
+        f"📎 <i>Détail complet des {len(detail_trades)} trades du jour (RSI, volume, "
+        f"variation, glissement, ATR, suivi post-stop) en pièce jointe ci-dessous.</i>\n"
         f"<code>{'─'*40}</code>\n"
         f"<b>CLASSEMENT MARCHÉS</b>\n"
         f"<code>{'MARCHÉ':<12} {'GAINS':<10} {'G/P':<6} RSI MOY</code>\n"
         f"{chr(10).join(lignes_marches)}"
     )
-    # ── Sécurité longueur (09/07) : avec le détail par trade ajouté, une
-    # journée à beaucoup de trades peut dépasser la limite Telegram (4096
-    # caractères). On tronque plutôt que d'échouer silencieusement à envoyer
-    # tout le rapport.
+    # ── CORRECTIF (10/07, demandé par Damien) — l'ancien bloc "DÉTAIL PAR
+    # TRADE" en texte dépassait régulièrement la limite Telegram (4096
+    # caractères) sur une journée chargée, tronquant le rapport. Le détail
+    # complet part maintenant en CSV joint (aucune limite pratique de
+    # taille, ouvrable dans Excel/Google Sheets) — le message texte reste
+    # un résumé, toujours largement sous la limite.
     if len(message) > 4000:
-        message = message[:4000] + "\n\n… (rapport tronqué, trop de trades pour un seul message)"
+        message = message[:4000] + "\n\n… (résumé tronqué — voir le CSV joint pour le détail complet)"
     log.info("  Envoi rapport quotidien Telegram")
     await telegram(session, message)
+    if detail_trades:
+        csv_contenu = construire_csv_trades(detail_trades)
+        await telegram_document(
+            session, f"trades_{date_affich.replace('/', '-')}.csv", csv_contenu,
+            legende=f"Détail des {len(detail_trades)} trades du {date_affich}"
+        )
 
 # ═══════════════════════════════════════════════════════════════
 #  RAPPORT HEBDOMADAIRE
