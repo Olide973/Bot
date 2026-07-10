@@ -101,12 +101,11 @@ PAUSE_SCAN              = 30         # secondes entre chaque scan de nouveaux ma
 # le même après-midi, dépassant chacun leur stop max prévu). Réduire le
 # nombre de trades simultanés réduit directement l'ampleur d'un tel épisode
 # sur le capital réel, au prix d'un volume de trades plus faible.
-# RELEVÉ à 10 le 09/07 (demandé par Damien) : phase active de collecte de
-# données (RSI, volume, suivi post-stop...) — plus de trades simultanés =
-# plus de données accumulées plus vite. Le risque de corrélation ci-dessus
-# reste valable, mais accepté temporairement pour cette phase. À REMETTRE
-# à 4 une fois assez de données recueillies.
-MAX_TRADES_SIMULTANES   = 10
+# RELEVÉ à 10 le 09/07, puis RETIRÉ (mis à 999 = aucune limite pratique) le
+# 10/07 (demandé par Damien) : phase d'analyse pure — aucune limite ne doit
+# bloquer la collecte de données. À REMETTRE à 4 une fois l'analyse
+# terminée et avant tout retour en argent réel.
+MAX_TRADES_SIMULTANES   = 999
 # ── NOUVEAU (08/07, carte blanche accordée par Damien après la première
 # journée réelle) : un compteur de pertes consécutives existait déjà
 # (pertes_consecutives) mais n'était utilisé nulle part pour agir — juste
@@ -117,7 +116,11 @@ MAX_TRADES_SIMULTANES   = 10
 # éviter d'insister avec la même stratégie pendant un épisode de marché qui
 # lui est défavorable (exactement le schéma du 08/07 : plusieurs pertes
 # d'affilée sur des marchés corrélés, tous perdants dans la même fenêtre).
-SEUIL_PERTES_CONSECUTIVES_PAUSE = 3    # nombre de pertes d'affilée déclenchant la pause
+# DÉSACTIVÉE le 10/07 (demandé par Damien, phase d'analyse) — seuil énorme
+# pour ne jamais se déclencher en pratique, sans retirer le mécanisme (facile
+# à réactiver avec un vrai seuil plus tard). À REMETTRE à ~3 avant tout
+# retour en argent réel.
+SEUIL_PERTES_CONSECUTIVES_PAUSE = 999999
 DUREE_PAUSE_APRES_PERTES_MIN    = 45   # minutes de pause avant de reprendre le scan
 
 # ── Fenêtre anti-funding (08/07, carte blanche) : les frais de financement
