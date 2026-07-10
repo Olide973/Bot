@@ -162,7 +162,14 @@ SEUIL_MOUVEMENT_PCT     = 0.50   # dès que le prix bouge de 0.50% → signal
 # servi à choisir le seuil — sinon on cale le bot sur le bruit du moment,
 # pas sur un vrai signal durable).
 VOLUME_MINI             = 0.20   # volume min vs moyenne 24h
-STOP_LOSS_PCT           = 0.006  # stop = 0.6% du prix d'entrée (≈ -4€ au capital/mise actuels) — évolue avec la taille de position, contrairement à un stop fixe en €
+# ── ÉLARGI de 0.60% à 0.75% le 09/07 — analyse du suivi post-stop sur un lot
+# de 8 stops en simulation : 6/8 sont repartis en sens favorable dans les 15
+# minutes suivant la fermeture (voir suivre_prix_post_stop). Élargissement
+# MODÉRÉ (pas radical) pour tester l'effet sur le taux de "stop bien placé"
+# et le résultat net des PROCHAINS trades — pas une certitude, une hypothèse
+# à valider sur de nouvelles données (les 8 trades déjà vus ne peuvent pas
+# servir à eux-mêmes de preuve, voir discussion du 09/07).
+STOP_LOSS_PCT           = 0.0075  # stop = 0.75% du prix d'entrée — évolue avec la taille de position, contrairement à un stop fixe en €
 DUREE_MAX_MINUTES       = 360    # 6h — fermeture forcée si ni stop ni lock atteint avant
 # ── Suivi post-stop (09/07, demandé par Damien) : après un stop-loss, on
 # continue de suivre le prix pendant DUREE_SUIVI_POST_STOP_MIN de plus (sans
@@ -2155,9 +2162,9 @@ async def suivre_prix_post_stop(session, symbole, direction, prix_stop_reel, pri
         stop_bien_place    = prix_apres > prix_stop_reel
         a_recupere_entree  = prix_apres <= prix_entree
 
-    verdict = ("↘️ Le prix a continué dans le sens du stop — stop bien placé"
+    verdict = ("✅ Le prix a continué dans le sens du stop — stop bien placé"
                if stop_bien_place else
-               "↗️ Le prix est reparti en sens inverse — stop peut-être trop serré")
+               "⚠️ Le prix est reparti en sens inverse — stop peut-être trop serré")
     if a_recupere_entree:
         verdict += " (et même repassé le prix d'entrée initial)"
 
@@ -3140,18 +3147,26 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
             etat_global["wins_consecutifs"]    = 0
 
             if etat_global["pertes_consecutives"] >= SEUIL_PERTES_CONSECUTIVES_PAUSE:
+                # ── CORRECTIF (09/07) — confirmé en conditions réelles : cette
+                # alerte se redéclenchait en ENTIER à CHAQUE perte supplémentaire
+                # (3, 4, 5, 6, 7, 8 pertes...), noyant Telegram de messages
+                # identiques. Désormais : message complet seulement au premier
+                # franchissement du seuil ; les pertes suivantes prolongent la
+                # pause silencieusement (juste un log, pas de nouveau message).
+                premiere_fois = etat_global["pertes_consecutives"] == SEUIL_PERTES_CONSECUTIVES_PAUSE
                 etat_global["pause_ouverture_jusqua_ts"] = time.time() + DUREE_PAUSE_APRES_PERTES_MIN * 60
                 log.warning(f"  ⏸️ [PAUSE-PERTES] {etat_global['pertes_consecutives']} pertes "
-                            f"consécutives — pause de {DUREE_PAUSE_APRES_PERTES_MIN} min avant "
-                            f"toute nouvelle ouverture. Les trades déjà ouverts continuent d'être "
-                            f"surveillés normalement.")
-                await telegram(session,
-                    f"⏸️ <b>PAUSE AUTOMATIQUE — {etat_global['pertes_consecutives']} PERTES D'AFFILÉE</b>\n"
-                    f"Le bot arrête d'ouvrir de nouveaux trades pendant {DUREE_PAUSE_APRES_PERTES_MIN} "
-                    f"minutes.\n"
-                    f"Les positions déjà ouvertes restent surveillées normalement (stops/planchers "
-                    f"actifs). Reprise automatique du scan ensuite."
-                )
+                            f"consécutives — pause {'de' if premiere_fois else 'prolongée de'} "
+                            f"{DUREE_PAUSE_APRES_PERTES_MIN} min avant toute nouvelle ouverture. "
+                            f"Les trades déjà ouverts continuent d'être surveillés normalement.")
+                if premiere_fois:
+                    await telegram(session,
+                        f"⏸️ <b>PAUSE AUTOMATIQUE — {etat_global['pertes_consecutives']} PERTES D'AFFILÉE</b>\n"
+                        f"Le bot arrête d'ouvrir de nouveaux trades pendant {DUREE_PAUSE_APRES_PERTES_MIN} "
+                        f"minutes.\n"
+                        f"Les positions déjà ouvertes restent surveillées normalement (stops/planchers "
+                        f"actifs). Reprise automatique du scan ensuite."
+                    )
 
         etat_global.setdefault("historique", []).append({
             'heure':           (datetime.utcnow() - timedelta(hours=3)).strftime('%Y-%m-%d %H:%M'),
@@ -3838,15 +3853,21 @@ async def envoyer_rapport_quotidien(session, etat):
         nb_bien_places = sum(1 for d in trades_avec_suivi if d["stop_bien_place"])
         lignes_post_stop = []
         for d in trades_avec_suivi:
-            icone = "↘️" if d["stop_bien_place"] else "↗️"
+            # ── CORRECTIF (09/07) — l'ancienne version utilisait ↘️/↗️ pour le
+            # VERDICT (bien placé / trop serré), pas la direction réelle du
+            # prix, donnant des combinaisons trompeuses (ex: ↘️ affiché alors
+            # que le prix était monté). Maintenant : la flèche suit le signe
+            # réel de la variation, le verdict est un symbole séparé (✅/⚠️).
+            fleche  = "📈" if d["suivi_post_stop_pct"] >= 0 else "📉"
+            verdict = "✅" if d["stop_bien_place"] else "⚠️"
             lignes_post_stop.append(
-                f"{icone} <code>{d['marche']:<10} {d['suivi_post_stop_pct']:+.3f}%</code>"
+                f"{verdict}{fleche} <code>{d['marche']:<10} {d['suivi_post_stop_pct']:+.3f}%</code>"
             )
         bloc_post_stop = (
             f"\n📐 <b>SUIVI POST-STOP</b> ({nb_bien_places}/{len(trades_avec_suivi)} bien placés)\n"
             + "\n".join(lignes_post_stop) + "\n"
-            f"<i>↘️ = le prix a continué dans le sens du stop | ↗️ = reparti en sens "
-            f"inverse (stop peut-être trop serré)</i>\n"
+            f"<i>✅ = stop bien placé | ⚠️ = prix reparti en sens inverse (stop trop serré) "
+            f"| 📈/📉 = direction réelle du prix ensuite</i>\n"
         )
 
     message = (
