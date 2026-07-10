@@ -2138,19 +2138,59 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
     )
 
 async def suivre_prix_post_stop(session, symbole, direction, prix_stop_reel, prix_entree,
-                                  pos_id, etat_global):
+                                  pos_id, etat_global, position=None, capital=None):
     """Suit le prix pendant DUREE_SUIVI_POST_STOP_MIN après un stop-loss —
     sans position ouverte, en pure observation — pour savoir si le marché a
     continué dans le sens du stop (bien calibré) ou est reparti en sens
-    inverse (stop trop serré). Envoie un message dédié et enrichit
-    l'historique déjà enregistré (recherché par pos_id) avec cette donnée,
-    pour qu'elle serve de base aux prochains ajustements de STOP_LOSS_PCT."""
-    await asyncio.sleep(DUREE_SUIVI_POST_STOP_MIN * 60)
+    inverse (stop trop serré). CORRIGÉ le 10/07 (demandé par Damien) : au
+    lieu d'un seul point de mesure à la fin, suit le prix EN CONTINU
+    (vérification toutes les 30s) pendant toute la fenêtre, pour savoir si
+    le prix a atteint, à un moment quelconque, le niveau du 1er palier de
+    gain — pas seulement où il se trouve pile à la 15e minute. Envoie un
+    message dédié et enrichit l'historique déjà enregistré (recherché par
+    pos_id) avec cette donnée, pour qu'elle serve de base aux prochains
+    ajustements de STOP_LOSS_PCT."""
+    # Niveau de prix correspondant au 1er palier de gain (LOCK_PALIERS_PCT[0]),
+    # si on connaît position/capital — sinon cette vérification est simplement
+    # ignorée (reste possible de suivre sans, pour compatibilité).
+    prix_palier1 = None
+    if position and capital:
+        lock1 = round(capital * LOCK_PALIERS_PCT[0] / 100, 2)
+        if direction == "ACHAT":
+            prix_palier1 = round(prix_entree * (1 + lock1 / position), 8)
+        else:
+            prix_palier1 = round(prix_entree * (1 - lock1 / position), 8)
+
+    meilleur_prix = prix_stop_reel  # le plus favorable observé (sens inverse du stop)
+    palier1_atteint = False
+    intervalle_sec = 30
+    nb_checks = max(1, (DUREE_SUIVI_POST_STOP_MIN * 60) // intervalle_sec)
+
+    for _ in range(int(nb_checks)):
+        await asyncio.sleep(intervalle_sec)
+        try:
+            prix_tick = await get_prix_actuel(session, symbole)
+        except Exception:
+            continue
+        if prix_tick is None:
+            continue
+        if direction == "ACHAT":
+            if prix_tick > meilleur_prix:
+                meilleur_prix = prix_tick
+        else:
+            if prix_tick < meilleur_prix:
+                meilleur_prix = prix_tick
+        if prix_palier1 is not None and not palier1_atteint:
+            if direction == "ACHAT" and prix_tick >= prix_palier1:
+                palier1_atteint = True
+            elif direction == "VENTE" and prix_tick <= prix_palier1:
+                palier1_atteint = True
+
     try:
         prix_apres = await get_prix_actuel(session, symbole)
     except Exception as e:
-        log.error(f"  ❌ [SUIVI-POST-STOP] Échec lecture prix pour {symbole} : {e}")
-        return
+        log.error(f"  ❌ [SUIVI-POST-STOP] Échec lecture prix final pour {symbole} : {e}")
+        prix_apres = meilleur_prix
     if prix_apres is None or not prix_stop_reel:
         log.error(f"  ❌ [SUIVI-POST-STOP] {symbole} : impossible de conclure "
                   f"(prix_apres={prix_apres}, prix_stop_reel={prix_stop_reel}) — "
@@ -2171,13 +2211,26 @@ async def suivre_prix_post_stop(session, symbole, direction, prix_stop_reel, pri
     if a_recupere_entree:
         verdict += " (et même repassé le prix d'entrée initial)"
 
+    bloc_palier1 = ""
+    if prix_palier1 is not None:
+        if palier1_atteint:
+            bloc_palier1 = ("\n🎯 Le prix a franchi le niveau du 1er palier de gain "
+                             "à un moment de cette fenêtre — le trade serait devenu "
+                             "gagnant si on avait tenu.")
+        else:
+            bloc_palier1 = ("\n🚫 Le prix n'a JAMAIS atteint le niveau du 1er palier "
+                             "pendant cette fenêtre — tenir n'aurait pas suffi (pour "
+                             "l'instant, sur la durée observée).")
+
     log.info(f"  📐 [SUIVI-POST-STOP] {symbole} : {DUREE_SUIVI_POST_STOP_MIN}min après le stop, "
-             f"prix {prix_stop_reel} → {prix_apres} ({variation_post_pct:+.3f}%). {verdict}")
+             f"prix {prix_stop_reel} → {prix_apres} ({variation_post_pct:+.3f}%). {verdict} "
+             f"| Palier1 atteint : {palier1_atteint if prix_palier1 is not None else 'N/A'}")
     await telegram(session,
         f"📐 <b>SUIVI POST-STOP — {symbole}</b>\n"
         f"{DUREE_SUIVI_POST_STOP_MIN} min après la fermeture : prix {prix_stop_reel} → "
         f"{prix_apres} ({variation_post_pct:+.3f}%).\n"
-        f"{verdict}\n"
+        f"{verdict}"
+        f"{bloc_palier1}\n"
         f"<i>Donnée conservée pour calibrer la distance du stop lors des prochaines "
         f"mises à jour.</i>"
     )
@@ -2186,6 +2239,7 @@ async def suivre_prix_post_stop(session, symbole, direction, prix_stop_reel, pri
         if entree.get("pos_id") == pos_id and pos_id is not None:
             entree["suivi_post_stop_pct"] = variation_post_pct
             entree["stop_bien_place"]     = stop_bien_place
+            entree["palier1_atteint_post_stop"] = palier1_atteint if prix_palier1 is not None else None
             break
     sauvegarder_etat(etat_global)
 
@@ -2979,7 +3033,8 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
     # seulement la sortie stop-loss classique.
     if resultat_final == "PERDU":
         asyncio.create_task(suivre_prix_post_stop(
-            session, symbole, direction, prix_actuel, prix_entree, pos_id, etat_global
+            session, symbole, direction, prix_actuel, prix_entree, pos_id, etat_global,
+            position=position, capital=capital
         ))
 
     # ── Resynchronisation avec le VRAI solde OKX avant de mettre à jour le
@@ -3650,6 +3705,7 @@ async def envoyer_rapport_quotidien(session, etat):
         heure_str = h.get("heure", "")
         suivi_post_stop_pct = h.get("suivi_post_stop_pct", None)
         stop_bien_place     = h.get("stop_bien_place", None)
+        palier1_post_stop   = h.get("palier1_atteint_post_stop", None)
 
         gains_jour[marche]  = round(gains_jour.get(marche, 0) + gain, 2)
         rsi_jour.setdefault(marche, []).append(rsi)
@@ -3659,6 +3715,7 @@ async def envoyer_rapport_quotidien(session, etat):
             "rsi": rsi, "vol": vol, "gain": gain, "resultat": resultat,
             "variation": variation, "atr": atr_h, "glissement": glissement,
             "suivi_post_stop_pct": suivi_post_stop_pct, "stop_bien_place": stop_bien_place,
+            "palier1_post_stop": palier1_post_stop,
         })
 
         if resultat == "GAGNE":
@@ -3854,6 +3911,8 @@ async def envoyer_rapport_quotidien(session, etat):
     bloc_post_stop = ""
     if trades_avec_suivi:
         nb_bien_places = sum(1 for d in trades_avec_suivi if d["stop_bien_place"])
+        trades_avec_palier1 = [d for d in trades_avec_suivi if d["palier1_post_stop"] is not None]
+        nb_palier1_atteint  = sum(1 for d in trades_avec_palier1 if d["palier1_post_stop"])
         lignes_post_stop = []
         for d in trades_avec_suivi:
             # ── CORRECTIF (09/07) — l'ancienne version utilisait ↘️/↗️ pour le
@@ -3863,14 +3922,25 @@ async def envoyer_rapport_quotidien(session, etat):
             # réel de la variation, le verdict est un symbole séparé (✅/⚠️).
             fleche  = "📈" if d["suivi_post_stop_pct"] >= 0 else "📉"
             verdict = "✅" if d["stop_bien_place"] else "⚠️"
+            # ── 10/07 (demandé par Damien) : marqueur 🎯 si le prix a franchi
+            # le niveau du 1er palier de gain à un moment de la fenêtre —
+            # aurait été un trade gagnant si on avait tenu au lieu de stopper.
+            marqueur_palier1 = " 🎯" if d.get("palier1_post_stop") else ""
             lignes_post_stop.append(
                 f"{verdict}{fleche} <code>{d['marche']:<10} {d['suivi_post_stop_pct']:+.3f}%</code>"
+                f"{marqueur_palier1}"
             )
+        bloc_palier1_resume = (
+            f"🎯 Aurait franchi le 1er palier : {nb_palier1_atteint}/{len(trades_avec_palier1)}\n"
+            if trades_avec_palier1 else ""
+        )
         bloc_post_stop = (
             f"\n📐 <b>SUIVI POST-STOP</b> ({nb_bien_places}/{len(trades_avec_suivi)} bien placés)\n"
+            f"{bloc_palier1_resume}"
             + "\n".join(lignes_post_stop) + "\n"
             f"<i>✅ = stop bien placé | ⚠️ = prix reparti en sens inverse (stop trop serré) "
-            f"| 📈/📉 = direction réelle du prix ensuite</i>\n"
+            f"| 📈/📉 = direction réelle du prix ensuite | 🎯 = aurait franchi le 1er "
+            f"palier de gain</i>\n"
         )
 
     message = (
