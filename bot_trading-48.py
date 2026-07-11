@@ -2245,21 +2245,25 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
     )
 
 async def suivre_prix_post_stop(session, symbole, direction, prix_stop_reel, prix_entree,
-                                  pos_id, etat_global, position=None, capital=None):
+                                  pos_id, etat_global, position=None, capital=None,
+                                  moment_fermeture_ts=None, cle_suivi=None):
     """Suit le prix pendant DUREE_SUIVI_POST_STOP_MIN après un stop-loss —
     sans position ouverte, en pure observation — pour savoir si le marché a
     continué dans le sens du stop (bien calibré) ou est reparti en sens
-    inverse (stop trop serré). CORRIGÉ le 10/07 (demandé par Damien) : au
-    lieu d'un seul point de mesure à la fin, suit le prix EN CONTINU
-    (vérification toutes les 30s) pendant toute la fenêtre, pour savoir si
-    le prix a atteint, à un moment quelconque, le niveau du 1er palier de
-    gain — pas seulement où il se trouve pile à la 15e minute. Envoie un
-    message dédié et enrichit l'historique déjà enregistré (recherché par
-    pos_id) avec cette donnée, pour qu'elle serve de base aux prochains
-    ajustements de STOP_LOSS_PCT."""
-    # Niveau de prix correspondant au 1er palier de gain (LOCK_PALIERS_PCT[0]),
-    # si on connaît position/capital — sinon cette vérification est simplement
-    # ignorée (reste possible de suivre sans, pour compatibilité).
+    inverse (stop trop serré), et s'il a franchi le niveau du 1er palier.
+
+    RENDU PERSISTANT le 10/07 (demandé par Damien, suite à des colonnes
+    vides dans le CSV — la tâche en mémoire était perdue à chaque
+    redéploiement pendant la fenêtre de 15 min) : le suivi se base
+    maintenant sur moment_fermeture_ts (horodatage RÉEL de la clôture,
+    sauvegardé en base via suivis_post_stop_en_attente) plutôt que sur une
+    simple attente en mémoire — si le bot redémarre en cours de route, il
+    peut reprendre exactement où il en était plutôt que de tout perdre.
+    cle_suivi identifie l'entrée en attente à retirer de l'état une fois
+    terminée (pos_id n'est pas toujours unique/présent)."""
+    moment_fermeture_ts = moment_fermeture_ts or time.time()
+    moment_fin = moment_fermeture_ts + DUREE_SUIVI_POST_STOP_MIN * 60
+
     prix_palier1 = None
     if position and capital:
         lock1 = round(capital * LOCK_PALIERS_PCT[0] / 100, 2)
@@ -2271,10 +2275,9 @@ async def suivre_prix_post_stop(session, symbole, direction, prix_stop_reel, pri
     meilleur_prix = prix_stop_reel  # le plus favorable observé (sens inverse du stop)
     palier1_atteint = False
     intervalle_sec = 30
-    nb_checks = max(1, (DUREE_SUIVI_POST_STOP_MIN * 60) // intervalle_sec)
 
-    for _ in range(int(nb_checks)):
-        await asyncio.sleep(intervalle_sec)
+    while time.time() < moment_fin:
+        await asyncio.sleep(min(intervalle_sec, max(1, moment_fin - time.time())))
         try:
             prix_tick = await get_prix_actuel(session, symbole)
         except Exception:
@@ -2292,6 +2295,11 @@ async def suivre_prix_post_stop(session, symbole, direction, prix_stop_reel, pri
                 palier1_atteint = True
             elif direction == "VENTE" and prix_tick <= prix_palier1:
                 palier1_atteint = True
+    # ── Fenêtre déjà entièrement écoulée au moment de l'appel (reprise après
+    # redémarrage, bot resté hors ligne plus de 15 min) : la boucle
+    # ci-dessus ne s'exécute alors aucune fois — on passe directement à la
+    # lecture finale, avec l'info honnête que la fenêtre d'observation a pu
+    # être plus longue que prévu.
 
     try:
         prix_apres = await get_prix_actuel(session, symbole)
@@ -2302,6 +2310,7 @@ async def suivre_prix_post_stop(session, symbole, direction, prix_stop_reel, pri
         log.error(f"  ❌ [SUIVI-POST-STOP] {symbole} : impossible de conclure "
                   f"(prix_apres={prix_apres}, prix_stop_reel={prix_stop_reel}) — "
                   f"message non envoyé.")
+        _retirer_suivi_post_stop_en_attente(etat_global, cle_suivi)
         return
 
     variation_post_pct = round((prix_apres - prix_stop_reel) / prix_stop_reel * 100, 3)
@@ -2342,13 +2351,49 @@ async def suivre_prix_post_stop(session, symbole, direction, prix_stop_reel, pri
         f"mises à jour.</i>"
     )
 
-    for entree in etat_global.get("historique", []):
-        if entree.get("pos_id") == pos_id and pos_id is not None:
-            entree["suivi_post_stop_pct"] = variation_post_pct
-            entree["stop_bien_place"]     = stop_bien_place
-            entree["palier1_atteint_post_stop"] = palier1_atteint if prix_palier1 is not None else None
-            break
+    # ── CORRECTIF (10/07) — trouvé en analysant un CSV où le suivi post-stop
+    # ne s'enregistrait JAMAIS dans l'historique, même pour des trades très
+    # anciens : le matching se faisait uniquement sur pos_id, qui peut être
+    # None (échec de capture à l'ouverture, position orpheline reprise sans
+    # capture...) — dans ce cas, la condition "pos_id is not None" excluait
+    # silencieusement TOUTE mise à jour, pour toujours. cle_suivi (généré à
+    # la planification, toujours présent) devient la clé de correspondance
+    # PRIORITAIRE, fiable même quand pos_id est absent.
+    entree_trouvee = False
+    if cle_suivi is not None:
+        for entree in etat_global.get("historique", []):
+            if entree.get("cle_suivi") == cle_suivi:
+                entree["suivi_post_stop_pct"] = variation_post_pct
+                entree["stop_bien_place"]     = stop_bien_place
+                entree["palier1_atteint_post_stop"] = palier1_atteint if prix_palier1 is not None else None
+                entree_trouvee = True
+                break
+    if not entree_trouvee and pos_id is not None:
+        for entree in etat_global.get("historique", []):
+            if entree.get("pos_id") == pos_id:
+                entree["suivi_post_stop_pct"] = variation_post_pct
+                entree["stop_bien_place"]     = stop_bien_place
+                entree["palier1_atteint_post_stop"] = palier1_atteint if prix_palier1 is not None else None
+                entree_trouvee = True
+                break
+    if not entree_trouvee:
+        log.error(f"  ❌ [SUIVI-POST-STOP] {symbole} : aucune entrée d'historique "
+                  f"correspondante trouvée (cle_suivi={cle_suivi}, pos_id={pos_id}) — "
+                  f"donnée calculée mais non rattachée au trade dans l'historique.")
+    _retirer_suivi_post_stop_en_attente(etat_global, cle_suivi)
     sauvegarder_etat(etat_global)
+
+
+def _retirer_suivi_post_stop_en_attente(etat_global, cle_suivi):
+    """Retire l'entrée correspondante de suivis_post_stop_en_attente une fois
+    le suivi terminé (succès ou échec) — pour ne pas la reprendre en double
+    au prochain redémarrage. Sans effet si cle_suivi est None (compatibilité)."""
+    if cle_suivi is None:
+        return
+    liste = etat_global.get("suivis_post_stop_en_attente", [])
+    etat_global["suivis_post_stop_en_attente"] = [
+        s for s in liste if s.get("cle") != cle_suivi
+    ]
 
 
 async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital, position,
@@ -3188,10 +3233,26 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
     # la fermeture (stop classique, plancher qui a quand même fini négatif,
     # durée max dépassée...). Couvre donc tous les cas de perte, pas
     # seulement la sortie stop-loss classique.
+    cle_suivi = None
     if resultat_final == "PERDU":
+        moment_fermeture_ts = time.time()
+        cle_suivi = f"{symbole}_{pos_id}_{moment_fermeture_ts}"
+        etat_global.setdefault("suivis_post_stop_en_attente", []).append({
+            "cle":                 cle_suivi,
+            "symbole":             symbole,
+            "direction":           direction,
+            "prix_stop_reel":      prix_actuel,
+            "prix_entree":         prix_entree,
+            "pos_id":              pos_id,
+            "position":            position,
+            "capital":             capital,
+            "moment_fermeture_ts": moment_fermeture_ts,
+        })
+        sauvegarder_etat(etat_global)
         asyncio.create_task(suivre_prix_post_stop(
             session, symbole, direction, prix_actuel, prix_entree, pos_id, etat_global,
-            position=position, capital=capital
+            position=position, capital=capital, moment_fermeture_ts=moment_fermeture_ts,
+            cle_suivi=cle_suivi
         ))
 
     # ── Resynchronisation avec le VRAI solde OKX avant de mettre à jour le
@@ -3400,6 +3461,7 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
             'atr_pct':         details.get("atr_pct", None),
             'glissement_pct':  details.get("glissement_pct", 0.0),
             'pos_id':          pos_id,
+            'cle_suivi':       cle_suivi,
         })
 
     if alerte_perte_a_envoyer:
@@ -4410,6 +4472,7 @@ async def boucle_principale():
         ("cumul_net", 0.0),
         ("pertes_consecutives", 0),
         ("pause_ouverture_jusqua_ts", 0),
+        ("suivis_post_stop_en_attente", []),
         ("historique", []),
         ("dernier_maj_marches", ""),
     ]:
@@ -4551,6 +4614,27 @@ async def boucle_principale():
         # comptabilisées. Capital corrigé avant le message de démarrage
         # ci-dessous, pour qu'il affiche déjà la valeur à jour.
         await reconcilier_trades_manques(session, etat)
+
+        # ── Reprise des suivis post-stop en attente (10/07, demandé par
+        # Damien) — voir suivre_prix_post_stop / cle_suivi. Chaque entrée
+        # encore présente ici correspond à un suivi qui n'a pas eu le temps
+        # de se terminer avant l'arrêt/redémarrage précédent (tâche en
+        # mémoire perdue). On les relance toutes, avec leur horodatage
+        # d'origine — celles déjà en retard reprennent immédiatement (la
+        # boucle d'attente interne de suivre_prix_post_stop ne s'exécute
+        # alors aucune fois, direct à la lecture finale).
+        suivis_en_attente = list(etat.get("suivis_post_stop_en_attente", []))
+        if suivis_en_attente:
+            log.info(f"  📐 [SUIVI-POST-STOP] {len(suivis_en_attente)} suivi(s) en attente "
+                      f"repris depuis le dernier redémarrage.")
+            for s in suivis_en_attente:
+                asyncio.create_task(suivre_prix_post_stop(
+                    session, s["symbole"], s["direction"], s["prix_stop_reel"],
+                    s["prix_entree"], s.get("pos_id"), etat,
+                    position=s.get("position"), capital=s.get("capital"),
+                    moment_fermeture_ts=s.get("moment_fermeture_ts"),
+                    cle_suivi=s.get("cle")
+                ))
 
         await telegram(session,
             (f"🔄 <b>RESET COMPLET EFFECTUÉ</b>\nCapital, PnL, compteurs et historique remis à zéro.\n\n" if RESET_TOUT else "")
