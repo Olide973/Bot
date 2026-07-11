@@ -213,7 +213,7 @@ GLISSEMENT_SIMULE_ECART_TYPE   = 0.12
 GLISSEMENT_SIMULE_PROBA_ACCIDENT = 0.05  # ~5% de chance d'un glissement sévère
 GLISSEMENT_SIMULE_ACCIDENT_MOYEN = 1.8
 GLISSEMENT_SIMULE_ACCIDENT_ECART = 0.8
-GLISSEMENT_SIMULE_MAX_PCT      = 4.0    # plafond absolu, jamais irréaliste
+GLISSEMENT_SIMULE_MAX_PCT      = 2.8    # plafond = pire cas RÉELLEMENT observé (avant : 4.0, irréaliste)
 DUREE_MAX_MINUTES       = 360    # 6h — fermeture forcée si ni stop ni lock atteint avant
 # ── Suivi post-stop (09/07, demandé par Damien) : après un stop-loss, on
 # continue de suivre le prix pendant DUREE_SUIVI_POST_STOP_MIN de plus (sans
@@ -1619,31 +1619,49 @@ async def get_klines(session, symbole, interval=15, limite=50):
     # d'une position déjà ouverte, en REST, confirmée fonctionnelle).
     okx_symbol = OKX_SYMBOLS.get(symbole, symbole)
     bar = {15: "15m", 60: "1H"}.get(interval, "15m")
-    try:
-        async with session.get(
-            "https://www.okx.com/api/v5/market/candles",
-            params={"instId": okx_symbol, "bar": bar, "limit": str(limite)},
-            timeout=aiohttp.ClientTimeout(total=15)
-        ) as resp:
-            data = await resp.json()
-            if data.get("code") != "0":
-                return None
-            candles = data.get("data", [])
-            if not candles:
-                return None
-            candles = list(reversed(candles))  # OKX renvoie du plus récent au plus ancien
-            df = pd.DataFrame(candles, columns=[
-                'time', 'open', 'high', 'low', 'close',
-                'volume', 'volCcy', 'volCcyQuote', 'confirm'
-            ])
-            df = df.astype({
-                'open': float, 'high': float, 'low': float,
-                'close': float, 'volume': float
-            })
-            return df.tail(limite).reset_index(drop=True)
-    except Exception as e:
-        log.error(f"Erreur klines {symbole} : {e}")
-        return None
+    # ── ROBUSTESSE (11/07) — les klines échouaient parfois sur un simple
+    # timeout réseau transitoire vers OKX (asyncio.TimeoutError, dont le str()
+    # est VIDE → log "Erreur klines ETHUSD :" sans le moindre détail). On
+    # retente jusqu'à 3 fois avec une courte pause pour les erreurs réseau
+    # transitoires, et si tout échoue on logue le TYPE de l'exception (jamais
+    # un message vide, pour ne plus avoir d'erreur illisible dans le rapport).
+    derniere_exc = None
+    for tentative in range(3):
+        try:
+            async with session.get(
+                "https://www.okx.com/api/v5/market/candles",
+                params={"instId": okx_symbol, "bar": bar, "limit": str(limite)},
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                data = await resp.json()
+                if data.get("code") != "0":
+                    log.warning(f"  ⚠️ klines {symbole} : réponse OKX code={data.get('code')} "
+                                f"msg={data.get('msg')}")
+                    return None
+                candles = data.get("data", [])
+                if not candles:
+                    return None
+                candles = list(reversed(candles))  # OKX renvoie du plus récent au plus ancien
+                df = pd.DataFrame(candles, columns=[
+                    'time', 'open', 'high', 'low', 'close',
+                    'volume', 'volCcy', 'volCcyQuote', 'confirm'
+                ])
+                df = df.astype({
+                    'open': float, 'high': float, 'low': float,
+                    'close': float, 'volume': float
+                })
+                return df.tail(limite).reset_index(drop=True)
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            derniere_exc = e
+            if tentative < 2:
+                await asyncio.sleep(1.0)  # blip réseau transitoire — on retente
+                continue
+        except Exception as e:
+            derniere_exc = e
+            break  # erreur non réseau (ex: format inattendu) — inutile de retenter
+    detail = f"{type(derniere_exc).__name__}: {derniere_exc}".rstrip(": ")
+    log.error(f"Erreur klines {symbole} : {detail} (après {tentative+1} tentative(s))")
+    return None
 
 async def get_prix_rest(session, symbole):
     """Prix via l'API REST OKX (fallback tant que le WebSocket n'a pas encore
@@ -2248,12 +2266,27 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
         # plus haut. Symétrique au recalcul réel ci-dessus : même logique de
         # recalcul du stop/objectif à partir du prix simulé, pour que la
         # simulation se comporte comme le réel face au glissement.
-        glissement_simule_pct = -abs(random.gauss(GLISSEMENT_SIMULE_MOYEN_PCT,
-                                                     GLISSEMENT_SIMULE_ECART_TYPE))
+        # ── Amplitude du glissement (TOUJOURS positive), calibrée sur le réel.
+        ampleur_glissement = abs(random.gauss(GLISSEMENT_SIMULE_MOYEN_PCT,
+                                              GLISSEMENT_SIMULE_ECART_TYPE))
         if random.random() < GLISSEMENT_SIMULE_PROBA_ACCIDENT:
-            glissement_simule_pct = -abs(random.gauss(GLISSEMENT_SIMULE_ACCIDENT_MOYEN,
-                                                         GLISSEMENT_SIMULE_ACCIDENT_ECART))
-        glissement_simule_pct = max(glissement_simule_pct, -GLISSEMENT_SIMULE_MAX_PCT)
+            ampleur_glissement = abs(random.gauss(GLISSEMENT_SIMULE_ACCIDENT_MOYEN,
+                                                  GLISSEMENT_SIMULE_ACCIDENT_ECART))
+        ampleur_glissement = min(ampleur_glissement, GLISSEMENT_SIMULE_MAX_PCT)
+        # ── CORRECTIF DIRECTION (11/07) — le glissement doit être DÉFAVORABLE au
+        # sens du trade (c'était déjà l'intention, cf. commentaire des constantes
+        # « toujours défavorable »), mais le code appliquait TOUJOURS un prix plus
+        # bas : favorable à un ACHAT. Comme la stratégie ne génère quasiment que
+        # des achats, ça gonflait tous les gains — un seul remplissage chanceux à
+        # -2.8%/-3.6% pouvait fabriquer un +20€ qui n'existerait jamais en réel.
+        # Un ordre au marché traverse le carnet CONTRE toi : un ACHAT se remplit
+        # PLUS HAUT (+ampleur), une VENTE PLUS BAS (-ampleur). Convention de signe
+        # identique au mode réel (glissement_pct = (prix rempli - prix visé)/prix
+        # visé) : positif sur un achat défavorable, négatif sur une vente.
+        if direction == "ACHAT":
+            glissement_simule_pct = +ampleur_glissement   # rempli plus haut = contre l'acheteur
+        else:
+            glissement_simule_pct = -ampleur_glissement   # rempli plus bas = contre le vendeur
         prix_simule = round(prix_entree * (1 + glissement_simule_pct / 100), 8)
         details["glissement_pct"] = round(glissement_simule_pct, 4)
         if abs(glissement_simule_pct) > 0.05:
