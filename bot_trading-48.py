@@ -156,6 +156,18 @@ TRAIL_RATIO_POST_PALIER1 = 0.002   # 08/07 (05:34) — ajusté à 0.20% suite au
 
 # ── Détection signal mean reversion — surveillance temps réel
 SEUIL_MOUVEMENT_PCT     = 0.50   # dès que le prix bouge de 0.50% → signal
+# ── PLAFOND de mouvement (11/07) — borne HAUTE, symétrique du seuil de
+# déclenchement ci-dessus. Jusqu'ici le signal partait dès |variation| >= 0.50%
+# SANS AUCUN plafond : un mouvement de 1.8% déclenchait exactement comme un
+# mouvement de 0.5%. C'est un contresens pour du mean reversion, qui parie sur
+# une SUR-réaction qui se corrige : un mouvement très large est bien plus
+# souvent une vraie repriçage / un début de tendance (news, liquidation) qu'une
+# simple sur-réaction — parier contre revient à se battre contre le momentum, et
+# à x10 la perte + le slippage sont lourds. Choix de PRINCIPE, pas de calage sur
+# l'échantillon : fixé à ~2.4x le seuil de déclenchement (au-delà, ce n'est plus
+# un "petit repli" mais un vrai mouvement), pas au chiffre qui optimise les
+# trades déjà vus. À revalider sur des trades NEUFS avant de resserrer.
+SEUIL_MOUVEMENT_MAX_PCT = 1.20   # au-delà : mouvement trop violent → pas d'entrée
 # ── ÉLARGI le 09/07 (phase de collecte de données, demandé par Damien) : de
 # 0.25x à 0.20x. Objectif explicite : laisser entrer PLUS de trades pour
 # accumuler une base statistique sur RSI/volume (déjà enregistrés par trade
@@ -174,6 +186,18 @@ VOLUME_MINI             = 0.20   # volume min vs moyenne 24h
 # à valider sur de nouvelles données (les 8 trades déjà vus ne peuvent pas
 # servir à eux-mêmes de preuve, voir discussion du 09/07).
 STOP_LOSS_PCT           = 0.0075  # stop = 0.75% du prix d'entrée — évolue avec la taille de position, contrairement à un stop fixe en €
+# ── BREAKEVEN ANTICIPÉ (11/07, demandé par Damien) — neutralise le RISQUE plus
+# tôt que le palier 1. Analyse des trades : les grosses pertes ne sont PAS des
+# gains coupés trop court, ce sont des trades partis à contresens dès l'entrée
+# qui mangent tout le stop (-0.75%) AVANT d'atteindre +0.28% (palier 1) — seul
+# moment où, jusqu'ici, le stop passait au breakeven. Dès que le trade a montré
+# ne serait-ce que +0.15% dans le bon sens, on remonte le stop au prix d'entrée
+# (+ tampon frais) : un trade qui monte un peu puis échoue ressort à ~0€ au lieu
+# de -5€. Ne touche PAS la largeur du stop initial (donc ne contredit pas le
+# suivi post-stop qui avait fait élargir à 0.75%), et ne sacrifie AUCUN gain (les
+# trades qui atteignent +0.28% capturent exactement pareil). À valider sur des
+# trades NEUFS en démo avant d'en tirer une conclusion.
+SEUIL_BREAKEVEN_ANTICIPE_PCT = 0.0015  # +0.15% du prix d'entrée → stop remonté au breakeven
 
 # ── Glissement SIMULÉ en mode SIMULATION (10/07, demandé par Damien) —
 # jusqu'ici, en simulation, prix_entree était EXACTEMENT le prix visé, sans
@@ -1921,6 +1945,18 @@ async def analyser_marche(session, symbole):
         "prix_actuel":   prix_actuel,
     }
 
+    # ── Filtre mouvement TROP violent (11/07) — voir SEUIL_MOUVEMENT_MAX_PCT.
+    # Le signal serait éligible (|variation| >= seuil de déclenchement), mais le
+    # mouvement dépasse le plafond : on n'entre pas. On ACQUITTE quand même le
+    # mouvement (reset de la référence au niveau actuel) pour repartir chercher
+    # une sur-réaction FRAÎCHE depuis ce nouveau niveau, plutôt que de rester
+    # bloqué sur un écart énorme qui rejouerait "trop violent" en boucle.
+    if abs(variation_pct) >= SEUIL_MOUVEMENT_MAX_PCT:
+        prix_reference[symbole] = prix_actuel
+        log.info(f"  {symbole} : Variation={variation_pct:+.2f}% >= plafond "
+                 f"{SEUIL_MOUVEMENT_MAX_PCT}% → skip (mouvement trop violent pour du mean reversion)")
+        return "NEUTRE", {}
+
     # Signal ACHAT : prix a chuté de >= 0.50%
     if variation_pct <= -SEUIL_MOUVEMENT_PCT:
         prix_reference[symbole] = prix_actuel
@@ -2462,6 +2498,10 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                         # reconstruit ratio_prix ici (non transmis tel quel à cette fonction),
                         # pour recalculer un stop depuis le prix ACTUEL à chaque retry.
 
+    # ── Breakeven anticipé (11/07) — voir SEUIL_BREAKEVEN_ANTICIPE_PCT.
+    breakeven_anticipe_pose = False   # True une fois le stop remonté au breakeven avant le palier 1
+    dernier_essai_breakeven = 0.0     # throttle des tentatives d'amendement (idem autres checks OKX)
+
     # ── Boucle de surveillance — jusqu'au stop, au lock, ou 6h max
     while True:
         await asyncio.sleep(CHECK_INTERVAL)
@@ -2939,6 +2979,66 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                                 f"n'est pas validé. L'ancien plancher (s'il existe) reste actif "
                                 f"entretemps — une confirmation 🧱 suivra dès que ce sera bon."
                             )
+
+        # ── BREAKEVEN ANTICIPÉ (11/07) — voir SEUIL_BREAKEVEN_ANTICIPE_PCT.
+        # Dès que le PnL max a atteint le seuil (+0.15% du prix d'entrée) et TANT
+        # QUE le palier 1 n'est pas encore franchi (lock_actuel == 0.0 — au-delà,
+        # la bascule vers le trailing + le plancher dur ont déjà pris le relais
+        # plus haut, avec leur propre breakeven), on remonte le stop au prix
+        # d'entrée + tampon frais. But : un trade parti à contresens qui a quand
+        # même montré un petit gain ressort à ~0€ au lieu d'une perte pleine.
+        # Le prix de breakeven est calculé EXACTEMENT comme celui du palier 1
+        # (même tampon_frais) pour une transition cohérente. On met aussi à jour
+        # stop_initial, pour que le filet interne (atteint_stop, plus bas)
+        # protège au même niveau que l'ordre natif amendé.
+        if (not breakeven_anticipe_pose and lock_actuel == 0.0
+                and pnl_max_atteint >= position * SEUIL_BREAKEVEN_ANTICIPE_PCT):
+            tampon_frais_be = OKX_TAKER_FEE * 2 * 1.15  # identique au breakeven du palier 1
+            if direction == "ACHAT":
+                prix_breakeven_anticipe = round(prix_entree * (1 + tampon_frais_be), 8)
+            else:
+                prix_breakeven_anticipe = round(prix_entree * (1 - tampon_frais_be), 8)
+
+            if MODE_REEL and inst_id and algo_id:
+                # Amendement EN PLACE du stop fixe natif (1 seul appel, aucune
+                # fenêtre sans protection) — réutilise le mécanisme du plancher
+                # dur. Throttlé comme les autres appels OKX de la boucle : la
+                # 1re tentative part immédiatement (dernier_essai_breakeven=0),
+                # les éventuelles retentatives après échec sont espacées.
+                maintenant_be = time.time()
+                if maintenant_be - dernier_essai_breakeven >= INTERVALLE_CHECK_UPL_SEC:
+                    dernier_essai_breakeven = maintenant_be
+                    side_ouverture_be = "buy" if direction == "ACHAT" else "sell"
+                    be_ok = await okx_amender_stop_floor(
+                        session, inst_id, algo_id, prix_breakeven_anticipe, side_ouverture_be
+                    )
+                    if be_ok:
+                        stop_initial = prix_breakeven_anticipe
+                        breakeven_anticipe_pose = True
+                        log.info(f"  🧱 [BREAKEVEN-ANTICIPÉ] {symbole} : +{pnl_max_atteint:.2f}€ atteint "
+                                 f"(>= +{SEUIL_BREAKEVEN_ANTICIPE_PCT*100:.2f}%) — stop remonté au "
+                                 f"breakeven ({prix_breakeven_anticipe}) avant le palier 1.")
+                        await telegram(session,
+                            f"🧱 <b>RISQUE NEUTRALISÉ (breakeven anticipé)</b>\n"
+                            f"{symbole} : le trade a pris +{SEUIL_BREAKEVEN_ANTICIPE_PCT*100:.2f}% "
+                            f"(PnL max +{pnl_max_atteint:.2f}€) — le stop remonte au prix d'entrée, "
+                            f"avant même le 1er palier.\n"
+                            f"Au pire, ce trade ressort maintenant à ~0€ au lieu d'une perte pleine."
+                        )
+                    else:
+                        log.warning(f"  ⚠️ [BREAKEVEN-ANTICIPÉ] {symbole} : amendement du stop au "
+                                    f"breakeven échoué — nouvelle tentative au prochain check (le stop "
+                                    f"initial à -{STOP_LOSS_PCT*100:.2f}% reste actif entretemps).")
+            elif not MODE_REEL:
+                # Pure simulation (aucun ordre natif) : on remonte simplement le
+                # filet interne — atteint_stop protégera au niveau breakeven.
+                stop_initial = prix_breakeven_anticipe
+                breakeven_anticipe_pose = True
+                log.info(f"  🧱 [BREAKEVEN-ANTICIPÉ/SIM] {symbole} : +{pnl_max_atteint:.2f}€ atteint — "
+                         f"stop interne remonté au breakeven ({prix_breakeven_anticipe}).")
+            # (MODE_REEL mais algo_id encore None : stop natif pas encore posé —
+            #  on ne fait rien ce tick, le bloc RETRY plus bas va le poser, puis
+            #  ce bloc l'amendera au breakeven au tick suivant.)
 
         # Stop loss — calculé et vérifié EN PREMIER, avant toute logique de
         # lock. Priorité absolue : si le prix a franchi le niveau de stop,
@@ -4807,11 +4907,19 @@ async def boucle_principale():
                     await asyncio.sleep(PAUSE_SCAN)
                     continue
 
-                # Trier par variation la plus forte
+                # ── Priorité aux mouvements les PLUS MODÉRÉS (11/07) — quand il
+                # y a plus de signaux que de slots libres, on privilégie les
+                # sur-réactions modérées (proches du seuil de déclenchement),
+                # PAS les mouvements les plus violents. Pour du mean reversion,
+                # un mouvement plus large n'est pas un meilleur signal mais un
+                # signal plus risqué (plus souvent une vraie tendance). L'ancien
+                # tri (reverse=True) faisait l'inverse : il sélectionnait d'abord
+                # les pires trades dès que les slots étaient limités. N'a d'effet
+                # que si MAX_TRADES_SIMULTANES < nombre de signaux simultanés
+                # (donc aucun effet tant que MAX_TRADES_SIMULTANES=999).
                 meilleurs = sorted(
                     signaux.items(),
                     key=lambda x: x[1]["details"].get("variation_pct", 0),
-                    reverse=True
                 )[:slots_libres]
 
                 if arret_demande:
