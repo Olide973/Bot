@@ -6,9 +6,22 @@
 #  et trades. Interface identique à l'original :
 #    init_database(), charger_etat(), sauvegarder_etat(etat),
 #    enregistrer_trade(trade)
+#
+#  ── CORRECTIF 11/07/2026 : bug d'EFFACEMENT de l'historique ──────
+#  Avant, charger_etat() renvoyait {} sur N'IMPORTE QUELLE erreur (y
+#  compris un simple aléa de connexion au démarrage, fréquent sur
+#  Railway quand la base n'est pas encore prête). Le bot croyait alors
+#  à un premier démarrage, peuplait ses valeurs par défaut et les
+#  RÉ-ENREGISTRAIT — écrasant définitivement l'historique réel.
+#  Deux changements :
+#   1) get_connection() retente une connexion transitoirement échouée.
+#   2) charger_etat() LÈVE si la lecture échoue, et ne renvoie {} QUE
+#      si la base est réellement vide (aucune ligne). L'appelant ne
+#      doit jamais écraser un état existant sur une simple erreur.
 # ═══════════════════════════════════════════════════════════════
 import os
 import json
+import time
 import logging
 from urllib.parse import urlparse
 
@@ -16,22 +29,45 @@ import pg8000
 
 log = logging.getLogger(__name__)
 
+# Nombre de tentatives et pause (secondes) pour absorber les coupures
+# transitoires de connexion PostgreSQL (redémarrage Railway, base pas
+# encore prête, blip réseau).
+_DB_TENTATIVES = 4
+_DB_PAUSE_SEC = 2
+
 
 def get_connection():
-    """Ouvre une connexion PostgreSQL à partir de DATABASE_URL.
+    """Ouvre une connexion PostgreSQL à partir de DATABASE_URL, avec retries.
+
     La variable est lue ICI (pas au niveau module) — correctif de mai 2026 :
     Railway injecte parfois la variable après l'import du module, la lire à
-    l'import figeait une valeur vide."""
+    l'import figeait une valeur vide.
+
+    Retente une connexion transitoirement échouée (_DB_TENTATIVES) plutôt que
+    d'échouer au premier blip — sans ça, une coupure d'une seconde au démarrage
+    faisait remonter une "base vide" et effaçait l'historique."""
     url = os.environ.get("DATABASE_URL", "")
     if not url:
         raise RuntimeError("DATABASE_URL absente des variables d'environnement")
     p = urlparse(url)
-    return pg8000.connect(
-        user=p.username,
-        password=p.password,
-        host=p.hostname,
-        port=p.port or 5432,
-        database=(p.path or "/postgres").lstrip("/"),
+    derniere_exc = None
+    for tentative in range(_DB_TENTATIVES):
+        try:
+            return pg8000.connect(
+                user=p.username,
+                password=p.password,
+                host=p.hostname,
+                port=p.port or 5432,
+                database=(p.path or "/postgres").lstrip("/"),
+            )
+        except Exception as e:
+            derniere_exc = e
+            if tentative < _DB_TENTATIVES - 1:
+                log.warning(f"  [DB] Connexion échouée (tentative {tentative + 1}/"
+                            f"{_DB_TENTATIVES}) : {e} — nouvelle tentative dans {_DB_PAUSE_SEC}s")
+                time.sleep(_DB_PAUSE_SEC)
+    raise RuntimeError(
+        f"Connexion PostgreSQL impossible après {_DB_TENTATIVES} tentatives : {derniere_exc}"
     )
 
 
@@ -76,29 +112,34 @@ def init_database():
 
 
 def charger_etat():
-    """Charge l'état complet du bot (dict). Retourne {} si aucun état
-    sauvegardé — le bot initialise alors ses champs par défaut."""
+    """Charge l'état complet du bot (dict).
+
+    IMPORTANT (correctif 11/07) — distingue deux cas radicalement différents :
+      • base RÉELLEMENT vide (aucune ligne id=1) → retourne {}  : c'est un vrai
+        premier démarrage, le bot peuple ses valeurs par défaut, c'est correct.
+      • lecture IMPOSSIBLE (DB injoignable même après retries) → LÈVE une
+        exception. Ne JAMAIS renvoyer {} dans ce cas : l'appelant écraserait
+        l'historique réel par un état vide (c'était le bug qui effaçait tout).
+
+    L'appelant (bot_trading-48.py) attrape l'exception au démarrage et REFUSE
+    d'écraser l'état plutôt que de repartir de zéro."""
+    conn = get_connection()  # lève (avec retries internes) si la base est injoignable
     try:
-        conn = get_connection()
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT data FROM etat_bot WHERE id = 1")
-            row = cur.fetchone()
-            if row and row[0]:
-                return json.loads(row[0])
-            return {}
-        finally:
-            conn.close()
-    except Exception as e:
-        log.error(f"  [DB] Échec chargement état : {e} — état vide utilisé")
-        return {}
+        cur = conn.cursor()
+        cur.execute("SELECT data FROM etat_bot WHERE id = 1")
+        row = cur.fetchone()
+        if row and row[0]:
+            return json.loads(row[0])
+        return {}  # base réellement vide (aucune ligne) — vrai premier démarrage
+    finally:
+        conn.close()
 
 
 def sauvegarder_etat(etat):
     """Sauvegarde l'état complet du bot (upsert sur la ligne unique id=1).
     Ne lève jamais : un échec de sauvegarde ne doit pas interrompre le
     trading — l'erreur est loggée (et remontée sur Telegram via le miroir
-    d'erreurs du bot)."""
+    d'erreurs du bot). get_connection() retente déjà les coupures passagères."""
     try:
         conn = get_connection()
         try:
