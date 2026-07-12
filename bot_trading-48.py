@@ -4581,12 +4581,35 @@ async def boucle_principale():
         log.warning(f"  ⚠️ Impossible d'enregistrer les gestionnaires de signal : {e}")
 
     init_database()
-    etat = charger_etat()
 
+    # ── Chargement ROBUSTE de l'état (11/07) — CORRECTIF du bug qui effaçait
+    # l'historique. Cause exacte : charger_etat() renvoyait {} sur un simple
+    # aléa de connexion DB au démarrage (fréquent sur Railway quand la base
+    # n'est pas encore prête). Le bot croyait alors à un premier démarrage,
+    # peuplait ses valeurs par défaut, et les SAUVEGARDAIT juste après (plus
+    # bas) — écrasant DÉFINITIVEMENT l'historique réel. Désormais charger_etat()
+    # LÈVE si la lecture échoue (au lieu de renvoyer {}), et on ne réinitialise
+    # QUE sur un vrai RESET_TOUT ou une base réellement vide. Si la lecture
+    # échoue malgré les retries : on N'ÉCRASE PAS — on sort, Railway redémarre
+    # et réessaie, l'historique reste intact.
     if RESET_TOUT:
         log.warning("  🔄 RESET_TOUT activé sur Railway — remise à zéro complète de l'état du bot")
         etat = {}
         sauvegarder_etat(etat)
+    else:
+        etat = None
+        for tentative in range(6):
+            try:
+                etat = charger_etat()   # {} seulement si base VRAIMENT vide ; lève si lecture impossible
+                break
+            except Exception as e:
+                log.error(f"  ⚠️ Chargement de l'état échoué (tentative {tentative + 1}/6) : {e}")
+                time.sleep(3)
+        if etat is None:
+            log.critical("  ❌ Base injoignable au démarrage après 6 tentatives — ARRÊT SANS "
+                         "écraser l'état. Railway va redémarrer et réessayer. L'historique est "
+                         "PRÉSERVÉ, pas effacé.")
+            raise SystemExit(1)
 
     # Initialiser les champs manquants
     for champ, valeur in [
@@ -4870,12 +4893,18 @@ async def boucle_principale():
                     break
                 if statut == "KILL_SWITCH":
                     await asyncio.sleep(60)
-                    etat = charger_etat()
-                    # ── CORRECTIF (09/07) — cause exacte de l'erreur "'capital'" :
-                    # si ce rechargement échoue ou renvoie un état vide (aléa DB
-                    # passager), la clé 'capital' n'existe plus et le code
-                    # plantait juste après (etat["capital"] direct). Filet de
-                    # sécurité minimal, pas une réinitialisation complète.
+                    # Rechargement PRUDENT (11/07) — ne JAMAIS remplacer l'état
+                    # en mémoire par un état vide si la lecture échoue (aléa DB
+                    # passager) : sinon l'historique serait écrasé au prochain
+                    # save. On garde l'état courant en cas d'échec ou de retour
+                    # vide, et on ne remplace que par un rechargement réussi.
+                    try:
+                        etat_recharge = charger_etat()
+                        if etat_recharge:
+                            etat = etat_recharge
+                    except Exception as e:
+                        log.warning(f"  ⚠️ Rechargement post-kill-switch échoué : {e} — "
+                                    f"état en mémoire conservé (historique préservé).")
                     etat.setdefault("capital", CAPITAL_INITIAL)
                     continue
 
