@@ -1550,8 +1550,11 @@ def construire_csv_trades(detail_trades):
     import io
     buffer = io.StringIO()
     colonnes = [
-        "heure_ouverture", "marche", "resultat", "gain_eur", "rsi",
-        "volume_ratio", "variation_pct", "glissement_pct", "atr_pct",
+        "heure_ouverture", "marche", "direction", "resultat", "motif_sortie",
+        "gain_eur", "pnl_max_eur", "pnl_max_pct", "frais_estimes",
+        "prix_entree", "prix_sortie", "prix_stop", "objectif",
+        "rsi", "volume_ratio", "variation_pct", "glissement_pct", "atr_pct",
+        "breakeven_anticipe", "duree_min",
         "stop_bien_place", "suivi_post_stop_pct", "palier1_atteint_post_stop",
     ]
     writer = csv.writer(buffer, delimiter=';')
@@ -1560,13 +1563,24 @@ def construire_csv_trades(detail_trades):
         writer.writerow([
             d.get("heure_ouv", "?"),
             d.get("marche", "?"),
+            d.get("direction", "?"),
             d.get("resultat", "?"),
+            d.get("motif_sortie", "?"),
             d.get("gain", 0),
+            d.get("pnl_max", ""),
+            d.get("pnl_max_pct", ""),
+            d.get("frais", ""),
+            d.get("prix_entree", ""),
+            d.get("prix_sortie", ""),
+            d.get("prix_stop", ""),
+            d.get("objectif", ""),
             d.get("rsi", ""),
             d.get("vol", ""),
             d.get("variation", ""),
             d.get("glissement", ""),
             d.get("atr", ""),
+            d.get("breakeven", ""),
+            d.get("duree", ""),
             d.get("stop_bien_place", ""),
             d.get("suivi_post_stop_pct", ""),
             d.get("palier1_post_stop", ""),
@@ -2535,6 +2549,12 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
     breakeven_anticipe_pose = False   # True une fois le stop remonté au breakeven avant le palier 1
     dernier_essai_breakeven = 0.0     # throttle des tentatives d'amendement (idem autres checks OKX)
 
+    # ── Traçabilité de sortie (12/07) — comment le trade s'est fermé, pour
+    # diagnostiquer sur données réelles. prix_sortie est déjà suivi (voir plus
+    # haut) et sert à mesurer le gap éventuel au moment du stop.
+    motif_sortie = "?"                 # STOP_NATIF / STOP_INTERNE / TRAILING / LOCK / PLANCHER_DUR /
+                                       # PALIER_NON_TENABLE / DUREE_MAX / PROTECTION_DISPARUE
+
     # ── Boucle de surveillance — jusqu'au stop, au lock, ou 6h max
     while True:
         await asyncio.sleep(CHECK_INTERVAL)
@@ -2635,6 +2655,7 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                         resultat_final = "GAGNE" if pnl_net > 0 else "PERDU"
                         gain_final     = pnl_net
                         algo_id        = None  # déjà disparu, rien à annuler plus bas
+                        motif_sortie   = "PROTECTION_DISPARUE"
                         break
                     # Sinon : position_encore_ouverte est False (fermée
                     # normalement par la protection avant de disparaître de
@@ -2682,6 +2703,7 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                         resultat_final    = "GAGNE" if gain_net > 0 else "PERDU"
                         gain_final        = gain_net
                         hard_floor_algo_id = None  # déjà disparu, rien à annuler plus bas
+                        motif_sortie       = "PLANCHER_DUR"
                         break
                     # Position encore ouverte : le plancher a disparu sans
                     # fermer (rare) — pas d'urgence, le trailing protège
@@ -2831,6 +2853,7 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                         f"PnL au moment de la décision (estimation, avant vérification OKX) : "
                         f"{'+' if pnl>=0 else ''}{pnl:.2f}€"
                     )
+                    motif_sortie = "PALIER_NON_TENABLE"
                     break
 
                 # ── Le gain réellement garanti correspond à la cible nominale
@@ -3197,6 +3220,7 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                             f"Durée : {duree} min"
                         )
                         gain_final = pnl_net
+                        motif_sortie = "STOP_NATIF"
                         break
                 # on ne l'annule jamais, on continue la boucle.
             else:
@@ -3216,6 +3240,7 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                     f"Durée : {duree} min"
                 )
                 gain_final = pnl_net
+                motif_sortie = "STOP_INTERNE"
                 break
 
         # Sortie lock : PnL redescend sous le palier verrouillé (mais le
@@ -3261,6 +3286,7 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                         )
                         resultat_final = "GAGNE" if gain_net > 0 else "PERDU"
                         gain_final     = gain_net
+                        motif_sortie   = "TRAILING"
                         break
                 # Position toujours ouverte (ou check pas encore dû à cause
                 # du throttle) : le trailing n'a pas encore déclenché — on
@@ -3304,6 +3330,7 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                     )
                     resultat_final = "GAGNE" if gain_net > 0 else "PERDU"
                     gain_final     = gain_net
+                    motif_sortie   = "LOCK"
                     break
 
         # Durée maximale : fermeture forcée à 6h si ni stop ni lock atteint
@@ -3322,6 +3349,7 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                 f"Durée : {duree} min"
             )
             gain_final = pnl_net
+            motif_sortie = "DUREE_MAX"
             break
 
     # ── Annulation du stop natif OKX actif (s'il en existe un) — AVANT
@@ -3583,7 +3611,16 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
             'marche':          symbole,
             'direction':       direction,
             'resultat':        resultat_final,
+            'motif_sortie':    motif_sortie,
             'gain':            round(gain_final, 2),
+            'pnl_max':         round(pnl_max_atteint, 2),
+            'pnl_max_pct':     round(pnl_max_atteint / position * 100, 3) if position else 0.0,
+            'frais_estimes':   round(calc_frais(position)["total"], 4),
+            'prix_entree':     prix_entree,
+            'prix_sortie':     prix_sortie,
+            'prix_stop':       stop_initial,
+            'objectif':        objectif_final,
+            'breakeven_anticipe': breakeven_anticipe_pose,
             'mise':            round(mise, 2),
             'capital':         etat_global["capital"],
             'duree_minutes':   duree,
@@ -4059,6 +4096,16 @@ async def envoyer_rapport_quotidien(session, etat):
         suivi_post_stop_pct = h.get("suivi_post_stop_pct", None)
         stop_bien_place     = h.get("stop_bien_place", None)
         palier1_post_stop   = h.get("palier1_atteint_post_stop", None)
+        direction_h  = h.get("direction", "?")
+        motif_sortie_h = h.get("motif_sortie", "?")
+        pnl_max_h    = h.get("pnl_max", None)
+        pnl_max_pct_h = h.get("pnl_max_pct", None)
+        frais_h      = h.get("frais_estimes", None)
+        prix_entree_h = h.get("prix_entree", None)
+        prix_sortie_h = h.get("prix_sortie", None)
+        prix_stop_h   = h.get("prix_stop", None)
+        objectif_h    = h.get("objectif", None)
+        breakeven_h   = h.get("breakeven_anticipe", None)
 
         gains_jour[marche]  = round(gains_jour.get(marche, 0) + gain, 2)
         rsi_jour.setdefault(marche, []).append(rsi)
@@ -4069,6 +4116,11 @@ async def envoyer_rapport_quotidien(session, etat):
             "variation": variation, "atr": atr_h, "glissement": glissement,
             "suivi_post_stop_pct": suivi_post_stop_pct, "stop_bien_place": stop_bien_place,
             "palier1_post_stop": palier1_post_stop,
+            "direction": direction_h, "motif_sortie": motif_sortie_h,
+            "pnl_max": pnl_max_h, "pnl_max_pct": pnl_max_pct_h, "frais": frais_h,
+            "prix_entree": prix_entree_h, "prix_sortie": prix_sortie_h,
+            "prix_stop": prix_stop_h, "objectif": objectif_h, "breakeven": breakeven_h,
+            "duree": duree,
         })
 
         if resultat == "GAGNE":
