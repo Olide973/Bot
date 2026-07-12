@@ -376,6 +376,22 @@ OKX_COMPTE_DEMO  = os.environ.get('OKX_COMPTE_DEMO', '1') == '1'
 #    fonctionnement normal sans redéclencher un reset à chaque redémarrage.
 RESET_TOUT = os.environ.get('RESET_TOUT', '0').strip().lower() in ('1', 'true', 'oui', 'yes')
 
+# ── EXPÉRIENCE : inversion du sens (12/07, demandé par Damien) — piloté depuis
+# Railway (Variables → INVERSER_SENS = 1, puis Deploy). Teste l'hypothèse « le
+# bot trade à l'envers » : quand actif, CHAQUE signal est pris dans le sens
+# OPPOSÉ à ce que la stratégie déciderait normalement (ACHAT <-> VENTE), au tout
+# dernier moment de la décision, SANS rien changer d'autre au code. Défaut = 0
+# (comportement normal). Mettre à 1 pour tester, à 0 pour revenir à la normale —
+# sans recoder. À comparer sur plusieurs jours dans les deux positions.
+INVERSER_SENS = os.environ.get('INVERSER_SENS', '0').strip().lower() in ('1', 'true', 'oui', 'yes')
+
+def _sens_effectif(direction):
+    """Renvoie le sens réellement pris : inversé si INVERSER_SENS est actif,
+    sinon inchangé. N'inverse jamais NEUTRE (pas de trade)."""
+    if not INVERSER_SENS or direction == "NEUTRE":
+        return direction
+    return "VENTE" if direction == "ACHAT" else "ACHAT"
+
 # ── Marchés — uniquement ceux à levier x10 sur OKX (X-Perps, compte France/EEA)
 # Chargés dynamiquement via API au démarrage et mis à jour chaque nuit à minuit
 MARCHES          = []   # liste des symboles actifs (levier x10 uniquement)
@@ -422,6 +438,8 @@ log.info(f"  Telegram : {'ON' if TELEGRAM_TOKEN else 'OFF'}")
 log.info(f"  Mode : {'REEL' if MODE_REEL else 'SIMULATION'}")
 if MODE_REEL:
     log.warning(f"  ⚠️ Compte ciblé pour les ordres : {'DÉMO (argent fictif)' if OKX_COMPTE_DEMO else '🚨 RÉEL — ARGENT VÉRITABLE 🚨'}")
+if INVERSER_SENS:
+    log.warning("  🔄 SENS INVERSÉ ACTIF — chaque trade est pris à L'ENVERS du signal normal (expérience). Mettre INVERSER_SENS=0 pour revenir à la normale.")
 log.info("=" * 60)
 
 # ═══════════════════════════════════════════════════════════════
@@ -1993,21 +2011,25 @@ async def analyser_marche(session, symbole):
     if variation_pct <= -SEUIL_MOUVEMENT_PCT:
         prix_reference[symbole] = prix_actuel
         if rsi_1h < RSI_SEUIL_BAS:
-            log.info(f"  {symbole} ACHAT->VENTE | RSI={rsi_1h} < {RSI_SEUIL_BAS} | Vol={vol_ratio:.2f}x")
-            return "VENTE", details
+            direction = "VENTE"   # RSI bas → suit la tendance baissière (inverse le fade)
         else:
-            log.info(f"  {symbole} ACHAT | Chute={variation_pct:.2f}% | RSI={rsi_1h} | Vol={vol_ratio:.2f}x")
-            return "ACHAT", details
+            direction = "ACHAT"   # fade classique de la baisse
+        direction = _sens_effectif(direction)  # inversion expérimentale éventuelle
+        log.info(f"  {symbole} {direction}{' [SENS INVERSÉ]' if INVERSER_SENS else ''} | "
+                 f"Chute={variation_pct:.2f}% | RSI={rsi_1h} | Vol={vol_ratio:.2f}x")
+        return direction, details
 
     # Signal VENTE : prix a monté de >= 0.50%
     if variation_pct >= SEUIL_MOUVEMENT_PCT:
         prix_reference[symbole] = prix_actuel
         if rsi_1h > RSI_SEUIL_HAUT:
-            log.info(f"  {symbole} VENTE->ACHAT | RSI={rsi_1h} > {RSI_SEUIL_HAUT} | Vol={vol_ratio:.2f}x")
-            return "ACHAT", details
+            direction = "ACHAT"   # RSI haut → suit la tendance haussière (inverse le fade)
         else:
-            log.info(f"  {symbole} VENTE | Montée={variation_pct:.2f}% | RSI={rsi_1h} | Vol={vol_ratio:.2f}x")
-            return "VENTE", details
+            direction = "VENTE"   # fade classique de la hausse
+        direction = _sens_effectif(direction)  # inversion expérimentale éventuelle
+        log.info(f"  {symbole} {direction}{' [SENS INVERSÉ]' if INVERSER_SENS else ''} | "
+                 f"Montée={variation_pct:.2f}% | RSI={rsi_1h} | Vol={vol_ratio:.2f}x")
+        return direction, details
 
     log.info(f"  {symbole} : Variation={variation_pct:+.2f}% (seuil +/-{SEUIL_MOUVEMENT_PCT}%) | RSI={rsi_1h}")
     return "NEUTRE", {}
