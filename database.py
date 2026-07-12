@@ -129,7 +129,19 @@ def charger_etat():
         cur.execute("SELECT data FROM etat_bot WHERE id = 1")
         row = cur.fetchone()
         if row and row[0]:
-            return json.loads(row[0])
+            data = row[0]
+            # ── CORRECTIF (12/07) — cause exacte du crash en boucle : la colonne
+            # etat_bot.data est en réalité de type JSONB (créée avant cette
+            # reconstruction du fichier), et pg8000 la renvoie déjà décodée en
+            # dict Python, pas en texte. json.loads(dict) levait "the JSON
+            # object must be str, bytes or bytearray, not dict" à CHAQUE
+            # tentative → 6 échecs → SystemExit → boucle de crash sans fin,
+            # aucun trade depuis 9h. On accepte les deux formats (JSONB déjà
+            # décodé, ou TEXT à parser) selon ce que la colonne renvoie
+            # réellement, pour ne plus dépendre du type exact de la colonne.
+            if isinstance(data, (dict, list)):
+                return data
+            return json.loads(data)
         return {}  # base réellement vide (aucune ligne) — vrai premier démarrage
     finally:
         conn.close()
