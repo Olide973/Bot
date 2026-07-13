@@ -197,7 +197,10 @@ ATR_PCT_MINI            = 0.30   # ATR (volatilité) min en % du prix pour ouvri
 # et le résultat net des PROCHAINS trades — pas une certitude, une hypothèse
 # à valider sur de nouvelles données (les 8 trades déjà vus ne peuvent pas
 # servir à eux-mêmes de preuve, voir discussion du 09/07).
-STOP_LOSS_PCT           = 0.0075  # stop = 0.75% du prix d'entrée — évolue avec la taille de position, contrairement à un stop fixe en €
+STOP_LOSS_PCT           = 0.0038  # 13/07 — stop RÉDUIT à 0.38% (≈ -2€ sur ~525€ de notionnel),
+                                    # sur demande de Damien. Config "petit stop / gros objectifs" :
+                                    # risquer ~2€ pour viser +4/6/8/12€. Attention data : seuls 3%
+                                    # des trades atteignent +4€, 0% atteint +8€. À tester tel quel.
 # ── BREAKEVEN ANTICIPÉ (11/07, demandé par Damien) — neutralise le RISQUE plus
 # tôt que le palier 1. Analyse des trades : les grosses pertes ne sont PAS des
 # gains coupés trop court, ce sont des trades partis à contresens dès l'entrée
@@ -285,19 +288,16 @@ SEUIL_CAPITAL_BTC       = 6000.0  # capital mini pour que BTCUSD soit inclus dan
 # dans le pire cas observé, sans revenir aux 0.30% d'avant la demande de
 # Damien. Palier 0.36% ajouté le 07/07 (12:50), conservé.
 LOCK_PALIERS_PCT = [
-    0.22, 0.28, 0.36, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
-    1.80, 2.20, 2.60, 3.20, 3.80, 4.60, 5.50, 6.50, 7.50, 9.00,
-    10.00, 12.50, 15.00, 17.50, 20.00, 25.00, 30.00, 45.00, 60.00,
+    0.78, 1.17, 1.56, 2.34,
 ]
-# ── 1er palier RABAISSÉ à 0.22% le 13/07 (0.28% -> 0.22%). Analyse : 29% des
-# gagnants ne franchissaient pas l'ancien 1er palier (0.28% ≈ +1.48€) et
-# relâchaient presque tout (sommets +0.94/+1.12/+1.39€ perdus). Le palier étant
-# un PLANCHER (pas une sortie), en poser un plus bas ne bride pas les trades qui
-# montent plus haut — ils verrouillent les paliers suivants en grimpant — mais
-# sécurise ceux qui plafonnent vers +1.2-1.5€. Choisi 0.22% (et non 0.20%) : même
-# capture totale mais NET +0.54€/lock au lieu de +0.43€ → marge confortable
-# au-dessus des frais+slippage (seuil de perte à 0.10%). À valider sur données
-# propres post-filtre (révise la suppression des bas paliers du 07/07).
+# ── PALIERS REDÉFINIS le 13/07 sur demande de Damien — config "gros objectifs" :
+#   +4€ (0.78%), +6€ (1.17%), +8€ (1.56%), +12€ (2.34%) — en % du capital ~513€.
+#   Stop associé à -2€ (voir STOP_LOSS_PCT). Objectif : renverser le ratio
+#   gain/perte (risquer 2€ pour viser 4-12€), approche "laisser courir".
+#   ⚠️ DATA : sur 60 trades vifs, seuls 2 (3%) atteignent +4€, 0 atteint +8€ ou
+#   +12€ (pic max jamais atteint = +7.55€). Ces deux derniers paliers ne se
+#   déclencheront donc jamais en l'état. Config testée à la demande explicite ;
+#   à comparer sur plusieurs jours avec l'ancienne.
 
 def get_palier_lock(pnl_max, capital):
     """Retourne le gain garanti selon le PnL max atteint — proportionnel au capital."""
