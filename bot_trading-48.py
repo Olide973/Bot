@@ -1764,9 +1764,14 @@ async def get_prix_rest(session, symbole):
             result = data.get("data", [])
             if not result:
                 return None
-            return float(result[0]["last"])
+            dernier = (result[0].get("last") or "").strip()
+            if not dernier or dernier in ("0", "0.0"):   # OKX renvoie parfois un prix vide (pas de tick récent) → on saute proprement
+                return None
+            return float(dernier)
+    except (ValueError, TypeError):
+        return None                                       # valeur non convertible (rare) — on saute sans polluer les logs
     except Exception as e:
-        log.error(f"Erreur prix REST {symbole} : {e}")
+        log.error(f"Erreur prix REST {symbole} : {type(e).__name__}: {e}")
         return None
 
 async def get_prix_actuel(session, symbole):
@@ -1862,9 +1867,14 @@ async def get_prix_reel_instid(session, inst_id):
             result = data.get("data", [])
             if not result:
                 return None
-            return float(result[0]["last"])
+            dernier = (result[0].get("last") or "").strip()
+            if not dernier or dernier in ("0", "0.0"):
+                return None
+            return float(dernier)
+    except (ValueError, TypeError):
+        return None
     except Exception as e:
-        log.error(f"Erreur prix REST (instId réel) {inst_id} : {e}")
+        log.error(f"Erreur prix REST (instId réel) {inst_id} : {type(e).__name__}: {e}")
         return None
 
 async def _ws_keepalive(ws):
