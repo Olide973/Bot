@@ -313,8 +313,26 @@ def palier_pose_plancher_dur(index_lock):
     return index_lock >= 1
 
 # ── Gestion mise dynamique
-WINS_CONFIANCE          = 3
+# ── BOOST DÉSACTIVÉ (12/07) — le boost gonflait la mise après 3 gains d'affilée,
+# donc le bot pariait PLUS GROS juste après une bonne série… et un gap tombait
+# pile sur cette mise gonflée (ex : LINKUSD -17,29€ sur une position à 641€ au
+# lieu de 538€). Comme les gains sont petits et les gaps énormes, sur-miser après
+# des gains amplifie surtout la casse. Mis à 999999 = ne se déclenche jamais.
+# Remettre à 3 pour réactiver le boost.
+WINS_CONFIANCE          = 999999
 BOOST_CONFIANCE         = 1.20
+
+# ── PAUSE AUTOMATIQUE DES MARCHÉS QUI GAPPENT (12/07) — le bot surveille lui-même
+# les gaps par marché sur une fenêtre glissante et met en pause tout seul ceux qui
+# déraillent (puis les réactive s'ils se calment). C'est la donnée qui décide en
+# continu, pas une liste figée. Un "gap" = un trade fermé au stop dont la perte a
+# dépassé le stop prévu d'un facteur (le prix a sauté À TRAVERS le stop). Analyse
+# sur 5 jours : 28 gaps = -211€, tout le reste = +70€ → les gaps SONT le problème,
+# et ils viennent de quelques marchés récidivistes (HYPE, ADA, INJ, LINK).
+GAP_FENETRE_JOURS       = 7       # fenêtre glissante d'observation des gaps
+GAP_FACTEUR_STOP        = 1.4     # perte > 1.4x le stop attendu = gap (a sauté à travers)
+GAP_NB_POUR_PAUSE       = 2       # ce nombre de gaps dans la fenêtre → marché en pause
+GAP_PERTE_CUMULEE_PAUSE = -12.0   # OU cette perte cumulée de gaps (€) → pause (capte un seul gap énorme)
 
 # ── Frais OKX réels (X-Perps, palier standard/non-VIP — identiques aux Swaps Perpétuels classiques)
 # Maker 0.02% / Taker 0.05% du notionnel — le bot sort au marché à l'ouverture
@@ -391,6 +409,40 @@ def _sens_effectif(direction):
     if not INVERSER_SENS or direction == "NEUTRE":
         return direction
     return "VENTE" if direction == "ACHAT" else "ACHAT"
+
+def _gaps_recents(symbole, etat):
+    """Renvoie (nb_gaps, perte_cumulée) des gaps du marché encore DANS la fenêtre
+    glissante. Élague au passage les gaps trop vieux pour garder l'état léger."""
+    tous = etat.get("gaps_par_marche", {}).get(symbole, [])
+    limite = time.time() - GAP_FENETRE_JOURS * 86400
+    recents = [g for g in tous if g.get("ts", 0) >= limite]
+    if len(recents) != len(tous):                       # purge des gaps périmés
+        etat.setdefault("gaps_par_marche", {})[symbole] = recents
+    nb = len(recents)
+    perte = round(sum(g.get("perte", 0.0) for g in recents), 2)
+    return nb, perte
+
+def _marche_en_pause_gap(symbole, etat):
+    """True si le marché a trop gappé récemment (trop de gaps OU une perte de gaps
+    cumulée trop lourde dans la fenêtre). Purement piloté par les données : dès que
+    les gaps sortent de la fenêtre, le marché se réactive tout seul."""
+    nb, perte = _gaps_recents(symbole, etat)
+    return nb >= GAP_NB_POUR_PAUSE or perte <= GAP_PERTE_CUMULEE_PAUSE
+
+def _enregistrer_gap_si_besoin(symbole, gain_final, motif_sortie, position, etat):
+    """À la fermeture d'un trade : si c'est un gap (fermé au stop, perte au-delà du
+    stop attendu par le facteur), l'enregistre dans l'état. Renvoie True si ce gap
+    vient JUSTE de faire basculer le marché en pause (pour notifier une seule fois)."""
+    if motif_sortie not in ("STOP_NATIF", "STOP_INTERNE"):
+        return False
+    perte_stop_attendue = position * STOP_LOSS_PCT               # ~ perte prix du stop, en €
+    if gain_final >= -perte_stop_attendue * GAP_FACTEUR_STOP:    # pas assez au-delà du stop → pas un gap
+        return False
+    etait_en_pause = _marche_en_pause_gap(symbole, etat)
+    etat.setdefault("gaps_par_marche", {}).setdefault(symbole, []).append(
+        {"ts": time.time(), "perte": round(gain_final, 2)}
+    )
+    return (not etait_en_pause) and _marche_en_pause_gap(symbole, etat)
 
 # ── Marchés — uniquement ceux à levier x10 sur OKX (X-Perps, compte France/EEA)
 # Chargés dynamiquement via API au démarrage et mis à jour chaque nuit à minuit
@@ -3656,6 +3708,22 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
             'cle_suivi':       cle_suivi,
         })
 
+    # ── Pause automatique des marchés qui gappent (12/07) — voir GAP_* et
+    # _enregistrer_gap_si_besoin. Si ce trade est un gap, on le mémorise ; s'il
+    # vient de faire basculer le marché en pause, on notifie une seule fois.
+    gap_a_bascule = _enregistrer_gap_si_besoin(symbole, round(gain_final, 2),
+                                               motif_sortie, position, etat_global)
+    if gap_a_bascule:
+        nb_g, perte_g = _gaps_recents(symbole, etat_global)
+        log.warning(f"  🚫 {symbole} MIS EN PAUSE (gaps) — {nb_g} gaps / {perte_g}€ sur "
+                    f"{GAP_FENETRE_JOURS}j. Plus de nouveaux trades dessus jusqu'à ce qu'il se calme.")
+        await telegram(session,
+            f"🚫 <b>MARCHÉ EN PAUSE — {symbole}</b>\n"
+            f"Trop de gaps récents : {nb_g} gaps pour {perte_g}€ sur {GAP_FENETRE_JOURS} jours.\n"
+            f"Le bot arrête d'ouvrir des trades sur ce marché. Il le réactivera "
+            f"automatiquement quand les gaps sortiront de la fenêtre (marché redevenu calme)."
+        )
+
     if alerte_perte_a_envoyer:
         await telegram(session,
             f"🆘 <b>ALERTE PERTE CAPITAL</b>\n"
@@ -5010,15 +5078,21 @@ async def boucle_principale():
                 async with trades_lock:
                     slots_libres        = MAX_TRADES_SIMULTANES - len(trades_ouverts)
                     marches_actifs      = get_marches_actifs()
+                    # ── Pause auto des marchés qui gappent (12/07) — voir _marche_en_pause_gap.
+                    marches_en_pause    = [m for m in marches_actifs if _marche_en_pause_gap(m, etat)]
                     marches_disponibles = [
                         m for m in marches_actifs
                         if m not in trades_ouverts
                         and time.time() >= cooldown_marches.get(m, 0)
+                        and not _marche_en_pause_gap(m, etat)   # exclut les marchés qui gappent trop
                         # BTCUSD retiré tant que le capital ne permet pas 1 contrat entier
                         # (ctVal=1 ≈ 1 BTC de notionnel par contrat) — uniquement en
                         # MODE_REEL, où cette contrainte existe réellement. Voir SEUIL_CAPITAL_BTC
                         and not (MODE_REEL and m == "BTCUSD" and etat["capital"] < SEUIL_CAPITAL_BTC)
                     ]
+
+                if marches_en_pause:
+                    log.info(f"  ⏸️ En pause (gaps récents) : {', '.join(marches_en_pause)}")
 
                 if slots_libres <= 0:
                     log.info(f"  {MAX_TRADES_SIMULTANES}/{MAX_TRADES_SIMULTANES} trades — attente...")
