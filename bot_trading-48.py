@@ -148,11 +148,14 @@ def dans_fenetre_pre_funding():
         prochains.append(t)
     prochain = min(prochains)
     return (prochain - maintenant).total_seconds() <= FENETRE_PRE_FUNDING_MIN * 60
-TRAIL_RATIO_POST_PALIER1 = 0.002   # 08/07 (05:34) — ajusté à 0.20% suite au retrait du
-                                     # palier 0.20% (retour à 28 paliers, premier à 0.30%).
-                                     # Historique : 0.30% d'origine jugé trop large (give-back
-                                     # de 70% sur un petit pic de 2.81€) -> resserré à 0.10% ->
-                                     # repassé à 0.20% ici, sur demande explicite.
+TRAIL_RATIO_POST_PALIER1 = 0.0014  # 13/07 — RESSERRÉ de 0.20% à 0.14%. Analyse sur 24
+                                     # gagnants (marchés vifs) : sommet moyen +1.93€ mais
+                                     # encaissé +0.83€ → le trailing rendait ~+1.1€ (57% du
+                                     # pic !). Les gagnants montent peu (rares > +3€), donc
+                                     # relâcher moins et verrouiller plus près du pic rapporte
+                                     # plus que laisser courir. Compromis modéré (pas 0.10%),
+                                     # à valider sur données propres. Historique : 0.30% ->
+                                     # 0.10% -> 0.20% -> 0.14% ici.
 
 # ── Détection signal mean reversion — surveillance temps réel
 SEUIL_MOUVEMENT_PCT     = 0.50   # dès que le prix bouge de 0.50% → signal
@@ -177,7 +180,16 @@ SEUIL_MOUVEMENT_MAX_PCT = 1.20   # au-delà : mouvement trop violent → pas d'e
 # validation sur un ÉCHANTILLON JAMAIS VU (pas les mêmes trades qui ont
 # servi à choisir le seuil — sinon on cale le bot sur le bruit du moment,
 # pas sur un vrai signal durable).
-VOLUME_MINI             = 0.20   # volume min vs moyenne 24h
+VOLUME_MINI             = 0.50   # volume min vs moyenne 24h
+# ── RELEVÉ de 0.20x à 0.50x le 13/07 — analyse sur ~100 trades réels :
+# Volume < 0.5x → WR 38% (catastrophe), Volume 1-2x → WR 76%. Les marchés
+# à faible volume ne bougent pas vraiment (chop) : le rebound de mean-reversion
+# ne vient jamais, on se fait sortir dans les deux sens. On ne les trade plus.
+ATR_PCT_MINI            = 0.30   # ATR (volatilité) min en % du prix pour ouvrir un trade
+# ── AJOUTÉ le 13/07 — même analyse : ATR < 0.3% (marché calme) → WR 39%,
+# ATR >= 0.3% → WR 60-64%. Un marché sans volatilité ne donne pas de rebond
+# exploitable. Combiné au volume, ces deux filtres font passer le WR de 56% à
+# ~74% sur les données observées. À valider sur données propres post-filtre.
 # ── ÉLARGI de 0.60% à 0.75% le 09/07 — analyse du suivi post-stop sur un lot
 # de 8 stops en simulation : 6/8 sont repartis en sens favorable dans les 15
 # minutes suivant la fermeture (voir suivre_prix_post_stop). Élargissement
@@ -273,10 +285,19 @@ SEUIL_CAPITAL_BTC       = 6000.0  # capital mini pour que BTCUSD soit inclus dan
 # dans le pire cas observé, sans revenir aux 0.30% d'avant la demande de
 # Damien. Palier 0.36% ajouté le 07/07 (12:50), conservé.
 LOCK_PALIERS_PCT = [
-    0.28, 0.36, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
+    0.22, 0.28, 0.36, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
     1.80, 2.20, 2.60, 3.20, 3.80, 4.60, 5.50, 6.50, 7.50, 9.00,
     10.00, 12.50, 15.00, 17.50, 20.00, 25.00, 30.00, 45.00, 60.00,
 ]
+# ── 1er palier RABAISSÉ à 0.22% le 13/07 (0.28% -> 0.22%). Analyse : 29% des
+# gagnants ne franchissaient pas l'ancien 1er palier (0.28% ≈ +1.48€) et
+# relâchaient presque tout (sommets +0.94/+1.12/+1.39€ perdus). Le palier étant
+# un PLANCHER (pas une sortie), en poser un plus bas ne bride pas les trades qui
+# montent plus haut — ils verrouillent les paliers suivants en grimpant — mais
+# sécurise ceux qui plafonnent vers +1.2-1.5€. Choisi 0.22% (et non 0.20%) : même
+# capture totale mais NET +0.54€/lock au lieu de +0.43€ → marge confortable
+# au-dessus des frais+slippage (seuil de perte à 0.10%). À valider sur données
+# propres post-filtre (révise la suppression des bas paliers du 07/07).
 
 def get_palier_lock(pnl_max, capital):
     """Retourne le gain garanti selon le PnL max atteint — proportionnel au capital."""
@@ -2037,9 +2058,15 @@ async def analyser_marche(session, symbole):
     if df_1h is not None and len(df_1h) >= 20:
         rsi_1h = calc_rsi_1h(df_1h, RSI_PERIODE)
 
-    # Filtre volume
+    # Filtre volume — marchés mous = chop, à éviter (voir VOLUME_MINI)
     if vol_ratio < VOLUME_MINI:
         log.info(f"  {symbole} : Vol {vol_ratio:.2f}x | Variation={variation_pct:+.2f}% → skip volume")
+        return "NEUTRE", {}
+
+    # Filtre ATR — marché sans volatilité = pas de rebond exploitable (voir ATR_PCT_MINI)
+    atr_pct_courant = round(atr_val / prix_actuel * 100, 3) if prix_actuel else 0.0
+    if atr_pct_courant < ATR_PCT_MINI:
+        log.info(f"  {symbole} : ATR {atr_pct_courant:.2f}% (< {ATR_PCT_MINI}%) | Variation={variation_pct:+.2f}% → skip ATR (marché trop calme)")
         return "NEUTRE", {}
 
     details = {
