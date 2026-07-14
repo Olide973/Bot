@@ -203,12 +203,19 @@ ATR_PCT_MINI            = 0.30   # ATR (volatilité) min en % du prix pour ouvri
 # et le résultat net des PROCHAINS trades — pas une certitude, une hypothèse
 # à valider sur de nouvelles données (les 8 trades déjà vus ne peuvent pas
 # servir à eux-mêmes de preuve, voir discussion du 09/07).
-STOP_LOSS_PCT           = 0.0065  # 14/07 — stop à 0.65% (≈ -3.4€). Compromis calibré : le -2€
-                                    # (0.38%) se faisait whipsawer (9 stops sur 12 repartaient
-                                    # dans l'autre sens), le -4€ d'origine faisait des pertes trop
-                                    # grosses. Les retournements post-stop observés font ~0.1-0.5%,
-                                    # donc 0.65% passe au-dessus de la plupart sans trop alourdir
-                                    # les pertes. Meilleur compromis WR / taille de perte trouvé.
+STOP_LOSS_PCT           = 0.0065  # Stop de REPLI (%) — sert quand l'ATR est inconnu (reprise d'un
+                                    # trade après redémarrage). En marche normale, le stop est
+                                    # ADAPTATIF à l'ATR (voir ci-dessous). 0.65% = compromis calibré :
+                                    # le -2€ (0.38%) whipsawait (9 stops sur 12 repartaient dans
+                                    # l'autre sens), le -4€ faisait des pertes trop grosses.
+# ── STOP ADAPTATIF À L'ATR (14/07, demandé par Damien) — au lieu d'un stop fixe
+# identique partout, le stop se cale sur la volatilité du marché : nerveux = stop
+# plus large (on ne se fait pas sortir sur du bruit), calme = stop plus serré.
+# stop% = STOP_ATR_MULT × ATR% du marché, borné entre un plancher et un plafond.
+# Réglé pour qu'à l'ATR médian (~0.4%) le stop tombe vers 0.6% (proche de l'actuel).
+STOP_ATR_MULT           = 1.5     # stop = 1.5 × ATR du marché
+STOP_PCT_MIN            = 0.0045  # plancher du stop : 0.45% (marché très calme)
+STOP_PCT_MAX            = 0.0110  # plafond du stop : 1.10% (marché très nerveux)
 # ── BREAKEVEN ANTICIPÉ (11/07, demandé par Damien) — neutralise le RISQUE plus
 # tôt que le palier 1. Analyse des trades : les grosses pertes ne sont PAS des
 # gains coupés trop court, ce sont des trades partis à contresens dès l'entrée
@@ -270,7 +277,16 @@ RSI_PERIODE             = 14
 # grossissait beaucoup. La journée du 08/07 (-13€, -2.4%) serait passée
 # JUSTE sous ce nouveau seuil — c'est voulu : une journée comme celle-là
 # doit pouvoir se produire sans tout couper, mais pas beaucoup pire.
-KILL_SWITCH_PCT         = 0.04     # perte max par jour en % du capital
+KILL_SWITCH_ACTIF       = False    # 14/07 (demandé par Damien) — kill switch quotidien DÉSACTIVÉ
+                                    # pour l'instant. En simulation il n'y a pas de capital réel à
+                                    # protéger et le kill switch ne faisait que couper la collecte de
+                                    # données les mauvais jours. Désactivé = le bot trade en continu et
+                                    # accumule plus de données. ⚠️ À RÉACTIVER (True) avant tout passage
+                                    # en argent réel : là, il te protège d'une journée catastrophe.
+KILL_SWITCH_PCT         = 0.06     # perte max par jour en % du capital. ÉLARGI de 4% à 6% le 14/07
+                                    # (demande de Damien : le -4% stoppait trop tôt). Donne plus de
+                                    # marge au bot, MAIS = de plus grosses pertes possibles un mauvais
+                                    # jour. Reste un garde-fou contre une journée catastrophe.
 KILL_SWITCH_JOUR        = -100.0   # plafond absolu (ne sert que si capital > 2500€)
 
 def seuil_kill_switch(capital):
@@ -278,6 +294,18 @@ def seuil_kill_switch(capital):
     borné par le plafond absolu KILL_SWITCH_JOUR."""
     return max(-abs(capital) * KILL_SWITCH_PCT, KILL_SWITCH_JOUR)
 SEUIL_RUINE             = 300.0
+SEUIL_RECHARGE_SIM      = 400.0   # 14/07 (demandé par Damien) — EN SIMULATION : seuil auquel le capital
+                                   # se recharge tout seul, AVANT d'avoir tout bouffé. Fixé plus haut que
+                                   # la ruine réelle (300€) pour ne pas laisser le capital saigner jusqu'au
+                                   # bout. Sert uniquement en simu ; en argent réel c'est SEUIL_RUINE qui
+                                   # commande l'arrêt. (À garder > SEUIL_RUINE.)
+AUTO_RECHARGE_SIM       = True    # 14/07 (demandé par Damien) — EN SIMULATION uniquement : à la
+                                   # ruine, le bot recharge son capital fictif à CAPITAL_INITIAL et
+                                   # CONTINUE, en gardant tout l'historique et les données d'adaptation.
+                                   # La simulation tourne ainsi en boucle sans jamais rien oublier, et
+                                   # sans jamais avoir besoin d'un RESET_TOUT (qui, lui, efface tout).
+                                   # En mode RÉEL c'est ignoré : on ne peut pas inventer de l'argent,
+                                   # le garde-fou de ruine reste un vrai arrêt.
 SEUIL_CAPITAL_BTC       = 6000.0  # capital mini pour que BTCUSD soit inclus dans le scan — sous ce seuil, 1 seul contrat BTC (ctVal=1 ≈ 1 BTC) coûte plus cher que toute la position ; BTC est retiré des marchés actifs jusqu'à ce que le capital dépasse ce seuil
 
 # ── Lock profits par paliers proportionnels au capital
@@ -364,6 +392,20 @@ GAP_PERTE_CUMULEE_PAUSE = -8.0    # OU cette perte cumulée de gaps (€) → pa
                                    # -8 le 14/07 : le gap LTCUSD à -11.60€ passait juste sous -12€
                                    # et ne déclenchait pas la pause. À -8€, un seul gros gap met le
                                    # marché en pause immédiatement.
+
+# ── ADAPTATION PAR MARCHÉ (14/07, idée de Damien) — 1ère couche d'un système
+# adaptatif : le bot surveille la PERFORMANCE NETTE de chaque marché sur une
+# fenêtre glissante et se retire tout seul de ceux qui saignent, puis y revient
+# s'ils se rétablissent. Différence avec la pause gaps : ici on juge le résultat
+# GLOBAL du marché (gaps + trades normaux), pas seulement les gaps. Point clé
+# anti-surapprentissage : il attend un minimum de trades avant de juger, et ne
+# pause que si la perte est FRANCHE (pas juste légèrement négative), pour ne pas
+# tout couper. Données observées : AVAX -26€, HYPE -19€, ADA -17€ = saigneurs
+# chroniques ; NEAR +6€ = à garder. La fenêtre repart de zéro au déploiement, donc
+# il faut quelques jours pour accumuler assez de trades avant qu'elle agisse.
+PERF_FENETRE_JOURS      = 7       # fenêtre glissante d'observation de la perf par marché
+PERF_MIN_TRADES         = 8       # minimum de trades dans la fenêtre avant de juger (anti-bruit)
+PERF_SEUIL_PAUSE        = -10.0   # perte nette cumulée (€) sur la fenêtre en dessous de laquelle on pause
 
 # ── Frais OKX réels (X-Perps, palier standard/non-VIP — identiques aux Swaps Perpétuels classiques)
 # Maker 0.02% / Taker 0.05% du notionnel — le bot sort au marché à l'ouverture
@@ -460,13 +502,14 @@ def _marche_en_pause_gap(symbole, etat):
     nb, perte = _gaps_recents(symbole, etat)
     return nb >= GAP_NB_POUR_PAUSE or perte <= GAP_PERTE_CUMULEE_PAUSE
 
-def _enregistrer_gap_si_besoin(symbole, gain_final, motif_sortie, position, etat):
+def _enregistrer_gap_si_besoin(symbole, gain_final, motif_sortie, position, stop_pct, etat):
     """À la fermeture d'un trade : si c'est un gap (fermé au stop, perte au-delà du
     stop attendu par le facteur), l'enregistre dans l'état. Renvoie True si ce gap
-    vient JUSTE de faire basculer le marché en pause (pour notifier une seule fois)."""
+    vient JUSTE de faire basculer le marché en pause (pour notifier une seule fois).
+    stop_pct = le stop RÉEL de ce trade (adaptatif), pour un calcul cohérent."""
     if motif_sortie not in ("STOP_NATIF", "STOP_INTERNE"):
         return False
-    perte_stop_attendue = position * STOP_LOSS_PCT               # ~ perte prix du stop, en €
+    perte_stop_attendue = position * stop_pct                   # perte prix du stop réel, en €
     if gain_final >= -perte_stop_attendue * GAP_FACTEUR_STOP:    # pas assez au-delà du stop → pas un gap
         return False
     etait_en_pause = _marche_en_pause_gap(symbole, etat)
@@ -474,6 +517,44 @@ def _enregistrer_gap_si_besoin(symbole, gain_final, motif_sortie, position, etat
         {"ts": time.time(), "perte": round(gain_final, 2)}
     )
     return (not etait_en_pause) and _marche_en_pause_gap(symbole, etat)
+
+def _perf_recente(symbole, etat):
+    """Renvoie (nb_trades, pnl_net_cumulé) du marché sur la fenêtre glissante de
+    performance. Élague les trades trop vieux pour garder l'état léger."""
+    tous = etat.get("perf_par_marche", {}).get(symbole, [])
+    limite = time.time() - PERF_FENETRE_JOURS * 86400
+    recents = [t for t in tous if t.get("ts", 0) >= limite]
+    if len(recents) != len(tous):
+        etat.setdefault("perf_par_marche", {})[symbole] = recents
+    return len(recents), round(sum(t.get("gain", 0.0) for t in recents), 2)
+
+def _marche_en_pause_perf(symbole, etat):
+    """True si le marché saigne franchement sur la fenêtre : assez de trades pour
+    juger (anti-bruit) ET perte nette cumulée sous le seuil. Se réactive seul quand
+    les vieux trades sortent de la fenêtre et que le bilan récent remonte."""
+    nb, pnl = _perf_recente(symbole, etat)
+    return nb >= PERF_MIN_TRADES and pnl <= PERF_SEUIL_PAUSE
+
+def _enregistrer_perf(symbole, gain_final, etat):
+    """À la fermeture de CHAQUE trade : mémorise son résultat net pour le suivi de
+    performance par marché. Renvoie True si ce trade vient JUSTE de faire basculer
+    le marché en pause perf (pour notifier une seule fois)."""
+    etait_en_pause = _marche_en_pause_perf(symbole, etat)
+    etat.setdefault("perf_par_marche", {}).setdefault(symbole, []).append(
+        {"ts": time.time(), "gain": round(gain_final, 2)}
+    )
+    return (not etait_en_pause) and _marche_en_pause_perf(symbole, etat)
+
+def _stop_pct_adaptatif(atr_pct):
+    """Stop loss adaptatif à la volatilité (ATR) du marché. Marché nerveux → stop
+    plus large (on ne se fait pas sortir sur du bruit) ; marché calme → stop plus
+    serré. Borné entre plancher et plafond pour rester raisonnable. Repli sur le
+    stop fixe si l'ATR est inconnu (ex : reprise d'un trade après redémarrage).
+    atr_pct est exprimé en POURCENT (ex 0.40 = 0.40%), on le repasse en ratio."""
+    if not atr_pct or atr_pct <= 0:
+        return STOP_LOSS_PCT
+    stop = STOP_ATR_MULT * (atr_pct / 100.0)
+    return round(max(STOP_PCT_MIN, min(stop, STOP_PCT_MAX)), 6)
 
 # ── Marchés — uniquement ceux à levier x10 sur OKX (X-Perps, compte France/EEA)
 # Chargés dynamiquement via API au démarrage et mis à jour chaque nuit à minuit
@@ -515,7 +596,8 @@ log.info(f"  Signal : mouvement >= {SEUIL_MOUVEMENT_PCT}% depuis le prix de réf
 log.info(f"  RSI 1h : seuil bas={RSI_SEUIL_BAS} | seuil haut={RSI_SEUIL_HAUT}")
 log.info(f"  Stop : {STOP_LOSS_PCT*100:.2f}% du prix d'entrée par trade")
 log.info(f"  Frais OKX : {OKX_TAKER_FEE*100:.2f}% ouv + {OKX_TAKER_FEE*100:.2f}% ferm (taker)")
-log.info(f"  Kill switch : -{KILL_SWITCH_PCT*100:.0f}%/jour du capital (plafond {KILL_SWITCH_JOUR}€) | Ruine : {SEUIL_RUINE}€")
+log.info(f"  Kill switch : {'-'+str(int(KILL_SWITCH_PCT*100))+'%/jour' if KILL_SWITCH_ACTIF else 'DÉSACTIVÉ'} | "
+         f"Ruine : {SEUIL_RUINE}€{' (recharge auto en simu)' if AUTO_RECHARGE_SIM else ''}")
 log.info(f"  Durée max par trade : {DUREE_MAX_MINUTES//60}h — fermeture forcée si ni stop ni lock atteint avant")
 log.info(f"  Telegram : {'ON' if TELEGRAM_TOKEN else 'OFF'}")
 log.info(f"  Mode : {'REEL' if MODE_REEL else 'SIMULATION'}")
@@ -2195,8 +2277,9 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
     mise = calculer_mise(capital, etat_global)
     position = round(mise * LEVIER, 2)
 
-    # Stop loss en pourcentage du prix d'entrée (fixe en %, pas en €)
-    ratio_prix    = STOP_LOSS_PCT
+    # Stop loss ADAPTATIF à la volatilité du marché (voir _stop_pct_adaptatif).
+    # Marché nerveux → stop plus large ; calme → plus serré. Repli sur le fixe si ATR absent.
+    ratio_prix    = _stop_pct_adaptatif(details.get("atr_pct"))
     stop_loss_eur = round(position * ratio_prix, 2)  # équivalent € affiché, dérivé du %
 
     rsi_1h = details.get("rsi_1h", 50.0)
@@ -3763,8 +3846,10 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
     # ── Pause automatique des marchés qui gappent (12/07) — voir GAP_* et
     # _enregistrer_gap_si_besoin. Si ce trade est un gap, on le mémorise ; s'il
     # vient de faire basculer le marché en pause, on notifie une seule fois.
+    # On passe le stop RÉEL de ce trade (adaptatif) pour un calcul cohérent.
+    stop_pct_reel = (abs(prix_entree - stop_initial) / prix_entree) if prix_entree else STOP_LOSS_PCT
     gap_a_bascule = _enregistrer_gap_si_besoin(symbole, round(gain_final, 2),
-                                               motif_sortie, position, etat_global)
+                                               motif_sortie, position, stop_pct_reel, etat_global)
     if gap_a_bascule:
         nb_g, perte_g = _gaps_recents(symbole, etat_global)
         log.warning(f"  🚫 {symbole} MIS EN PAUSE (gaps) — {nb_g} gaps / {perte_g}€ sur "
@@ -3774,6 +3859,21 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
             f"Trop de gaps récents : {nb_g} gaps pour {perte_g}€ sur {GAP_FENETRE_JOURS} jours.\n"
             f"Le bot arrête d'ouvrir des trades sur ce marché. Il le réactivera "
             f"automatiquement quand les gaps sortiront de la fenêtre (marché redevenu calme)."
+        )
+
+    # ── Adaptation par marché (14/07) — voir PERF_* et _enregistrer_perf. On
+    # mémorise le résultat net de CE trade ; si le marché vient de basculer en
+    # pause performance (saigne franchement sur assez de trades), on notifie.
+    perf_a_bascule = _enregistrer_perf(symbole, round(gain_final, 2), etat_global)
+    if perf_a_bascule:
+        nb_p, pnl_p = _perf_recente(symbole, etat_global)
+        log.warning(f"  📉 {symbole} MIS EN PAUSE (performance) — {pnl_p}€ sur {nb_p} trades / "
+                    f"{PERF_FENETRE_JOURS}j. Le bot s'en retire jusqu'à ce qu'il se rétablisse.")
+        await telegram(session,
+            f"📉 <b>MARCHÉ EN PAUSE — {symbole}</b> (performance)\n"
+            f"Ce marché saigne : {pnl_p}€ sur {nb_p} trades ({PERF_FENETRE_JOURS} jours).\n"
+            f"Le bot arrête d'y trader et se concentre sur les marchés qui se tiennent. "
+            f"Il y reviendra automatiquement si son bilan récent se redresse."
         )
 
     if alerte_perte_a_envoyer:
@@ -4169,11 +4269,14 @@ def verifier_protections(etat, capital):
     if capital < SEUIL_RUINE:
         log.critical(f"SEUIL RUINE ! Capital {capital}€ → ARRET")
         return "RUINE"
-    seuil_jour = seuil_kill_switch(capital)
-    if etat.get("pnl_jour", 0.0) <= seuil_jour:
-        log.warning(f"KILL SWITCH — PnL jour {etat.get('pnl_jour', 0)}€ "
-                    f"(seuil : {seuil_jour:.2f}€, soit -{KILL_SWITCH_PCT*100:.0f}% du capital)")
-        return "KILL_SWITCH"
+    # Kill switch quotidien — désactivable via KILL_SWITCH_ACTIF (voir ce param).
+    # La protection de ruine ci-dessus reste toujours active (avec recharge auto en simu).
+    if KILL_SWITCH_ACTIF:
+        seuil_jour = seuil_kill_switch(capital)
+        if etat.get("pnl_jour", 0.0) <= seuil_jour:
+            log.warning(f"KILL SWITCH — PnL jour {etat.get('pnl_jour', 0)}€ "
+                        f"(seuil : {seuil_jour:.2f}€, soit -{KILL_SWITCH_PCT*100:.0f}% du capital)")
+            return "KILL_SWITCH"
     return "OK"
 
 def reset_pnl_jour_si_nouveau_jour(etat):
@@ -5079,9 +5182,42 @@ async def boucle_principale():
                     etat["derniere_semaine"] = maintenant_utc.strftime('%Y-%W')
                     sauvegarder_etat(etat)
 
+                # ── Recharge auto en SIMULATION (14/07) — dès que le capital passe
+                # sous le seuil de recharge (AVANT d'avoir tout bouffé), on recharge
+                # le capital fictif et on CONTINUE, en gardant tout l'historique et
+                # les données d'adaptation (perf/gaps par marché). Se déclenche plus
+                # haut que la ruine. En mode RÉEL c'est ignoré (on ne peut pas inventer
+                # d'argent) : là c'est SEUIL_RUINE qui commande l'arrêt.
+                if (not MODE_REEL) and AUTO_RECHARGE_SIM and etat["capital"] <= SEUIL_RECHARGE_SIM:
+                    etat.setdefault("cycles_ruine", []).append({
+                        "ts": time.time(),
+                        "capital_atteint": round(etat["capital"], 2),
+                        "nb_trades_total": len(etat.get("historique", [])),
+                    })
+                    n_cycles = len(etat["cycles_ruine"])
+                    nb_tr    = len(etat.get("historique", []))
+                    log.warning(f"  🔄 Recharge auto (simulation) — capital "
+                                f"{round(etat['capital'],2)}€ → {CAPITAL_INITIAL}€. "
+                                f"Cycle n°{n_cycles}. Données CONSERVÉES ({nb_tr} trades).")
+                    await telegram(session,
+                        f"🔄 <b>RECHARGE AUTO (simulation)</b>\n"
+                        f"Capital descendu à {round(etat['capital'],2)}€ (seuil {SEUIL_RECHARGE_SIM}€) "
+                        f"→ rechargé à {CAPITAL_INITIAL}€.\n"
+                        f"Cycle n°{n_cycles}. Toutes les données sont conservées "
+                        f"({nb_tr} trades mémorisés) — le bot continue d'apprendre sans rien perdre."
+                    )
+                    etat["capital"]  = CAPITAL_INITIAL
+                    etat["pnl_jour"] = 0.0
+                    sauvegarder_etat(etat)
+                    await asyncio.sleep(2)
+                    continue
+
                 # Vérification protections
                 statut = verifier_protections(etat, etat["capital"])
                 if statut == "RUINE":
+                    # Mode RÉEL : arrêt véritable (on ne peut pas inventer d'argent).
+                    # En simulation ce point n'est jamais atteint — la recharge ci-dessus
+                    # se déclenche plus haut (SEUIL_RECHARGE_SIM > SEUIL_RUINE).
                     await telegram(session,
                         f"🚨 <b>SEUIL RUINE !</b>\nCapital : {etat['capital']}€\nBot arrêté !")
                     break
@@ -5132,11 +5268,13 @@ async def boucle_principale():
                     marches_actifs      = get_marches_actifs()
                     # ── Pause auto des marchés qui gappent (12/07) — voir _marche_en_pause_gap.
                     marches_en_pause    = [m for m in marches_actifs if _marche_en_pause_gap(m, etat)]
+                    marches_pause_perf  = [m for m in marches_actifs if _marche_en_pause_perf(m, etat)]
                     marches_disponibles = [
                         m for m in marches_actifs
                         if m not in trades_ouverts
                         and time.time() >= cooldown_marches.get(m, 0)
                         and not _marche_en_pause_gap(m, etat)   # exclut les marchés qui gappent trop
+                        and not _marche_en_pause_perf(m, etat)  # exclut les marchés qui saignent (adaptation par marché)
                         # BTCUSD retiré tant que le capital ne permet pas 1 contrat entier
                         # (ctVal=1 ≈ 1 BTC de notionnel par contrat) — uniquement en
                         # MODE_REEL, où cette contrainte existe réellement. Voir SEUIL_CAPITAL_BTC
@@ -5145,6 +5283,8 @@ async def boucle_principale():
 
                 if marches_en_pause:
                     log.info(f"  ⏸️ En pause (gaps récents) : {', '.join(marches_en_pause)}")
+                if marches_pause_perf:
+                    log.info(f"  📉 En pause (performance) : {', '.join(marches_pause_perf)}")
 
                 if slots_libres <= 0:
                     log.info(f"  {MAX_TRADES_SIMULTANES}/{MAX_TRADES_SIMULTANES} trades — attente...")
