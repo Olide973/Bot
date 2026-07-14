@@ -405,7 +405,21 @@ GAP_PERTE_CUMULEE_PAUSE = -8.0    # OU cette perte cumulée de gaps (€) → pa
 # il faut quelques jours pour accumuler assez de trades avant qu'elle agisse.
 PERF_FENETRE_JOURS      = 7       # fenêtre glissante d'observation de la perf par marché
 PERF_MIN_TRADES         = 8       # minimum de trades dans la fenêtre avant de juger (anti-bruit)
-PERF_SEUIL_PAUSE        = -10.0   # perte nette cumulée (€) sur la fenêtre en dessous de laquelle on pause
+PERF_SEUIL_PAUSE        = -10.0   # perte nette cumulée (€) au niveau de laquelle la taille tombe au minimum
+TAILLE_MIN_MARCHE       = 0.25    # 14/07 (demandé par Damien) — au lieu d'ÉLIMINER un marché qui saigne,
+                                   # on RÉDUIT sa taille de position (curseur, pas interrupteur). Un marché
+                                   # qui gagne garde 100% ; un marché qui saigne descend progressivement
+                                   # jusqu'à ce plancher (25%) ; il n'est JAMAIS mis à zéro, donc il garde
+                                   # sa chance de rapporter et remonte tout seul s'il se rétablit.
+# ── APPRENTISSAGE DE DIRECTION PAR MARCHÉ (14/07, idée "recette" de Damien) — le
+# bot apprend, marché par marché, si FADER ou SUIVRE rapporte le plus, à partir de
+# son propre historique récent, et ne garde QUE le bon mode pour chaque marché.
+# C'est le "dosage" par marché : NEAR se fade bien, LTC se suit bien, etc. Se met à
+# jour en continu. Garde-fou anti-surapprentissage FORT : il faut assez de trades
+# DANS CHAQUE mode avant de trancher (sinon on calibre sur du bruit). Tant que le
+# minimum n'est pas atteint pour un marché, les deux modes restent autorisés.
+MODE_MIN_TRADES         = 10      # minimum de trades DANS CHAQUE mode (fade ET suivre) avant de préférer
+MODE_ECART_MINI         = 5.0     # écart minimal de P&L total (€) entre les 2 modes pour trancher
 
 # ── Frais OKX réels (X-Perps, palier standard/non-VIP — identiques aux Swaps Perpétuels classiques)
 # Maker 0.02% / Taker 0.05% du notionnel — le bot sort au marché à l'ouverture
@@ -535,15 +549,38 @@ def _marche_en_pause_perf(symbole, etat):
     nb, pnl = _perf_recente(symbole, etat)
     return nb >= PERF_MIN_TRADES and pnl <= PERF_SEUIL_PAUSE
 
-def _enregistrer_perf(symbole, gain_final, etat):
-    """À la fermeture de CHAQUE trade : mémorise son résultat net pour le suivi de
-    performance par marché. Renvoie True si ce trade vient JUSTE de faire basculer
-    le marché en pause perf (pour notifier une seule fois)."""
-    etait_en_pause = _marche_en_pause_perf(symbole, etat)
+def _enregistrer_perf(symbole, gain_final, mode, etat):
+    """À la fermeture de CHAQUE trade : mémorise son résultat net ET son mode
+    (fade/follow) pour le suivi de performance et l'apprentissage de direction par
+    marché. Renvoie True si ce trade vient JUSTE de faire tomber le marché à la
+    taille minimale (pour notifier une seule fois)."""
+    etait_min = _marche_en_pause_perf(symbole, etat)
     etat.setdefault("perf_par_marche", {}).setdefault(symbole, []).append(
-        {"ts": time.time(), "gain": round(gain_final, 2)}
+        {"ts": time.time(), "gain": round(gain_final, 2), "mode": mode}
     )
-    return (not etait_en_pause) and _marche_en_pause_perf(symbole, etat)
+    return (not etait_min) and _marche_en_pause_perf(symbole, etat)
+
+def _mode_trade(rsi):
+    """Classe un trade : 'follow' si RSI extrême (on suit la tendance), 'fade' sinon
+    (mean-reversion). Correspond exactement à la logique de direction du bot."""
+    return "follow" if (rsi < RSI_SEUIL_BAS or rsi > RSI_SEUIL_HAUT) else "fade"
+
+def _mode_prefere_marche(symbole, etat):
+    """Apprend, par marché, si FADER ou SUIVRE rapporte le plus, à partir de son
+    historique récent (fenêtre PERF). Renvoie 'fade', 'follow', ou None (pas de
+    préférence : pas assez de données dans un des modes, ou les deux se valent).
+    Se met à jour en continu au fil des trades. C'est la 'recette' par marché."""
+    nb, _ = _perf_recente(symbole, etat)  # élague la fenêtre au passage
+    recs = etat.get("perf_par_marche", {}).get(symbole, [])
+    fade   = [r for r in recs if r.get("mode") == "fade"]
+    follow = [r for r in recs if r.get("mode") == "follow"]
+    if len(fade) < MODE_MIN_TRADES or len(follow) < MODE_MIN_TRADES:
+        return None                       # pas assez de données dans un mode → pas de tri
+    pnl_fade   = sum(r.get("gain", 0.0) for r in fade)
+    pnl_follow = sum(r.get("gain", 0.0) for r in follow)
+    if abs(pnl_fade - pnl_follow) < MODE_ECART_MINI:
+        return None                       # trop proche → on ne tranche pas
+    return "fade" if pnl_fade > pnl_follow else "follow"
 
 def _stop_pct_adaptatif(atr_pct):
     """Stop loss adaptatif à la volatilité (ATR) du marché. Marché nerveux → stop
@@ -555,6 +592,25 @@ def _stop_pct_adaptatif(atr_pct):
         return STOP_LOSS_PCT
     stop = STOP_ATR_MULT * (atr_pct / 100.0)
     return round(max(STOP_PCT_MIN, min(stop, STOP_PCT_MAX)), 6)
+
+def _facteur_taille_marche(symbole, etat):
+    """Adaptation par marché (14/07) — au lieu d'éliminer un marché qui saigne, on
+    module la TAILLE de sa position selon sa performance récente. Renvoie un facteur
+    entre TAILLE_MIN_MARCHE (marché qui saigne franchement) et 1.0 (marché rentable
+    ou pas encore assez de données). Le marché n'est JAMAIS éliminé : il garde sa
+    chance de rapporter, et sa taille remonte seule s'il se rétablit.
+      - moins de PERF_MIN_TRADES trades  → 1.0 (pas de jugement sur du bruit)
+      - perf récente >= 0                → 1.0 (rentable, pleine taille)
+      - perf <= PERF_SEUIL_PAUSE         → TAILLE_MIN_MARCHE (saigne, taille mini)
+      - entre les deux                   → interpolation linéaire 1.0 → mini
+    (Pas de facteur > 1.0 : booster un marché amplifierait ses gaps, on l'a vu.)"""
+    nb, pnl = _perf_recente(symbole, etat)
+    if nb < PERF_MIN_TRADES or pnl >= 0:
+        return 1.0
+    if pnl <= PERF_SEUIL_PAUSE:
+        return TAILLE_MIN_MARCHE
+    frac = pnl / PERF_SEUIL_PAUSE            # 0 (à pnl=0) → 1 (à pnl=seuil)
+    return round(1.0 - frac * (1.0 - TAILLE_MIN_MARCHE), 3)
 
 # ── Marchés — uniquement ceux à levier x10 sur OKX (X-Perps, compte France/EEA)
 # Chargés dynamiquement via API au démarrage et mis à jour chaque nuit à minuit
@@ -2274,8 +2330,15 @@ async def executer_trade(session, symbole, direction, capital, details, etat_glo
             trades_ouverts.pop(symbole, None)
         return
 
-    mise = calculer_mise(capital, etat_global)
+    # Taille de base, MODULÉE par la performance récente du marché (voir
+    # _facteur_taille_marche) : un marché qui saigne trade en réduit plutôt qu'être
+    # éliminé ; un marché rentable garde 100%. Jamais mis à zéro.
+    facteur_marche = _facteur_taille_marche(symbole, etat_global)
+    mise = round(calculer_mise(capital, etat_global) * facteur_marche, 2)
     position = round(mise * LEVIER, 2)
+    if facteur_marche < 1.0:
+        log.info(f"  {symbole} : taille réduite à {int(facteur_marche*100)}% "
+                 f"(perf récente faible) → mise {mise}€")
 
     # Stop loss ADAPTATIF à la volatilité du marché (voir _stop_pct_adaptatif).
     # Marché nerveux → stop plus large ; calme → plus serré. Repli sur le fixe si ATR absent.
@@ -3852,28 +3915,29 @@ async def surveiller_et_fermer_trade(session, symbole, direction, mise, capital,
                                                motif_sortie, position, stop_pct_reel, etat_global)
     if gap_a_bascule:
         nb_g, perte_g = _gaps_recents(symbole, etat_global)
-        log.warning(f"  🚫 {symbole} MIS EN PAUSE (gaps) — {nb_g} gaps / {perte_g}€ sur "
-                    f"{GAP_FENETRE_JOURS}j. Plus de nouveaux trades dessus jusqu'à ce qu'il se calme.")
+        log.warning(f"  ⚠️ {symbole} — gaps récents : {nb_g} gaps / {perte_g}€ sur "
+                    f"{GAP_FENETRE_JOURS}j. Taille de position réduite (pas éliminé).")
         await telegram(session,
-            f"🚫 <b>MARCHÉ EN PAUSE — {symbole}</b>\n"
-            f"Trop de gaps récents : {nb_g} gaps pour {perte_g}€ sur {GAP_FENETRE_JOURS} jours.\n"
-            f"Le bot arrête d'ouvrir des trades sur ce marché. Il le réactivera "
-            f"automatiquement quand les gaps sortiront de la fenêtre (marché redevenu calme)."
+            f"⚠️ <b>{symbole} — gaps récents</b>\n"
+            f"{nb_g} gaps pour {perte_g}€ sur {GAP_FENETRE_JOURS} jours.\n"
+            f"Le bot continue de trader ce marché mais en <b>taille réduite</b> (il n'est pas "
+            f"éliminé). Sa taille remontera toute seule si sa performance se redresse."
         )
 
     # ── Adaptation par marché (14/07) — voir PERF_* et _enregistrer_perf. On
-    # mémorise le résultat net de CE trade ; si le marché vient de basculer en
-    # pause performance (saigne franchement sur assez de trades), on notifie.
-    perf_a_bascule = _enregistrer_perf(symbole, round(gain_final, 2), etat_global)
+    # mémorise le résultat net de CE trade ; si le marché vient de basculer sous le
+    # seuil (taille désormais minimale), on notifie une seule fois.
+    perf_a_bascule = _enregistrer_perf(symbole, round(gain_final, 2), _mode_trade(rsi_1h), etat_global)
     if perf_a_bascule:
         nb_p, pnl_p = _perf_recente(symbole, etat_global)
-        log.warning(f"  📉 {symbole} MIS EN PAUSE (performance) — {pnl_p}€ sur {nb_p} trades / "
-                    f"{PERF_FENETRE_JOURS}j. Le bot s'en retire jusqu'à ce qu'il se rétablisse.")
+        log.warning(f"  📉 {symbole} — taille MINIMALE ({int(TAILLE_MIN_MARCHE*100)}%) : "
+                    f"{pnl_p}€ sur {nb_p} trades / {PERF_FENETRE_JOURS}j. Pas éliminé.")
         await telegram(session,
-            f"📉 <b>MARCHÉ EN PAUSE — {symbole}</b> (performance)\n"
+            f"📉 <b>{symbole} — taille réduite au minimum</b>\n"
             f"Ce marché saigne : {pnl_p}€ sur {nb_p} trades ({PERF_FENETRE_JOURS} jours).\n"
-            f"Le bot arrête d'y trader et se concentre sur les marchés qui se tiennent. "
-            f"Il y reviendra automatiquement si son bilan récent se redresse."
+            f"Le bot le trade maintenant en taille minimale ({int(TAILLE_MIN_MARCHE*100)}%) — "
+            f"il n'est PAS éliminé, il garde sa chance. Sa taille remontera automatiquement "
+            f"si son bilan récent se redresse."
         )
 
     if alerte_perte_a_envoyer:
@@ -5266,25 +5330,27 @@ async def boucle_principale():
                 async with trades_lock:
                     slots_libres        = MAX_TRADES_SIMULTANES - len(trades_ouverts)
                     marches_actifs      = get_marches_actifs()
-                    # ── Pause auto des marchés qui gappent (12/07) — voir _marche_en_pause_gap.
-                    marches_en_pause    = [m for m in marches_actifs if _marche_en_pause_gap(m, etat)]
-                    marches_pause_perf  = [m for m in marches_actifs if _marche_en_pause_perf(m, etat)]
+                    # ── Adaptation par marché (14/07) : plus de pause binaire. Les
+                    # marchés en difficulté ne sont PAS éliminés — ils tradent en
+                    # taille réduite (voir _facteur_taille_marche, appliqué à
+                    # l'ouverture). On liste juste ceux en taille réduite pour le log.
+                    marches_reduits = [
+                        (m, _facteur_taille_marche(m, etat)) for m in marches_actifs
+                        if _facteur_taille_marche(m, etat) < 1.0
+                    ]
                     marches_disponibles = [
                         m for m in marches_actifs
                         if m not in trades_ouverts
                         and time.time() >= cooldown_marches.get(m, 0)
-                        and not _marche_en_pause_gap(m, etat)   # exclut les marchés qui gappent trop
-                        and not _marche_en_pause_perf(m, etat)  # exclut les marchés qui saignent (adaptation par marché)
                         # BTCUSD retiré tant que le capital ne permet pas 1 contrat entier
                         # (ctVal=1 ≈ 1 BTC de notionnel par contrat) — uniquement en
                         # MODE_REEL, où cette contrainte existe réellement. Voir SEUIL_CAPITAL_BTC
                         and not (MODE_REEL and m == "BTCUSD" and etat["capital"] < SEUIL_CAPITAL_BTC)
                     ]
 
-                if marches_en_pause:
-                    log.info(f"  ⏸️ En pause (gaps récents) : {', '.join(marches_en_pause)}")
-                if marches_pause_perf:
-                    log.info(f"  📉 En pause (performance) : {', '.join(marches_pause_perf)}")
+                if marches_reduits:
+                    details_red = ", ".join(f"{m} {int(f*100)}%" for m, f in marches_reduits)
+                    log.info(f"  📉 Taille réduite (perf faible) : {details_red}")
 
                 if slots_libres <= 0:
                     log.info(f"  {MAX_TRADES_SIMULTANES}/{MAX_TRADES_SIMULTANES} trades — attente...")
@@ -5299,7 +5365,18 @@ async def boucle_principale():
                 for marche in marches_disponibles:
                     direction, details = await analyser_marche(session, marche)
                     if direction != "NEUTRE":
-                        signaux[marche] = {"direction": direction, "details": details}
+                        # ── Apprentissage de direction par marché (14/07, "recette") —
+                        # si ce marché a appris (sur son historique) qu'il préfère
+                        # fader ou suivre, on ignore les signaux du MAUVAIS mode et on
+                        # ne garde que le bon. Voir _mode_prefere_marche. Tant qu'il n'a
+                        # pas assez de données par mode, aucune préférence → tout passe.
+                        pref     = _mode_prefere_marche(marche, etat)
+                        mode_sig = _mode_trade(details.get("rsi_1h", 50.0))
+                        if pref is not None and mode_sig != pref:
+                            log.info(f"  {marche} : signal '{mode_sig}' ignoré — ce marché "
+                                     f"préfère '{pref}' (appris sur son historique).")
+                        else:
+                            signaux[marche] = {"direction": direction, "details": details}
                     await asyncio.sleep(0.3)
 
                 if not signaux:
