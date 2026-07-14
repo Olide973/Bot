@@ -181,6 +181,12 @@ SEUIL_MOUVEMENT_MAX_PCT = 1.20   # au-delà : mouvement trop violent → pas d'e
 # servi à choisir le seuil — sinon on cale le bot sur le bruit du moment,
 # pas sur un vrai signal durable).
 VOLUME_MINI             = 0.50   # volume min vs moyenne 24h
+VOLUME_MAXI             = 5.00   # volume MAX vs moyenne 24h — AJOUTÉ le 14/07
+# ── PLAFOND de volume : sur volume >= 5x, le taux de gap grimpe à 23% (contre
+# 3-4% ailleurs) — ce sont des spikes violents (cascades de liquidation, news)
+# où le prix saute à travers le stop. On n'entre plus dans ces spikes. Attention :
+# ça n'attrape QUE les gaps de gros volume ; les gaps de faible volume passent
+# quand même (ex : AVAX a gappé à 0.55x). Parade partielle, pas totale.
 # ── RELEVÉ de 0.20x à 0.50x le 13/07 — analyse sur ~100 trades réels :
 # Volume < 0.5x → WR 38% (catastrophe), Volume 1-2x → WR 76%. Les marchés
 # à faible volume ne bougent pas vraiment (chop) : le rebound de mean-reversion
@@ -2065,6 +2071,11 @@ async def analyser_marche(session, symbole):
     # Filtre volume — marchés mous = chop, à éviter (voir VOLUME_MINI)
     if vol_ratio < VOLUME_MINI:
         log.info(f"  {symbole} : Vol {vol_ratio:.2f}x | Variation={variation_pct:+.2f}% → skip volume")
+        return "NEUTRE", {}
+
+    # Plafond volume — spike violent = risque de gap élevé (voir VOLUME_MAXI)
+    if vol_ratio > VOLUME_MAXI:
+        log.info(f"  {symbole} : Vol {vol_ratio:.2f}x (> {VOLUME_MAXI}x) | Variation={variation_pct:+.2f}% → skip spike (risque gap)")
         return "NEUTRE", {}
 
     # Filtre ATR — marché sans volatilité = pas de rebond exploitable (voir ATR_PCT_MINI)
