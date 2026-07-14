@@ -197,10 +197,12 @@ ATR_PCT_MINI            = 0.30   # ATR (volatilité) min en % du prix pour ouvri
 # et le résultat net des PROCHAINS trades — pas une certitude, une hypothèse
 # à valider sur de nouvelles données (les 8 trades déjà vus ne peuvent pas
 # servir à eux-mêmes de preuve, voir discussion du 09/07).
-STOP_LOSS_PCT           = 0.0038  # 13/07 — stop RÉDUIT à 0.38% (≈ -2€ sur ~525€ de notionnel),
-                                    # sur demande de Damien. Config "petit stop / gros objectifs" :
-                                    # risquer ~2€ pour viser +4/6/8/12€. Attention data : seuls 3%
-                                    # des trades atteignent +4€, 0% atteint +8€. À tester tel quel.
+STOP_LOSS_PCT           = 0.0065  # 14/07 — stop à 0.65% (≈ -3.4€). Compromis calibré : le -2€
+                                    # (0.38%) se faisait whipsawer (9 stops sur 12 repartaient
+                                    # dans l'autre sens), le -4€ d'origine faisait des pertes trop
+                                    # grosses. Les retournements post-stop observés font ~0.1-0.5%,
+                                    # donc 0.65% passe au-dessus de la plupart sans trop alourdir
+                                    # les pertes. Meilleur compromis WR / taille de perte trouvé.
 # ── BREAKEVEN ANTICIPÉ (11/07, demandé par Damien) — neutralise le RISQUE plus
 # tôt que le palier 1. Analyse des trades : les grosses pertes ne sont PAS des
 # gains coupés trop court, ce sont des trades partis à contresens dès l'entrée
@@ -288,16 +290,15 @@ SEUIL_CAPITAL_BTC       = 6000.0  # capital mini pour que BTCUSD soit inclus dan
 # dans le pire cas observé, sans revenir aux 0.30% d'avant la demande de
 # Damien. Palier 0.36% ajouté le 07/07 (12:50), conservé.
 LOCK_PALIERS_PCT = [
-    0.78, 1.17, 1.56, 2.34,
+    0.22, 0.28, 0.36, 0.40, 0.50, 0.65, 0.80, 1.00, 1.20, 1.50,
+    1.80, 2.20, 2.60, 3.20, 3.80, 4.60, 5.50, 6.50, 7.50, 9.00,
+    10.00, 12.50, 15.00, 17.50, 20.00, 25.00, 30.00, 45.00, 60.00,
 ]
-# ── PALIERS REDÉFINIS le 13/07 sur demande de Damien — config "gros objectifs" :
-#   +4€ (0.78%), +6€ (1.17%), +8€ (1.56%), +12€ (2.34%) — en % du capital ~513€.
-#   Stop associé à -2€ (voir STOP_LOSS_PCT). Objectif : renverser le ratio
-#   gain/perte (risquer 2€ pour viser 4-12€), approche "laisser courir".
-#   ⚠️ DATA : sur 60 trades vifs, seuls 2 (3%) atteignent +4€, 0 atteint +8€ ou
-#   +12€ (pic max jamais atteint = +7.55€). Ces deux derniers paliers ne se
-#   déclencheront donc jamais en l'état. Config testée à la demande explicite ;
-#   à comparer sur plusieurs jours avec l'ancienne.
+# ── PALIERS REMIS en échelle ATTEIGNABLE le 14/07. La config +4/6/8/12€ ne
+# verrouillait rien (1 trade sur 18 atteignait +4€, 0 atteignait +8€). Ici le 1er
+# palier est à 0.22% (≈ +1.15€), atteint par ~70% des gagnants, et l'échelle monte
+# progressivement pour laisser courir les rares gros mouvements. Les gagnants
+# encaissent enfin un vrai gain au lieu de tout relâcher au breakeven.
 
 def get_palier_lock(pnl_max, capital):
     """Retourne le gain garanti selon le PnL max atteint — proportionnel au capital."""
@@ -353,7 +354,10 @@ BOOST_CONFIANCE         = 1.20
 GAP_FENETRE_JOURS       = 7       # fenêtre glissante d'observation des gaps
 GAP_FACTEUR_STOP        = 1.4     # perte > 1.4x le stop attendu = gap (a sauté à travers)
 GAP_NB_POUR_PAUSE       = 2       # ce nombre de gaps dans la fenêtre → marché en pause
-GAP_PERTE_CUMULEE_PAUSE = -12.0   # OU cette perte cumulée de gaps (€) → pause (capte un seul gap énorme)
+GAP_PERTE_CUMULEE_PAUSE = -8.0    # OU cette perte cumulée de gaps (€) → pause. ABAISSÉ de -12 à
+                                   # -8 le 14/07 : le gap LTCUSD à -11.60€ passait juste sous -12€
+                                   # et ne déclenchait pas la pause. À -8€, un seul gros gap met le
+                                   # marché en pause immédiatement.
 
 # ── Frais OKX réels (X-Perps, palier standard/non-VIP — identiques aux Swaps Perpétuels classiques)
 # Maker 0.02% / Taker 0.05% du notionnel — le bot sort au marché à l'ouverture
