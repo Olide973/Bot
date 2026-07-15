@@ -502,6 +502,12 @@ INVERSER_SENS = os.environ.get('INVERSER_SENS', '0').strip().lower() in ('1', 't
 # comme avant — le code funding n'est même pas touché.
 MODE_FUNDING = os.environ.get('MODE_FUNDING', '0').strip().lower() in ('1', 'true', 'oui', 'yes')
 
+# ── BASCULE MODE DEUX SENS (15/07, test de Damien) — Railway → MODE_DEUX_SENS=1.
+# Quand actif, le bot NE lance PAS le scalper : il lance le bot "deux sens"
+# (fichier bot_deux_sens.py) qui, à chaque signal, ouvre LONG + SHORT. Défaut = 0.
+# Même bascule sûre que MODE_FUNDING : le scalper n'est pas touché quand c'est à 0.
+MODE_DEUX_SENS = os.environ.get('MODE_DEUX_SENS', '0').strip().lower() in ('1', 'true', 'oui', 'yes')
+
 def _sens_effectif(direction):
     """Renvoie le sens réellement pris : inversé si INVERSER_SENS est actif,
     sinon inchangé. N'inverse jamais NEUTRE (pas de trade)."""
@@ -5016,6 +5022,16 @@ async def boucle_principale():
             return
         except Exception as e:
             log.error(f"  Échec lancement du bot funding ({e}) — poursuite en mode scalper normal.")
+
+    if MODE_DEUX_SENS:
+        try:
+            import bot_deux_sens
+            log.info("  🔀 MODE_DEUX_SENS=1 → lancement du bot deux sens "
+                     "(le scalper reste en veille).")
+            await bot_deux_sens.main()
+            return
+        except Exception as e:
+            log.error(f"  Échec lancement du bot deux sens ({e}) — poursuite en mode scalper normal.")
 
     trades_lock = asyncio.Lock()
 
