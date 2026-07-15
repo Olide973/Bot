@@ -494,6 +494,14 @@ RESET_TOUT = os.environ.get('RESET_TOUT', '0').strip().lower() in ('1', 'true', 
 # sans recoder. À comparer sur plusieurs jours dans les deux positions.
 INVERSER_SENS = os.environ.get('INVERSER_SENS', '0').strip().lower() in ('1', 'true', 'oui', 'yes')
 
+# ── BASCULE MODE FUNDING (14/07, projet capture de funding) — piloté depuis
+# Railway (Variables → MODE_FUNDING = 1, puis Deploy). Quand actif, le bot NE
+# lance PAS le scalper : il lance le bot de capture de funding delta-neutre
+# (fichier funding_bot.py, dans le même dossier). Défaut = 0 (scalper normal).
+# Bascule sûre : quand la variable est absente/à 0, le scalper tourne exactement
+# comme avant — le code funding n'est même pas touché.
+MODE_FUNDING = os.environ.get('MODE_FUNDING', '0').strip().lower() in ('1', 'true', 'oui', 'yes')
+
 def _sens_effectif(direction):
     """Renvoie le sens réellement pris : inversé si INVERSER_SENS est actif,
     sinon inchangé. N'inverse jamais NEUTRE (pas de trade)."""
@@ -4992,6 +5000,23 @@ def afficher_tableau_de_bord(etat):
 # ═══════════════════════════════════════════════════════════════
 async def boucle_principale():
     global trades_lock, CAPITAL_INITIAL, arret_demande
+
+    # ── BASCULE MODE FUNDING (14/07) — si MODE_FUNDING=1, on ne lance PAS le
+    # scalper : on délègue au bot de capture de funding delta-neutre
+    # (funding_bot.py, même dossier). Import PARESSEUX + garde-fou : si le module
+    # est absent ou plante à l'init, on log et on retombe sur le scalper — donc
+    # aucun risque de casser le bot actuel. Quand MODE_FUNDING est à 0/absent,
+    # rien de tout ceci ne s'exécute.
+    if MODE_FUNDING:
+        try:
+            import funding_bot
+            log.info("  🏦 MODE_FUNDING=1 → lancement du bot de capture de funding "
+                     "(le scalper reste en veille).")
+            await funding_bot.main()
+            return
+        except Exception as e:
+            log.error(f"  Échec lancement du bot funding ({e}) — poursuite en mode scalper normal.")
+
     trades_lock = asyncio.Lock()
 
     # ── Arrêt propre (Graceful Shutdown) sur SIGTERM/SIGINT — Railway envoie
