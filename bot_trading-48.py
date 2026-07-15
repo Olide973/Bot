@@ -404,7 +404,8 @@ GAP_PERTE_CUMULEE_PAUSE = -8.0    # OU cette perte cumulée de gaps (€) → pa
 # chroniques ; NEAR +6€ = à garder. La fenêtre repart de zéro au déploiement, donc
 # il faut quelques jours pour accumuler assez de trades avant qu'elle agisse.
 PERF_FENETRE_JOURS      = 7       # fenêtre glissante d'observation de la perf par marché
-PERF_MIN_TRADES         = 8       # minimum de trades dans la fenêtre avant de juger (anti-bruit)
+PERF_MIN_TRADES         = 6       # minimum de trades dans la fenêtre avant de juger (anti-bruit) —
+                                   # ABAISSÉ de 8 à 6 le 15/07 (Damien veut plus de réactivité)
 PERF_SEUIL_PAUSE        = -10.0   # perte nette cumulée (€) au niveau de laquelle la taille tombe au minimum
 TAILLE_MIN_MARCHE       = 0.25    # 14/07 (demandé par Damien) — au lieu d'ÉLIMINER un marché qui saigne,
                                    # on RÉDUIT sa taille de position (curseur, pas interrupteur). Un marché
@@ -418,7 +419,10 @@ TAILLE_MIN_MARCHE       = 0.25    # 14/07 (demandé par Damien) — au lieu d'É
 # jour en continu. Garde-fou anti-surapprentissage FORT : il faut assez de trades
 # DANS CHAQUE mode avant de trancher (sinon on calibre sur du bruit). Tant que le
 # minimum n'est pas atteint pour un marché, les deux modes restent autorisés.
-MODE_MIN_TRADES         = 10      # minimum de trades DANS CHAQUE mode (fade ET suivre) avant de préférer
+MODE_MIN_TRADES         = 6       # minimum de trades DANS CHAQUE mode (fade ET suivre) avant de préférer
+                                   # — ABAISSÉ de 10 à 6 le 15/07 : Damien veut que ça s'adapte plus vite.
+                                   # Plus réactif, mais plus bruité (une préférence sur 6 trades peut être
+                                   # de la chance) → le système se corrige seul au fil des trades suivants.
 MODE_ECART_MINI         = 5.0     # écart minimal de P&L total (€) entre les 2 modes pour trancher
 
 # ── Frais OKX réels (X-Perps, palier standard/non-VIP — identiques aux Swaps Perpétuels classiques)
