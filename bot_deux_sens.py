@@ -44,9 +44,19 @@ import pg8000
 CAPITAL_INITIAL = float(os.environ.get("CAPITAL_DEUXSENS", "416"))
 
 NOTIONNEL_PAR_COTE = 200.0   # notionnel de CHAQUE côté (long et short). 2 côtés = 400€ d'expo.
-STOP_EUR   = 1.0             # stop du côté perdant (demande de Damien : 1€)
-PALIER_EUR = 3.0             # objectif du côté gagnant (demande de Damien : 3€)
-# → avec 200€ de notionnel : stop = 0.50% de mouvement, palier = 1.50%.
+
+# ── TOUT EN POURCENTAGE de mouvement de prix (demande de Damien).
+#    Équivalent en € = pourcentage × notionnel. À 200€ : 0.5% = 1€, 1.0% = 2€.
+STOP_PCT = 0.005             # stop du côté perdant : 0.50% (= 1€ à 200€)
+
+# ── Échelle de PALIERS pour le côté GAGNANT : 1.5%, 2.5%, 3.5%, 4.5%… soit en €
+#    (à 200€) : 3€, 5€, 7€, 9€… « ainsi de suite ». Le côté gagnant grimpe l'échelle ;
+#    un plancher trailing verrouille le palier PRÉCÉDENT (au 1er palier : plancher au
+#    point mort / breakeven). Ça laisse courir les gros mouvements tout en protégeant.
+PALIER_1_PCT   = 0.015       # 1er palier : 1.50% (= 3€)
+PALIER_PAS_PCT = 0.010       # pas entre paliers : 1.00% (= +2€)
+NB_PALIERS     = 15          # nombre de paliers dans l'échelle (3€ → 31€)
+PALIERS_PCT = [round(PALIER_1_PCT + i * PALIER_PAS_PCT, 6) for i in range(NB_PALIERS)]
 
 SEUIL_MOUVEMENT = 0.005      # 0.5% : mouvement depuis la référence qui déclenche un signal
 FRAIS_TAKER     = 0.0005     # 0.05% par patte (comme ton scalper)
@@ -188,101 +198,122 @@ async def prix(session, inst_id):
 #  BOUCLE
 # ═══════════════════════════════════════════════════════════════════════════
 async def boucle(session, etat):
-    stop_pct   = STOP_EUR / NOTIONNEL_PAR_COTE      # ex 1/200 = 0.5%
-    palier_pct = PALIER_EUR / NOTIONNEL_PAR_COTE    # ex 3/200 = 1.5%
     frais_1_cote = round(NOTIONNEL_PAR_COTE * FRAIS_TAKER, 4)
 
     while True:
         try:
-            refs   = etat.setdefault("references", {})       # prix de référence par marché
-            trades = etat.setdefault("trades", {})           # trades doubles ouverts par marché
+            refs      = etat.setdefault("references", {})    # prix de référence par marché
+            positions = etat.setdefault("positions", [])     # LISTE de positions INDÉPENDANTES
 
+            # 1) Récupère le prix de tous les marchés
+            prix_actuels = {}
             for m, inst in OKX_SYMBOLS.items():
                 p = await prix(session, inst)
                 await asyncio.sleep(0.1)
+                if p is not None:
+                    prix_actuels[m] = p
+                    refs.setdefault(m, p)
+
+            # 2) GESTION — chaque position vit sa vie, indépendamment de l'autre côté
+            restantes = []
+            for pos in positions:
+                p = prix_actuels.get(pos["marche"])
                 if p is None:
+                    restantes.append(pos)
+                    continue
+                entree = pos["entree"]
+                pct = (p - entree) / entree if pos["sens"] == "long" else (entree - p) / entree
+
+                # Monte l'échelle de paliers (plus haut palier franchi)
+                i = pos.get("palier", -1)
+                while i + 1 < len(PALIERS_PCT) and pct >= PALIERS_PCT[i + 1]:
+                    i += 1
+                pos["palier"] = i
+
+                ferme, resultat, motif = False, 0.0, ""
+                if i < 0:
+                    # Aucun palier franchi : stop initial à -STOP_PCT
+                    if pct <= -STOP_PCT:
+                        resultat = round(-STOP_PCT * NOTIONNEL_PAR_COTE - frais_1_cote, 4)
+                        motif, ferme = "STOP", True
+                else:
+                    # Palier franchi : plancher trailing = palier PRÉCÉDENT (breakeven au 1er)
+                    plancher = PALIERS_PCT[i - 1] if i >= 1 else 0.0
+                    if pct <= plancher:
+                        resultat = round(plancher * NOTIONNEL_PAR_COTE - frais_1_cote, 4)
+                        motif, ferme = "PALIER", True
+
+                if not ferme:
+                    restantes.append(pos)
                     continue
 
-                # Initialise la référence au premier passage
-                if m not in refs:
-                    refs[m] = p
+                # Fermeture INDÉPENDANTE de cette position
+                m = pos["marche"]
+                etat["capital"]   = round(etat.get("capital", CAPITAL_INITIAL) + resultat, 4)
+                etat["total_net"] = round(etat.get("total_net", 0) + resultat, 4)
+                etat["nb_trades"] = etat.get("nb_trades", 0) + 1
+                if resultat > 0:
+                    etat["nb_gagnants"] = etat.get("nb_gagnants", 0) + 1
+                etat.setdefault("historique", []).append({
+                    "marche": m, "sens": pos["sens"], "resultat": resultat, "motif": motif,
+                    "palier": i, "ferme_le": datetime.now(timezone.utc).isoformat()})
+                ic = "✅" if resultat > 0 else "❌"
+                sens_txt = "LONG" if pos["sens"] == "long" else "SHORT"
+                if motif == "STOP":
+                    detail = f"stoppé à -{STOP_PCT*100:.2f}%"
+                elif i >= 1:
+                    detail = f"palier {i + 1} franchi, verrouillé au palier {i}"
+                else:
+                    detail = "monté au 1er palier puis revenu au point mort"
+                await telegram(session,
+                    f"{ic} <b>{sens_txt} FERMÉ — {m.replace('USD','')}</b>\n"
+                    f"Résultat : <b>{resultat:+.2f}€</b> ({detail})\n"
+                    f"Capital : {etat['capital']:.2f}€")
+                refs[m] = p   # référence remise à jour
+
+            etat["positions"] = restantes
+            positions = restantes
+
+            # 3) SIGNAUX — ouvre une PAIRE indépendante (long + short) si le marché est libre.
+            #    « Libre » = aucune position en cours sur ce marché (évite d'empiler sans fin).
+            marches_occupes = {pos["marche"] for pos in positions}
+            for m, p in prix_actuels.items():
+                if m in marches_occupes:
                     continue
-
-                # ── Marché avec un trade double ouvert : on gère les 2 côtés ──
-                if m in trades:
-                    t = trades[m]
-                    entree = t["entree"]
-                    # P&L de chaque côté (en €), delta-neutre au départ
-                    pnl_long  = (p - entree) / entree * NOTIONNEL_PAR_COTE
-                    pnl_short = (entree - p) / entree * NOTIONNEL_PAR_COTE
-
-                    for cote, pnl in (("long", pnl_long), ("short", pnl_short)):
-                        if t[cote]["ouvert"]:
-                            if pnl <= -STOP_EUR:
-                                t[cote] = {"ouvert": False, "resultat": round(-STOP_EUR - frais_1_cote, 4), "motif": "STOP"}
-                            elif pnl >= PALIER_EUR:
-                                t[cote] = {"ouvert": False, "resultat": round(PALIER_EUR - frais_1_cote, 4), "motif": "PALIER"}
-
-                    # Les 2 côtés fermés → on clôture le trade double
-                    if not t["long"]["ouvert"] and not t["short"]["ouvert"]:
-                        net = round(t["long"]["resultat"] + t["short"]["resultat"], 4)
-                        etat["capital"] = round(etat.get("capital", CAPITAL_INITIAL) + net, 4)
-                        etat["total_net"] = round(etat.get("total_net", 0) + net, 4)
-                        etat["nb_trades"] = etat.get("nb_trades", 0) + 1
-                        if net > 0:
-                            etat["nb_gagnants"] = etat.get("nb_gagnants", 0) + 1
-                        etat.setdefault("historique", []).append(
-                            {"marche": m, "net": net, "long": t["long"], "short": t["short"],
-                             "ferme_le": datetime.now(timezone.utc).isoformat()})
-                        icone = "✅" if net > 0 else "❌"
-                        await telegram(session,
-                            f"{icone} <b>TRADE DOUBLE FERMÉ — {m.replace('USD','')}</b>\n"
-                            f"Long : {t['long']['resultat']:+.2f}€ ({t['long']['motif']})\n"
-                            f"Short : {t['short']['resultat']:+.2f}€ ({t['short']['motif']})\n"
-                            f"<b>Net : {net:+.2f}€</b> | Capital : {etat['capital']:.2f}€")
-                        trades.pop(m)
-                        refs[m] = p   # nouvelle référence pour repartir
-                    continue
-
-                # ── Pas de trade ouvert : détection d'un signal (mouvement ≥ seuil) ──
                 variation = abs(p - refs[m]) / refs[m]
                 if variation >= SEUIL_MOUVEMENT:
-                    trades[m] = {
-                        "entree": p,
-                        "ouvert_le": datetime.now(timezone.utc).isoformat(),
-                        "long":  {"ouvert": True, "resultat": 0.0, "motif": ""},
-                        "short": {"ouvert": True, "resultat": 0.0, "motif": ""},
-                    }
+                    for sens in ("long", "short"):
+                        positions.append({
+                            "marche": m, "sens": sens, "entree": p,
+                            "ouvert_le": datetime.now(timezone.utc).isoformat(), "palier": -1})
                     etat["capital"] = round(etat.get("capital", CAPITAL_INITIAL) - 2 * frais_1_cote, 4)
+                    marches_occupes.add(m)
                     await telegram(session,
                         f"🔀 <b>DOUBLE POSITION — {m.replace('USD','')}</b>\n"
-                        f"Mouvement {variation*100:.2f}% détecté → LONG + SHORT ouverts @ {p}\n"
-                        f"Notionnel {NOTIONNEL_PAR_COTE:.0f}€/côté | stop -{STOP_EUR:.0f}€ | palier +{PALIER_EUR:.0f}€\n"
+                        f"Mouvement {variation*100:.2f}% → LONG + SHORT ouverts @ {p} "
+                        f"(<b>indépendants</b>)\n"
+                        f"Notionnel {NOTIONNEL_PAR_COTE:.0f}€/côté | stop -{STOP_PCT*100:.2f}% "
+                        f"| 1er palier +{PALIERS_PCT[0]*100:.1f}% puis échelle\n"
                         f"Frais d'ouverture (2 côtés) : -{2*frais_1_cote:.3f}€")
 
-            # ── Bilan quotidien à 22h UTC (19h Guyane) ──
+            # 4) Bilan quotidien complet à 22h UTC (19h Guyane)
             now = datetime.now(timezone.utc)
             cle = now.strftime("%Y-%m-%d")
             if now.hour == 22 and etat.get("dernier_rapport") != cle:
                 etat["dernier_rapport"] = cle
-                nb = etat.get("nb_trades", 0)
-                wr = (etat.get("nb_gagnants", 0) / nb * 100) if nb else 0
-                await telegram(session,
-                    f"📊 <b>BILAN DEUX SENS — {cle}</b>\n"
-                    f"Trades doubles : {nb} | Gagnants : {wr:.0f}%\n"
-                    f"<b>Résultat net global : {etat.get('total_net',0):+.2f}€</b>\n"
-                    f"Capital : {etat.get('capital',CAPITAL_INITIAL):.2f}€ (départ {CAPITAL_INITIAL:.0f}€)")
+                await rapport_quotidien(session, etat, cle)
 
             sauvegarder_etat(etat)
         except Exception as e:
             log.error(f"Boucle : {e}")
 
-        # Battement de cœur (comme le bot funding)
+        # Battement de cœur : nb de positions ouvertes (chaque côté compte pour 1)
         now = datetime.now(timezone.utc)
         net = round(etat.get("capital", CAPITAL_INITIAL) - CAPITAL_INITIAL, 3)
-        ouverts = ", ".join(k.replace("USD", "") for k in etat.get("trades", {})) or "aucun"
-        log.info(f"  ❤️ [{now:%H:%M} UTC] Deux-sens actif — trades ouverts: {ouverts} | "
-                 f"net {net:+.3f}€ | {etat.get('nb_trades',0)} trades clôturés")
+        pos_ouvertes = etat.get("positions", [])
+        marches = len({pos["marche"] for pos in pos_ouvertes})
+        log.info(f"  ❤️ [{now:%H:%M} UTC] Deux-sens actif — {len(pos_ouvertes)} positions ouvertes "
+                 f"sur {marches} marchés | net {net:+.3f}€ | {etat.get('nb_trades',0)} clôturées")
 
         await asyncio.sleep(PAUSE_LOOP_SEC)
 
@@ -290,6 +321,61 @@ async def boucle(session, etat):
 # ═══════════════════════════════════════════════════════════════════════════
 #  DÉMARRAGE
 # ═══════════════════════════════════════════════════════════════════════════
+async def rapport_quotidien(session, etat, cle):
+    """Bilan complet du jour : résultat, trades, palier vs stop, détail, ouverts."""
+    hist = etat.get("historique", [])
+    jour = [h for h in hist if str(h.get("ferme_le", ""))[:10] == cle]
+
+    net_jour = round(sum(h.get("resultat", 0) for h in jour), 2)
+    gagnants = sum(1 for h in jour if h.get("resultat", 0) > 0)
+    perdants = len(jour) - gagnants
+
+    # Le chiffre clé : combien de positions ont grimpé un palier vs juste stoppé
+    nb_palier = sum(1 for h in jour if h.get("motif") == "PALIER")
+    nb_stop   = sum(1 for h in jour if h.get("motif") == "STOP")
+
+    # Détail position par position (compact) — 🎯 = palier franchi, 🛑 = stoppé
+    lignes = []
+    for h in jour[:40]:
+        m = h.get("marche", "?").replace("USD", "")
+        sens = "L" if h.get("sens") == "long" else "S"
+        ic = "✅" if h.get("resultat", 0) > 0 else "❌"
+        sym = "🎯" if h.get("motif") == "PALIER" else "🛑"
+        lignes.append(f"{ic} {sens} {m:6s} {h.get('resultat',0):+.2f}€ {sym}")
+    if len(jour) > 40:
+        lignes.append(f"… et {len(jour)-40} autres")
+    detail = "\n".join(lignes) if lignes else "(aucune position clôturée aujourd'hui)"
+
+    pos_ouvertes = etat.get("positions", [])
+    ouverts = f"{len(pos_ouvertes)} positions sur {len({p['marche'] for p in pos_ouvertes})} marchés" \
+              if pos_ouvertes else "aucune"
+
+    # Lecture en une phrase, factuelle
+    if len(jour) == 0:
+        lecture = "Aucune position terminée aujourd'hui — trop tôt pour juger."
+    elif nb_palier == 0:
+        lecture = f"Aucune position n'a franchi de palier. Toutes stoppées ({nb_stop}×)."
+    elif nb_palier < nb_stop:
+        lecture = f"Le stop tombe bien plus souvent qu'un palier ({nb_stop} contre {nb_palier})."
+    else:
+        lecture = f"Palier franchi {nb_palier}× / stoppé {nb_stop}×."
+
+    await telegram(session,
+        f"📊 <b>BILAN DEUX SENS — {cle}</b>\n"
+        f"\n💰 <b>RÉSULTAT DU JOUR</b>\n"
+        f"Net : <b>{net_jour:+.2f}€</b>\n"
+        f"Capital : {etat.get('capital',CAPITAL_INITIAL):.2f}€ (départ {CAPITAL_INITIAL:.0f}€)\n"
+        f"\n📈 <b>POSITIONS (chaque côté compté séparément)</b>\n"
+        f"Clôturées aujourd'hui : {len(jour)}\n"
+        f"Gagnantes : {gagnants} | Perdantes : {perdants}\n"
+        f"\n🎯 <b>LE CHIFFRE CLÉ</b>\n"
+        f"Ont franchi un palier : {nb_palier} fois\n"
+        f"Juste stoppées (-{STOP_PCT*100:.2f}%) : {nb_stop} fois\n"
+        f"→ {lecture}\n"
+        f"\n📋 <b>DÉTAIL</b> (L=long, S=short)\n<pre>{detail}</pre>\n"
+        f"⏳ Encore ouvertes : {ouverts}")
+
+
 async def main():
     log.info("=" * 60)
     log.info("  BOT DEUX SENS — capture des deux directions (SIMULATION)")
@@ -297,7 +383,7 @@ async def main():
     init_db()
     etat = {} if RESET_DEUXSENS else (charger_etat() or {})
     etat.setdefault("capital", CAPITAL_INITIAL)
-    etat.setdefault("trades", {})
+    etat.setdefault("positions", [])
     etat.setdefault("references", {})
     etat.setdefault("total_net", 0.0)
     etat.setdefault("nb_trades", 0)
@@ -309,9 +395,14 @@ async def main():
             (f"🔄 <b>RESET DEUX SENS</b> — repart de zéro.\n\n" if RESET_DEUXSENS else "")
             + f"🔀 <b>BOT DEUX SENS DÉMARRÉ</b> (simulation)\n"
             f"Capital : {etat['capital']:.2f}€\n"
-            f"À chaque signal (mouvement ≥ {SEUIL_MOUVEMENT*100:.1f}%) : LONG + SHORT\n"
-            f"Notionnel {NOTIONNEL_PAR_COTE:.0f}€/côté | stop -{STOP_EUR:.0f}€ | palier +{PALIER_EUR:.0f}€\n"
-            f"(stop = {STOP_EUR/NOTIONNEL_PAR_COTE*100:.2f}% | palier = {PALIER_EUR/NOTIONNEL_PAR_COTE*100:.2f}% de mouvement)\n"
+            f"À chaque signal (mouvement ≥ {SEUIL_MOUVEMENT*100:.1f}%) : LONG + SHORT "
+            f"<b>indépendants</b> (chacun sa vie)\n"
+            f"Notionnel {NOTIONNEL_PAR_COTE:.0f}€/côté\n"
+            f"Stop : -{STOP_PCT*100:.2f}% (= -{STOP_PCT*NOTIONNEL_PAR_COTE:.1f}€)\n"
+            f"Paliers (échelle) : "
+            f"{', '.join(f'{x*100:.1f}%' for x in PALIERS_PCT[:5])}…\n"
+            f"  soit en € : {', '.join(f'{x*NOTIONNEL_PAR_COTE:.0f}€' for x in PALIERS_PCT[:5])}…\n"
+            f"Le gagnant grimpe l'échelle, un plancher verrouille le palier précédent.\n"
             f"Marchés suivis : {len(OKX_SYMBOLS)}")
         await boucle(session, etat)
 
