@@ -777,6 +777,79 @@ def get_marches_actifs():
     """Retourne tous les marchés actifs (levier x10 uniquement) — trading 24h/24, 7j/7."""
     return MARCHES
 
+async def scanner_funding_et_notifier(session, capital):
+    """SCAN DE FUNDING (14/07, projet "capture de funding") — lit le funding réel
+    de chaque marché actif et envoie sur Telegram un classement + un verdict de
+    rentabilité APRÈS frais, à l'échelle du capital. Ne trade RIEN : lecture de
+    données PUBLIQUES (www.okx.com). Utilise les instId publics déjà résolus dans
+    OKX_SYMBOLS. Si un instrument n'expose pas de funding, il est simplement
+    ignoré (le scan reste robuste)."""
+    FRAIS_AR = 2 * (OKX_TAKER_FEE + 0.0010)   # 2 pattes (perp+spot) × (entrée+sortie) ; spot ~0.10%
+    N = 30                                     # ~10 jours de funding (30 × 8h)
+    resultats = []
+    for m in MARCHES:
+        inst = OKX_SYMBOLS.get(m)
+        if not inst:
+            continue
+        taux = []
+        try:
+            url = (f"https://www.okx.com/api/v5/public/funding-rate-history"
+                   f"?instId={inst}&limit={N}")
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as r:
+                data = await r.json()
+            if data.get("code") == "0" and data.get("data"):
+                taux = [float(x["fundingRate"]) for x in data["data"]]
+        except Exception:
+            taux = []
+        await asyncio.sleep(0.15)   # respecte la limite de requêtes OKX
+        if not taux:
+            continue
+        moy      = sum(taux) / len(taux)
+        par_jour = moy * 3
+        pct_pos  = sum(1 for t in taux if t > 0) / len(taux) * 100
+        resultats.append((m, moy, par_jour, par_jour * 365, pct_pos))
+
+    if not resultats:
+        await telegram(session,
+            "📊 <b>SCAN FUNDING</b>\nAucune donnée de funding récupérée pour tes marchés "
+            "(les X-Perp n'exposent peut-être pas d'historique de funding public). "
+            "Dis-le-moi, j'ajusterai la méthode.")
+        return
+
+    resultats.sort(key=lambda x: -x[1])
+    lignes = [f"{'Marché':9s}{'/8h':>9s}{'/jour':>8s}{'/an':>7s}{'+%':>5s}", "-" * 38]
+    for m, moy, par_jour, annuel, pct_pos in resultats:
+        nom = m.replace("USD", "")
+        lignes.append(f"{nom:9s}{moy*100:>8.4f}{par_jour*100:>7.3f}{annuel*100:>6.1f}{pct_pos:>5.0f}")
+    tableau = "\n".join(lignes)
+
+    m, moy, par_jour, annuel, pct_pos = resultats[0]
+    nom       = m.replace("USD", "")
+    notionnel = capital / 2                    # moitié spot (hedge) + moitié marge perp, sans levier
+    brut_30j  = notionnel * par_jour * 30
+    net_30j   = brut_30j - notionnel * FRAIS_AR
+
+    v = [f"<b>🏆 MEILLEUR : {nom}</b>",
+         f"Funding {moy*100:.4f}%/8h → <b>{annuel*100:.1f}%/an</b> brut",
+         f"Régularité : {'stable ✅' if pct_pos >= 80 else f'instable ⚠️ ({pct_pos:.0f}%+)'}",
+         f"Frais A/R : {FRAIS_AR*100:.2f}% du notionnel",
+         "",
+         f"<b>À ton échelle ({capital:.0f}€, ~{notionnel:.0f}€ delta-neutre) :</b>",
+         f"Net après frais sur 30j : <b>{net_30j:+.2f}€</b>"]
+    if net_30j <= 0:
+        v.append("⚠️ Nul/négatif à cette échelle et ce funding. Pas rentable maintenant — "
+                 "à re-scanner quand le funding remonte, ou avec plus de capital.")
+    else:
+        v.append(f"→ ~{net_30j/capital*100:.2f}%/mois. Modeste mais RÉEL, sans pari directionnel.")
+        if pct_pos < 80:
+            v.append("⚠️ Funding instable : à surveiller (s'il passe négatif, tu paierais).")
+
+    await telegram(session,
+        f"📊 <b>SCAN FUNDING OKX</b>\n"
+        f"<i>Funding + = shorts payés → short perp + long spot</i>\n\n"
+        f"<pre>{tableau}</pre>\n" + "\n".join(v))
+
+
 async def filtrer_marches_selon_compte(session):
     """En MODE_REEL uniquement : réduit MARCHES à l'intersection avec ce que
     CE COMPTE peut réellement trader, via l'endpoint authentifié et scopé au
@@ -5170,6 +5243,15 @@ async def boucle_principale():
             + (f"Compte ordres : {'DÉMO (fictif)' if OKX_COMPTE_DEMO else '🚨 RÉEL — ARGENT VÉRITABLE 🚨'}\n" if MODE_REEL else "")
             + f"{(datetime.utcnow() - timedelta(hours=3)).strftime('%Y-%m-%d %H:%M:%S')}"
         )
+
+        # ── Scan de funding au démarrage (14/07, projet "capture de funding") :
+        # envoie sur Telegram un classement du funding de tes marchés + un verdict
+        # de rentabilité. Ne trade rien. Enveloppé pour ne JAMAIS bloquer le
+        # démarrage du bot si le scan échoue.
+        try:
+            await scanner_funding_et_notifier(session, round(etat["capital"], 2))
+        except Exception as e:
+            log.error(f"  Scan funding au démarrage : {e}")
 
         # Lance le flux WebSocket temps réel en tâche de fond (reconnexion
         # auto en cas de coupure) — remplace le polling REST pour la
