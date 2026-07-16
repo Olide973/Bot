@@ -508,6 +508,11 @@ MODE_FUNDING = os.environ.get('MODE_FUNDING', '0').strip().lower() in ('1', 'tru
 # Même bascule sûre que MODE_FUNDING : le scalper n'est pas touché quand c'est à 0.
 MODE_DEUX_SENS = os.environ.get('MODE_DEUX_SENS', '0').strip().lower() in ('1', 'true', 'oui', 'yes')
 
+# ── BASCULE MODE MOMENTUM (15/07) — Railway → MODE_MOMENTUM=1. Quand actif, le
+# bot lance le bot momentum (bot_momentum.py) : suivi des gros mouvements, une
+# seule direction. Défaut = 0. Même bascule sûre que les autres.
+MODE_MOMENTUM = os.environ.get('MODE_MOMENTUM', '0').strip().lower() in ('1', 'true', 'oui', 'yes')
+
 def _sens_effectif(direction):
     """Renvoie le sens réellement pris : inversé si INVERSER_SENS est actif,
     sinon inchangé. N'inverse jamais NEUTRE (pas de trade)."""
@@ -5032,6 +5037,16 @@ async def boucle_principale():
             return
         except Exception as e:
             log.error(f"  Échec lancement du bot deux sens ({e}) — poursuite en mode scalper normal.")
+
+    if MODE_MOMENTUM:
+        try:
+            import bot_momentum
+            log.info("  🚀 MODE_MOMENTUM=1 → lancement du bot momentum "
+                     "(le scalper reste en veille).")
+            await bot_momentum.main()
+            return
+        except Exception as e:
+            log.error(f"  Échec lancement du bot momentum ({e}) — poursuite en mode scalper normal.")
 
     trades_lock = asyncio.Lock()
 
