@@ -303,10 +303,11 @@ async def boucle(session, etat):
                     f"1er palier +{PALIERS_PCT[0]*100:.1f}% puis échelle\n"
                     f"Frais d'entrée : -{frais:.3f}€")
 
-            # 4) Bilan quotidien à 22h UTC (19h Guyane)
+            # 4) Bilan quotidien à 22h UTC (19h Guyane) — se déclenche même si le
+            #    bot a démarré un peu après l'heure (>= 22h), tant que pas déjà envoyé.
             now = datetime.now(timezone.utc)
             cle = now.strftime("%Y-%m-%d")
-            if now.hour == 22 and etat.get("dernier_rapport") != cle:
+            if now.hour >= 22 and etat.get("dernier_rapport") != cle:
                 etat["dernier_rapport"] = cle
                 await rapport_quotidien(session, etat, cle)
 
@@ -404,6 +405,20 @@ async def main():
             f"On coupe vite, on laisse courir loin.\n"
             f"⏳ Chauffe ~{FENETRE_SEC//60} min avant les 1ers signaux (remplissage fenêtre).\n"
             f"Marchés suivis : {len(OKX_SYMBOLS)}")
+
+        # Aperçu de l'état au démarrage (pour voir où on en est sans attendre 19h)
+        hist = etat.get("historique", [])
+        if hist:
+            gagn  = sum(1 for h in hist if h.get("resultat", 0) > 0)
+            npal  = sum(1 for h in hist if h.get("motif") == "PALIER")
+            nstop = sum(1 for h in hist if h.get("motif") == "STOP")
+            net_tot = round(etat.get("capital", CAPITAL_INITIAL) - CAPITAL_INITIAL, 2)
+            await telegram(session,
+                f"📸 <b>ÉTAT ACTUEL (depuis le début)</b>\n"
+                f"Positions clôturées : {len(hist)} | Gagnantes : {gagn}\n"
+                f"Ont couru (palier) : {npal} | Fausses cassures (stop) : {nstop}\n"
+                f"<b>Net total : {net_tot:+.2f}€</b> | Capital : {etat.get('capital',CAPITAL_INITIAL):.2f}€")
+
         await boucle(session, etat)
 
 
