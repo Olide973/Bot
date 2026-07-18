@@ -57,7 +57,10 @@ PALIER_PAS_PCT = 0.010
 NB_PALIERS     = 20
 PALIERS_PCT = [round(PALIER_1_PCT + i * PALIER_PAS_PCT, 6) for i in range(NB_PALIERS)]
 
-FRAIS_TAKER    = 0.0005      # 0.05% par patte
+FRAIS_TAKER    = 0.0005      # 0.05% par patte (taker)
+GLISSEMENT_PCT = 0.0003      # 0.03% par patte : estimation du glissement (exécution pas au prix pile)
+FUNDING_EST_8H = 0.0001      # 0.01%/8h : estimation du funding pour les trades tenus longtemps
+                             #   (un SHORT encaisse ~ce taux/8h, un LONG le paie — funding supposé +)
 PAUSE_LOOP_SEC = 60
 
 CANDIDATS = [
@@ -210,15 +213,24 @@ def variation_fenetre(m, p_actuel):
 # ═══════════════════════════════════════════════════════════════════════════
 #  BOUCLE
 # ═══════════════════════════════════════════════════════════════════════════
-async def boucle(session, etat):
-    frais = round(NOTIONNEL * FRAIS_TAKER, 4)
+def _duree_txt(sec):
+    """Formate une durée en texte court : 45s, 12min, 2h05."""
+    sec = int(sec)
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}min"
+    return f"{sec // 3600}h{(sec % 3600) // 60:02d}"
 
+
+async def boucle(session, etat):
     while True:
+        prix_actuels = {}
         try:
             positions = etat.setdefault("positions", [])   # 1 position max par marché
 
             # 1) Prix de tous les marchés + mise à jour des fenêtres
-            prix_actuels, variations = {}, {}
+            variations = {}
             for m, inst in OKX_SYMBOLS.items():
                 p = await prix(session, inst)
                 await asyncio.sleep(0.1)
@@ -240,42 +252,58 @@ async def boucle(session, etat):
                     i += 1
                 pos["palier"] = i
 
-                ferme, resultat, motif = False, 0.0, ""
+                ferme, pct_sortie, motif = False, 0.0, ""
                 if i < 0:
                     if pct <= -STOP_PCT:
-                        resultat = round(-STOP_PCT * NOTIONNEL - frais, 4)
-                        motif, ferme = "STOP", True
+                        pct_sortie, motif, ferme = -STOP_PCT, "STOP", True
                 else:
                     plancher = PALIERS_PCT[i - 1] if i >= 1 else 0.0
                     if pct <= plancher:
-                        resultat = round(plancher * NOTIONNEL - frais, 4)
-                        motif, ferme = "PALIER", True
+                        pct_sortie, motif, ferme = plancher, "PALIER", True
 
                 if not ferme:
                     restantes.append(pos)
                     continue
 
+                # ── Calcul complet et honnête du résultat ──
                 m = pos["marche"]
+                brut       = round(pct_sortie * NOTIONNEL, 4)                 # gain/perte "prix"
+                frais_tot  = round(2 * NOTIONNEL * FRAIS_TAKER, 4)            # 2 pattes
+                gliss_tot  = round(2 * NOTIONNEL * GLISSEMENT_PCT, 4)         # 2 pattes
+                ouvert_ts  = pos.get("ouvert_ts", time.time())
+                duree_sec  = max(0, time.time() - ouvert_ts)
+                nb_8h      = int(duree_sec // 28800)                          # nb de règlements funding traversés
+                # SHORT encaisse le funding (funding supposé +), LONG le paie
+                funding    = round(nb_8h * NOTIONNEL * FUNDING_EST_8H * (1 if pos["sens"] == "short" else -1), 4)
+                resultat   = round(brut - frais_tot - gliss_tot + funding, 4)  # NET de tout
+
                 etat["capital"]   = round(etat.get("capital", CAPITAL_INITIAL) + resultat, 4)
                 etat["total_net"] = round(etat.get("total_net", 0) + resultat, 4)
                 etat["nb_trades"] = etat.get("nb_trades", 0) + 1
                 if resultat > 0:
                     etat["nb_gagnants"] = etat.get("nb_gagnants", 0) + 1
                 etat.setdefault("historique", []).append({
-                    "marche": m, "sens": pos["sens"], "resultat": resultat, "motif": motif,
-                    "palier": i, "ferme_le": datetime.now(timezone.utc).isoformat()})
+                    "marche": m, "sens": pos["sens"], "entree": entree, "sortie": p,
+                    "ouvert_le": pos.get("ouvert_le"), "ferme_le": datetime.now(timezone.utc).isoformat(),
+                    "duree_sec": round(duree_sec), "palier_max": i, "motif": motif,
+                    "brut": brut, "frais": frais_tot, "glissement": gliss_tot, "funding": funding,
+                    "resultat": resultat})
+
                 ic = "✅" if resultat > 0 else "❌"
                 sens_txt = "LONG" if pos["sens"] == "long" else "SHORT"
                 if motif == "STOP":
                     detail = f"cassure, stoppé à -{STOP_PCT*100:.2f}%"
                 elif i >= 1:
-                    detail = f"a couru jusqu'au palier {i + 1}, verrouillé au palier {i}"
+                    detail = f"a couru jusqu'au palier {i + 1}, verrouillé au palier {i} (+{pct_sortie*100:.1f}%)"
                 else:
                     detail = "1er palier atteint puis retour au point mort"
                 await telegram(session,
                     f"{ic} <b>{sens_txt} FERMÉ — {m.replace('USD','')}</b>\n"
-                    f"Résultat : <b>{resultat:+.2f}€</b> ({detail})\n"
-                    f"Capital : {etat['capital']:.2f}€")
+                    f"{detail}\n"
+                    f"Entrée {entree} → sortie {p} | durée {_duree_txt(duree_sec)}\n"
+                    f"Brut {brut:+.2f}€ − frais {frais_tot:.2f}€ − glissement {gliss_tot:.2f}€"
+                    f"{f' {funding:+.2f}€ funding' if nb_8h else ''}\n"
+                    f"= <b>Net {resultat:+.2f}€</b> | Capital : {etat['capital']:.2f}€")
 
             etat["positions"] = restantes
             positions = restantes
@@ -291,8 +319,8 @@ async def boucle(session, etat):
                 sens = "long" if var > 0 else "short"   # on SUIT l'impulsion
                 positions.append({
                     "marche": m, "sens": sens, "entree": p,
-                    "ouvert_le": datetime.now(timezone.utc).isoformat(), "palier": -1})
-                etat["capital"] = round(etat.get("capital", CAPITAL_INITIAL) - frais, 4)
+                    "ouvert_le": datetime.now(timezone.utc).isoformat(),
+                    "ouvert_ts": time.time(), "palier": -1})
                 marches_occupes.add(m)
                 fleche = "📈 hausse" if sens == "long" else "📉 baisse"
                 await telegram(session,
@@ -301,7 +329,7 @@ async def boucle(session, etat):
                     f"<b>{sens.upper()}</b> @ {p}\n"
                     f"Notionnel {NOTIONNEL:.0f}€ | stop -{STOP_PCT*100:.2f}% | "
                     f"1er palier +{PALIERS_PCT[0]*100:.1f}% puis échelle\n"
-                    f"Frais d'entrée : -{frais:.3f}€")
+                    f"(frais + glissement ≈ {2*NOTIONNEL*(FRAIS_TAKER+GLISSEMENT_PCT):.2f}€ déduits à la fermeture)")
 
             # 4) Bilan quotidien à 22h UTC (19h Guyane) — se déclenche même si le
             #    bot a démarré un peu après l'heure (>= 22h), tant que pas déjà envoyé.
@@ -309,55 +337,91 @@ async def boucle(session, etat):
             cle = now.strftime("%Y-%m-%d")
             if now.hour >= 22 and etat.get("dernier_rapport") != cle:
                 etat["dernier_rapport"] = cle
-                await rapport_quotidien(session, etat, cle)
+                await rapport_quotidien(session, etat, cle, prix_actuels)
 
             sauvegarder_etat(etat)
         except Exception as e:
             log.error(f"Boucle : {e}")
 
-        # Battement de cœur
+        # Battement de cœur : P&L en direct de chaque position ouverte
         now = datetime.now(timezone.utc)
         net = round(etat.get("capital", CAPITAL_INITIAL) - CAPITAL_INITIAL, 3)
         po = etat.get("positions", [])
-        detail = ", ".join(f"{x['marche'].replace('USD','')}" for x in po) or "aucune"
-        log.info(f"  ❤️ [{now:%H:%M} UTC] Momentum actif — {len(po)} position(s) ({detail}) | "
+        bouts = []
+        for pos in po:
+            p = prix_actuels.get(pos["marche"])
+            nom = pos["marche"].replace("USD", "")
+            if p:
+                pct = (p - pos["entree"]) / pos["entree"] if pos["sens"] == "long" else (pos["entree"] - p) / pos["entree"]
+                bouts.append(f"{nom} {pct*NOTIONNEL:+.2f}€")
+            else:
+                bouts.append(nom)
+        detail = ", ".join(bouts) if bouts else "aucune"
+        log.info(f"  ❤️ [{now:%H:%M} UTC] Momentum actif — {len(po)} ouverte(s) [{detail}] | "
                  f"net {net:+.3f}€ | {etat.get('nb_trades',0)} clôturées")
 
         await asyncio.sleep(PAUSE_LOOP_SEC)
 
 
-async def rapport_quotidien(session, etat, cle):
+async def rapport_quotidien(session, etat, cle, prix_actuels=None):
+    prix_actuels = prix_actuels or {}
     hist = etat.get("historique", [])
     jour = [h for h in hist if str(h.get("ferme_le", ""))[:10] == cle]
 
-    net_jour = round(sum(h.get("resultat", 0) for h in jour), 2)
-    gagnants = sum(1 for h in jour if h.get("resultat", 0) > 0)
-    perdants = len(jour) - gagnants
+    net_jour  = round(sum(h.get("resultat", 0) for h in jour), 2)
+    gagnants  = sum(1 for h in jour if h.get("resultat", 0) > 0)
+    perdants  = len(jour) - gagnants
     nb_palier = sum(1 for h in jour if h.get("motif") == "PALIER")
     nb_stop   = sum(1 for h in jour if h.get("motif") == "STOP")
-    gain_moy = round(sum(h["resultat"] for h in jour if h["resultat"] > 0) / gagnants, 2) if gagnants else 0
+    gain_moy  = round(sum(h["resultat"] for h in jour if h["resultat"] > 0) / gagnants, 2) if gagnants else 0
     perte_moy = round(sum(h["resultat"] for h in jour if h["resultat"] <= 0) / perdants, 2) if perdants else 0
 
+    # Totaux de coûts du jour (transparence)
+    tot_brut  = round(sum(h.get("brut", 0) for h in jour), 2)
+    tot_frais = round(sum(h.get("frais", 0) for h in jour), 2)
+    tot_gliss = round(sum(h.get("glissement", 0) for h in jour), 2)
+    tot_fund  = round(sum(h.get("funding", 0) for h in jour), 2)
+    duree_moy = round(sum(h.get("duree_sec", 0) for h in jour) / len(jour)) if jour else 0
+
+    # Détail trade par trade : sens, marché, entrée→sortie, durée, palier max, net
     lignes = []
-    for h in jour[:40]:
+    for h in jour[:30]:
         m = h.get("marche", "?").replace("USD", "")
         sens = "L" if h.get("sens") == "long" else "S"
         ic = "✅" if h.get("resultat", 0) > 0 else "❌"
-        sym = "🎯" if h.get("motif") == "PALIER" else "🛑"
-        lignes.append(f"{ic} {sens} {m:6s} {h.get('resultat',0):+.2f}€ {sym}")
-    if len(jour) > 40:
-        lignes.append(f"… et {len(jour)-40} autres")
+        pmax = h.get("palier_max", -1)
+        pmax_txt = f"P{pmax+1}" if pmax >= 0 else "—"
+        lignes.append(
+            f"{ic}{sens} {m:5s} {h.get('resultat',0):+6.2f}€ "
+            f"{_duree_txt(h.get('duree_sec',0)):>5s} max:{pmax_txt}")
+    if len(jour) > 30:
+        lignes.append(f"… et {len(jour)-30} autres")
     detail = "\n".join(lignes) if lignes else "(aucune position clôturée aujourd'hui)"
 
+    # État EN DIRECT des positions encore ouvertes
     po = etat.get("positions", [])
-    ouverts = f"{len(po)} ({', '.join(x['marche'].replace('USD','') for x in po)})" if po else "aucune"
+    lignes_o = []
+    for pos in po:
+        m = pos["marche"]
+        p = prix_actuels.get(m)
+        sens = "L" if pos["sens"] == "long" else "S"
+        dur = _duree_txt(time.time() - pos.get("ouvert_ts", time.time()))
+        if p:
+            pct = (p - pos["entree"]) / pos["entree"] if pos["sens"] == "long" else (pos["entree"] - p) / pos["entree"]
+            pnl = round(pct * NOTIONNEL, 2)
+            pmax = pos.get("palier", -1)
+            pmax_txt = f"P{pmax+1}" if pmax >= 0 else "—"
+            lignes_o.append(f"{sens} {m.replace('USD',''):5s} {pnl:+6.2f}€ (en cours) {dur:>5s} max:{pmax_txt}")
+        else:
+            lignes_o.append(f"{sens} {m.replace('USD',''):5s} (prix indispo) {dur:>5s}")
+    ouverts = "\n".join(lignes_o) if lignes_o else "aucune"
 
     if len(jour) == 0:
         lecture = "Aucune impulsion clôturée aujourd'hui — trop tôt pour juger."
     elif nb_palier == 0:
-        lecture = f"Aucune impulsion n'a couru : toutes se sont retournées (stop {nb_stop}×). Fausses cassures."
-    elif gagnants and perdants and gain_moy > abs(perte_moy) * (perdants / max(gagnants, 1)):
-        lecture = f"Les gagnants ({gain_moy:+.2f}€ moy) couvrent les perdants ({perte_moy:+.2f}€ moy). À confirmer."
+        lecture = f"Aucune impulsion n'a couru : toutes retournées (stop {nb_stop}×). Fausses cassures."
+    elif net_jour > 0:
+        lecture = f"Les gagnants ({gain_moy:+.2f}€ moy) couvrent les perdants ({perte_moy:+.2f}€ moy). À confirmer sur plusieurs jours."
     else:
         lecture = f"Trop de fausses cassures : {nb_stop} stops pour {nb_palier} qui ont couru."
 
@@ -369,11 +433,17 @@ async def rapport_quotidien(session, etat, cle):
         f"\n📈 <b>IMPULSIONS SUIVIES</b>\n"
         f"Clôturées : {len(jour)} | Gagnantes : {gagnants} | Perdantes : {perdants}\n"
         f"Gain moyen : {gain_moy:+.2f}€ | Perte moyenne : {perte_moy:+.2f}€\n"
+        f"Durée moyenne d'un trade : {_duree_txt(duree_moy)}\n"
         f"\n🎯 <b>LE CHIFFRE CLÉ</b>\n"
         f"Ont couru (palier) : {nb_palier} | Fausses cassures (stop) : {nb_stop}\n"
         f"→ {lecture}\n"
-        f"\n📋 <b>DÉTAIL</b> (L=long, S=short)\n<pre>{detail}</pre>\n"
-        f"⏳ Encore ouvertes : {ouverts}")
+        f"\n🧾 <b>DÉCOMPTE DES COÛTS (jour)</b>\n"
+        f"Brut : {tot_brut:+.2f}€\n"
+        f"− Frais : {tot_frais:.2f}€ | − Glissement : {tot_gliss:.2f}€"
+        f"{f' | Funding : {tot_fund:+.2f}€' if tot_fund else ''}\n"
+        f"= Net : {net_jour:+.2f}€\n"
+        f"\n📋 <b>DÉTAIL CLÔTURÉS</b> (L/S · net · durée · palier max)\n<pre>{detail}</pre>\n"
+        f"⏳ <b>ENCORE OUVERTES</b> (P&L en direct)\n<pre>{ouverts}</pre>")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
